@@ -1,0 +1,31 @@
+# Binaries
+*.exe
+*.out
+/bin/
+# Compiled `go build` output in main-package example dirs. Go names the binary
+# after its directory (no extension), so ignore any extensionless executable
+# that lands in an example dir rather than listing each by name.
+/examples/*/*
+!/examples/*/*.go
+!/examples/*/*.md
+!/examples/*/go.mod
+!/examples/*/go.sum
+!/examples/*/.env.example
+
+# Test / coverage
+*.test
+coverage.out
+
+# Span debug logs
+spans_raw_optimized.log
+spans_optimized.log
+
+# Secrets — never commit API keys
+.env
+*.env
+!*.env.example
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
