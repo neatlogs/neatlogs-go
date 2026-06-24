@@ -10,12 +10,8 @@ SDKs.
 ## Install
 
 ```bash
-go get go.neatlogs.com
+go get github.com/neatlogs/neatlogs-go
 ```
-
-The module is published under the vanity path `go.neatlogs.com` (hosted on GitHub
-at [`neatlogs/neatlogs-go`](https://github.com/neatlogs/neatlogs-go); see
-[vanity/](vanity/) for the import-redirect setup).
 
 ## Quick start
 
@@ -72,7 +68,7 @@ performs no value rewriting or derived computation — the backend owns that.
 > [`contrib/adk`](contrib/adk)'s `WrapModel`:
 >
 > ```go
-> import nladk "go.neatlogs.com/contrib/adk"
+> import nladk "github.com/neatlogs/neatlogs-go/contrib/adk"
 >
 > model, _ := gemini.NewModel(ctx, "gemini-2.5-flash", cfg)
 > agent, _ := llmagent.New(llmagent.Config{Model: nladk.WrapModel(model), ...})

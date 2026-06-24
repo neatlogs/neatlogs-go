@@ -1,4 +1,4 @@
-module go.neatlogs.com/contrib/adk
+module github.com/neatlogs/neatlogs-go/contrib/adk
 
 go 1.25.0
 

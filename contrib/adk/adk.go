@@ -17,7 +17,7 @@
 //
 //	model, _ := gemini.NewModel(ctx, "gemini-2.5-flash", cfg)
 //	agent, _ := llmagent.New(llmagent.Config{Model: nladk.WrapModel(model), ...})
-package adk // import "go.neatlogs.com/contrib/adk"
+package adk
 
 import (
 	"context"

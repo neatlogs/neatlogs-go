@@ -21,7 +21,7 @@ import (
 
 	"google.golang.org/genai"
 
-	neatlogs "go.neatlogs.com"
+	neatlogs "github.com/neatlogs/neatlogs-go"
 )
 
 func main() {

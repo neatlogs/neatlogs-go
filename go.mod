@@ -1,4 +1,4 @@
-module go.neatlogs.com
+module github.com/neatlogs/neatlogs-go
 
 go 1.25.0
 

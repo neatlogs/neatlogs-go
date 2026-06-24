@@ -8,7 +8,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
-	attrs "go.neatlogs.com/internal/attributes"
+	attrs "github.com/neatlogs/neatlogs-go/internal/attributes"
 )
 
 // A bare provider span (kind=llm) with no surrounding span must get a synthetic

@@ -4,8 +4,8 @@ go 1.25.0
 
 require (
 	github.com/a2aproject/a2a-go/v2 v2.3.1
-	go.neatlogs.com v0.0.0
-	go.neatlogs.com/contrib/adk v0.0.0-00010101000000-000000000000
+	github.com/neatlogs/neatlogs-go v0.0.0
+	github.com/neatlogs/neatlogs-go/contrib/adk v0.0.0-00010101000000-000000000000
 	go.opentelemetry.io/otel/sdk v1.44.0
 	google.golang.org/adk v1.4.0
 	google.golang.org/genai v1.61.0
@@ -53,6 +53,6 @@ require (
 	rsc.io/ordered v1.1.1 // indirect
 )
 
-replace go.neatlogs.com => ../..
+replace github.com/neatlogs/neatlogs-go => ../..
 
-replace go.neatlogs.com/contrib/adk => ../../contrib/adk
+replace github.com/neatlogs/neatlogs-go/contrib/adk => ../../contrib/adk

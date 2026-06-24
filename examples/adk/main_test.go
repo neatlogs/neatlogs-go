@@ -13,7 +13,7 @@ import (
 	"google.golang.org/adk/session"
 	"google.golang.org/genai"
 
-	neatlogs "go.neatlogs.com"
+	neatlogs "github.com/neatlogs/neatlogs-go"
 )
 
 // fakeModel implements model.LLM with a canned response, so the test runs a

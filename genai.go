@@ -11,7 +11,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/genai"
 
-	attrs "go.neatlogs.com/internal/attributes"
+	attrs "github.com/neatlogs/neatlogs-go/internal/attributes"
 )
 
 // Provider/system identifiers, matching the TS SDK: the Vertex AI backend is

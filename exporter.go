@@ -6,7 +6,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
-	"go.neatlogs.com/internal/attributes"
+	"github.com/neatlogs/neatlogs-go/internal/attributes"
 )
 
 // normalizingExporter wraps a SpanExporter and rewrites every span's attributes

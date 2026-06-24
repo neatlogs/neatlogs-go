@@ -29,7 +29,7 @@
 //	})
 //	if err != nil { log.Fatal(err) }
 //	defer shutdown(ctx)
-package neatlogs // import "go.neatlogs.com"
+package neatlogs
 
 import (
 	"context"
@@ -50,7 +50,7 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"go.opentelemetry.io/otel/trace"
 
-	"go.neatlogs.com/internal/attributes"
+	"github.com/neatlogs/neatlogs-go/internal/attributes"
 )
 
 // defaultEndpoint is the Neatlogs staging ingestion base URL. Override via

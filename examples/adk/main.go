@@ -62,8 +62,8 @@ import (
 	"google.golang.org/adk/tool/functiontool"
 	"google.golang.org/genai"
 
-	neatlogs "go.neatlogs.com"
-	nladk "go.neatlogs.com/contrib/adk"
+	neatlogs "github.com/neatlogs/neatlogs-go"
+	nladk "github.com/neatlogs/neatlogs-go/contrib/adk"
 )
 
 const adkModel = "gemini-2.5-flash"

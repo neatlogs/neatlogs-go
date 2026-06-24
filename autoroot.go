@@ -9,7 +9,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
-	attrs "go.neatlogs.com/internal/attributes"
+	attrs "github.com/neatlogs/neatlogs-go/internal/attributes"
 )
 
 // The backend's trace-finalizer only renders a trace once it contains a
