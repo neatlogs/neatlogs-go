@@ -64,12 +64,9 @@ const (
 
 // Identity / session resource attributes set by Init.
 const (
-	WorkflowName    = "neatlogs.workflow_name"
-	SessionID       = "neatlogs.session.id"
-	UserID          = "neatlogs.user.id"
-	EndUserID       = "neatlogs.end_user.id"
-	EndUserMetadata = "neatlogs.end_user.metadata"
-	Tags            = "neatlogs.tags"
+	WorkflowName = "neatlogs.workflow_name"
+	SessionID    = "neatlogs.session.id"
+	Tags         = "neatlogs.tags"
 )
 
 // Indexed-attribute prefixes. Callers expand with an integer index, e.g.

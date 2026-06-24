@@ -77,13 +77,6 @@ type Config struct {
 	// SessionID groups related traces (e.g. turns of one conversation).
 	SessionID string
 
-	// UserID identifies the operator running the SDK (developer, service
-	// account) — not the end-user of the application.
-	UserID string
-
-	// EndUserID identifies the application's end-user. One per trace.
-	EndUserID string
-
 	// Tags are attached to every span as a resource attribute.
 	Tags []string
 
@@ -259,12 +252,6 @@ func buildResource(cfg Config) *resource.Resource {
 	}
 	if cfg.SessionID != "" {
 		attrs = append(attrs, attribute.String(attributes.SessionID, cfg.SessionID))
-	}
-	if cfg.UserID != "" {
-		attrs = append(attrs, attribute.String(attributes.UserID, cfg.UserID))
-	}
-	if cfg.EndUserID != "" {
-		attrs = append(attrs, attribute.String(attributes.EndUserID, cfg.EndUserID))
 	}
 	if len(cfg.Tags) > 0 {
 		attrs = append(attrs, attribute.String(attributes.Tags, strings.Join(cfg.Tags, ",")))

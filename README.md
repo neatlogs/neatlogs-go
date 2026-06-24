@@ -122,8 +122,6 @@ delays your agent code.
 |----------------|--------------------|-------|
 | `APIKey`       | `NEATLOGS_API_KEY` | Your Neatlogs project key. Required to export; if empty, spans are dropped. |
 | `WorkflowName` | —                  | Service/run label grouping your traces. Defaults to the caller source file (e.g. `main.go`). |
-| `UserID`       | —                  | The operator running the SDK (optional). |
-| `EndUserID`    | —                  | Your application's end-user (optional). |
 | `Tags`         | —                  | Attached to every span (optional). |
 
 ## Transport
