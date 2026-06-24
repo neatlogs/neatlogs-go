@@ -118,17 +118,13 @@ delays your agent code.
 
 ## Configuration
 
-| `Config` field   | Env fallback         | Default                 | Notes |
-|------------------|----------------------|-------------------------|-------|
-| `APIKey`         | `NEATLOGS_API_KEY`   | —                       | If empty, export is disabled and spans are dropped. |
-| `Endpoint`       | `NEATLOGS_ENDPOINT`  | staging ingestion URL   | Base URL; spans are sent to `{endpoint}/v1/traces`. |
-| `WorkflowName`   | —                    | caller source file      | Service/run label (e.g. `main.go`). |
-| `SessionID`      | —                    | —                       | Groups related traces. |
-| `UserID`         | —                    | —                       | The operator running the SDK. |
-| `EndUserID`      | —                    | —                       | The application's end-user. |
-| `Tags`           | —                    | —                       | Attached to every span. |
-| `Debug`          | —                    | `false`                 | Verbose diagnostics on stderr. |
-| `DisableExport`  | —                    | `false`                 | Drop spans instead of sending (tests). |
+| `Config` field | Env fallback       | Notes |
+|----------------|--------------------|-------|
+| `APIKey`       | `NEATLOGS_API_KEY` | Your Neatlogs project key. Required to export; if empty, spans are dropped. |
+| `WorkflowName` | —                  | Service/run label grouping your traces. Defaults to the caller source file (e.g. `main.go`). |
+| `UserID`       | —                  | The operator running the SDK (optional). |
+| `EndUserID`    | —                  | Your application's end-user (optional). |
+| `Tags`         | —                  | Attached to every span (optional). |
 
 ## Transport
 
