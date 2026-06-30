@@ -69,6 +69,15 @@ const (
 	Tags         = "neatlogs.tags"
 )
 
+// End-user identity. The end user is the user of the CUSTOMER'S application,
+// distinct from the operator running the SDK. Stamped on the trace ROOT span
+// only (or as an Init resource-attr default); the backend rolls it up to the
+// trace and its session.
+const (
+	EndUserID       = "neatlogs.end_user.id"
+	EndUserMetadata = "neatlogs.end_user.metadata"
+)
+
 // Indexed-attribute prefixes. Callers expand with an integer index, e.g.
 // fmt.Sprintf("%s%d.role", LLMInputMessagePrefix, i).
 const (

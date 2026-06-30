@@ -74,9 +74,6 @@ type Config struct {
 	// WorkflowName labels this service/run. Defaults to the executable name.
 	WorkflowName string
 
-	// SessionID groups related traces (e.g. turns of one conversation).
-	SessionID string
-
 	// Tags are attached to every span as a resource attribute.
 	Tags []string
 
@@ -174,6 +171,10 @@ func Init(ctx context.Context, cfg Config, opts ...Option) (ShutdownFunc, error)
 	}
 
 	tp := sdktrace.NewTracerProvider(tpOpts...)
+	// Stamp session/end-user identity (bound via Identify) onto every root span
+	// at start — including spans the SDK doesn't create itself (e.g. ADK
+	// passthrough), which Trace()/the auto-root never see.
+	tp.RegisterSpanProcessor(&identityProcessor{})
 	// Emit a trace-completion marker when each root span ends, so the backend
 	// finalizes and surfaces the trace. Registered after construction so it can
 	// use the provider's own tracer.
@@ -249,9 +250,6 @@ func buildResource(cfg Config) *resource.Resource {
 	attrs := []attribute.KeyValue{
 		semconv.ServiceName(workflow),
 		attribute.String(attributes.WorkflowName, workflow),
-	}
-	if cfg.SessionID != "" {
-		attrs = append(attrs, attribute.String(attributes.SessionID, cfg.SessionID))
 	}
 	if len(cfg.Tags) > 0 {
 		attrs = append(attrs, attribute.String(attributes.Tags, strings.Join(cfg.Tags, ",")))
