@@ -86,6 +86,9 @@ func startProviderSpan(ctx context.Context, name, kind string) (context.Context,
 		return ctx, span, func() { span.End() }
 	}
 
+	// Session/end-user identity (bound via Identify) is stamped on this auto-root
+	// by the identityProcessor — it reads the start context, so no inline
+	// stamping is needed here.
 	rootCtx, root := t.Start(ctx, resolveRootWorkflowName(), trace.WithAttributes(
 		attribute.String(attrs.SpanKind, attrs.KindWorkflow),
 		attribute.Bool("neatlogs.auto_root", true),
