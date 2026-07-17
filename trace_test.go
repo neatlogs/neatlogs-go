@@ -4,7 +4,6 @@ import (
 	"context"
 	"testing"
 
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
@@ -158,7 +157,7 @@ func TestAutoRoot_StampsContextIdentity(t *testing.T) {
 		EndUserID:       "ctx_user",
 		EndUserMetadata: map[string]any{"plan": "pro"},
 	})
-	_, span, end := startProviderSpan(ctx, "google_genai.models.generate_content", attrs.KindLLM)
+	_, span, end := StartProviderSpan(ctx, "google_genai.models.generate_content", attrs.KindLLM)
 	span.SetAttributes(attribute.String(attrs.SpanKind, attrs.KindLLM))
 	end()
 	Flush(ctx)
@@ -185,10 +184,10 @@ func TestAutoRoot_StampsContextIdentity(t *testing.T) {
 	}
 }
 
-// A raw OTel root span (the ADK passthrough case — created directly via the
-// global tracer, bypassing Trace() and the WrapGenAI auto-root) still picks up
+// A raw span created directly from the private provider (the injected-tracer
+// framework case, bypassing Trace() and the WrapGenAI auto-root) still picks up
 // identity from Identify(ctx), via the identityProcessor.
-func TestIdentityProcessor_StampsRawOTelRoot(t *testing.T) {
+func TestIdentityProcessor_StampsPrivateProviderRoot(t *testing.T) {
 	ctx := context.Background()
 	sink := tracetest.NewInMemoryExporter()
 	sd, err := Init(ctx, Config{WorkflowName: "wf"}, WithExporter(sink))
@@ -203,9 +202,8 @@ func TestIdentityProcessor_StampsRawOTelRoot(t *testing.T) {
 		EndUserMetadata: map[string]any{"plan": "pro"},
 	})
 
-	// Simulate ADK: a span started straight off the global provider, NOT via
-	// neatlogs.Trace or a provider wrapper.
-	_, span := otel.Tracer("gcp.vertex.agent").Start(ctx, "adk.invoke")
+	// Simulate a framework that accepts the private provider/tracer explicitly.
+	_, span := provider.Tracer("gcp.vertex.agent").Start(ctx, "adk.invoke")
 	span.End()
 	Flush(ctx)
 

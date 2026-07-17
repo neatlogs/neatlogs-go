@@ -5,20 +5,17 @@
 // ({endpoint}/v1/traces) and normalizes their attributes into the neatlogs.*
 // namespace shared with the Python and TypeScript SDKs.
 //
-// There are two ways spans reach Neatlogs:
+// Spans reach Neatlogs through explicit SDK wrappers and tracing helpers:
 //
 //   - Active wrapping. Call WrapGenAI on a google.golang.org/genai client to
 //     trace each GenerateContent / GenerateContentStream / EmbedContent /
 //     CountTokens call with full request/response detail (including message
 //     text) on the span.
 //
-//   - Passive passthrough. Init registers a *global* OpenTelemetry
-//     TracerProvider, so any OTel-native framework — notably Google ADK —
-//     emits spans that flow through Neatlogs automatically. ADK uses the OTel
-//     GenAI semantic conventions, which the SDK maps onto neatlogs.* keys. Note
-//     that ADK records prompt/completion text on the OTel logs signal rather
-//     than on spans, so the ADK passthrough captures model, token usage, tool
-//     calls and finish reasons, but not message text.
+// Init never changes the process-global OpenTelemetry provider or propagator.
+// This keeps Neatlogs isolated from Datadog and other co-tenant
+// instrumentation. OTel-native frameworks that only use the global provider
+// must be integrated through an explicit Neatlogs wrapper.
 //
 // Typical usage:
 //
@@ -41,10 +38,8 @@ import (
 	"strings"
 	"sync"
 
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
-	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
@@ -91,6 +86,7 @@ type ShutdownFunc func(context.Context) error
 var (
 	mu       sync.Mutex
 	provider *sdktrace.TracerProvider
+	noopTP   = trace.NewNoopTracerProvider()
 )
 
 // Option customizes Init. Options are for advanced/testing use; the common path
@@ -110,9 +106,10 @@ func WithExporter(exp sdktrace.SpanExporter) Option {
 	return func(o *initOptions) { o.exporter = exp }
 }
 
-// Init configures the global OpenTelemetry TracerProvider for Neatlogs and
-// returns a ShutdownFunc. It is safe to call once; a second call without an
-// intervening shutdown returns an error.
+// Init configures a private OpenTelemetry TracerProvider for Neatlogs and
+// returns a ShutdownFunc. It never changes process-global OpenTelemetry state.
+// It is safe to call once; a second call without an intervening shutdown
+// returns an error.
 func Init(ctx context.Context, cfg Config, opts ...Option) (ShutdownFunc, error) {
 	var io initOptions
 	for _, opt := range opts {
@@ -181,15 +178,6 @@ func Init(ctx context.Context, cfg Config, opts ...Option) (ShutdownFunc, error)
 	if !disable {
 		tp.RegisterSpanProcessor(&completionProcessor{tracer: tp.Tracer(tracerName)})
 	}
-	otel.SetTracerProvider(tp)
-	// Install W3C trace-context + baggage propagators so spans can cross process
-	// boundaries (e.g. an HTTP call to another service) and stay in one trace,
-	// when callers instrument their transport. Standard OTel default; harmless
-	// when unused.
-	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
-		propagation.TraceContext{},
-		propagation.Baggage{},
-	))
 	provider = tp
 
 	if cfg.Debug {
@@ -198,13 +186,13 @@ func Init(ctx context.Context, cfg Config, opts ...Option) (ShutdownFunc, error)
 
 	return func(ctx context.Context) error {
 		mu.Lock()
-		defer mu.Unlock()
-		if provider == nil {
+		if provider != tp {
+			mu.Unlock()
 			return nil
 		}
-		err := provider.Shutdown(ctx)
 		provider = nil
-		return err
+		mu.Unlock()
+		return tp.Shutdown(ctx)
 	}, nil
 }
 
@@ -322,7 +310,13 @@ func shortSourcePath(file string) string {
 	}
 }
 
-// tracer returns the SDK's tracer from the global provider.
+// tracer returns the SDK's tracer from its private provider.
 func tracer() trace.Tracer {
-	return otel.Tracer(tracerName)
+	mu.Lock()
+	tp := provider
+	mu.Unlock()
+	if tp == nil {
+		return noopTP.Tracer(tracerName)
+	}
+	return tp.Tracer(tracerName)
 }

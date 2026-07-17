@@ -21,6 +21,12 @@ import (
 // They deliberately do NOT create their own HTTP spans (unlike otelhttp); they
 // only inject/extract the trace context, keeping the trace free of transport
 // noise.
+//
+// Deprecated: part of the quarantined ADK integration (see DEPRECATED.md). These
+// helpers read/write the GLOBAL OpenTelemetry propagator, which the isolated
+// Neatlogs SDK no longer installs, so no traceparent is propagated. Cross-process
+// continuation in the isolated SDK uses neatlogs.InjectTraceContext /
+// ExtractTraceContext (the SDK's private propagator) instead.
 
 // A2AHTTPClient returns an *http.Client whose transport injects the current
 // trace context as a traceparent header on every outbound request. Pass it to

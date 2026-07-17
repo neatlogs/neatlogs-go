@@ -1,22 +1,22 @@
 // Package adk adds Neatlogs input/output capture to Google ADK.
 //
-// ADK auto-instruments agent runs on the global OpenTelemetry TracerProvider,
-// so installing Neatlogs (neatlogs.Init) already captures the trace structure,
-// model, token usage, tool calls and finish reasons. However, ADK-Go records
-// prompt/completion TEXT only on the OTel *logs* signal — never on spans. Since
-// Neatlogs carries semantic data on traces (not logs), that message text would
-// otherwise be lost.
+// Deprecated: this integration is incompatible with the isolated Neatlogs SDK
+// and no longer works. See DEPRECATED.md. It was built when neatlogs.Init
+// registered the process-GLOBAL OpenTelemetry TracerProvider, so ADK's
+// global-provider auto-instrumentation flowed into Neatlogs for free and
+// WrapModel only had to annotate the live span with message text. The SDK now
+// isolates onto a PRIVATE provider it never registers globally (so it can never
+// export or parent a co-tenant's spans, e.g. Datadog). As a result ADK's spans
+// never reach the Neatlogs provider, WrapModel finds no recording Neatlogs span
+// to annotate, and no ADK trace is captured (the suite fails with "no spans
+// captured"). The code is retained, compilable, for reference and a possible
+// future redesign (e.g. an ADK-side hook that accepts an injected provider);
+// do not wire it into new code.
 //
-// WrapModel closes that gap: it wraps an ADK model.LLM so that, on each
-// GenerateContent call, the request and response messages are written onto the
-// live `generate_content` span (which ADK has already started and placed in the
-// context) as neatlogs.llm.input_messages.* / output_messages.* — putting I/O on
-// the trace, where Neatlogs expects it.
-//
-// Usage:
-//
-//	model, _ := gemini.NewModel(ctx, "gemini-2.5-flash", cfg)
-//	agent, _ := llmagent.New(llmagent.Config{Model: nladk.WrapModel(model), ...})
+// Original behavior: ADK-Go records prompt/completion TEXT only on the OTel
+// *logs* signal, never on spans; WrapModel wrote the request/response messages
+// onto the live generate_content span as neatlogs.llm.input_messages.* /
+// output_messages.* so the I/O landed on the trace where Neatlogs expects it.
 package adk
 
 import (
@@ -47,6 +47,11 @@ type instrumentedModel struct {
 // WrapModel returns a model.LLM that records request/response messages onto the
 // generate_content span ADK starts around each call. If inner is nil it is
 // returned unchanged.
+//
+// Deprecated: no longer functional under the isolated Neatlogs SDK — ADK's
+// spans are started on the global OTel provider, which Neatlogs no longer owns,
+// so there is no recording Neatlogs span to annotate. See the package doc and
+// DEPRECATED.md.
 func WrapModel(inner model.LLM) model.LLM {
 	if inner == nil {
 		return inner

@@ -13,9 +13,9 @@ import (
 
 // identityProcessor stamps session + end-user identity onto ROOT spans at start
 // time, reading it from the span's start context (where neatlogs.Identify put
-// it). As a SpanProcessor it sees EVERY span — including ones the SDK never
-// creates itself, like Google ADK passthrough spans — so Identify(ctx) reaches
-// them too, not just Trace() and the WrapGenAI auto-root.
+// it). As a SpanProcessor it sees every span created on the private Neatlogs
+// provider, including spans created by frameworks that accept an injected
+// tracer/provider.
 //
 // Identity is root-only; child spans are skipped (the backend rolls the root's
 // value up to the trace and its session).

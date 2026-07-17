@@ -27,11 +27,28 @@ import (
 //
 // Identity (session + end-user bound via Identify) is stamped on the root span
 // by the identityProcessor, which reads it from the span's start context — so it
-// applies to this WORKFLOW root, the WrapGenAI auto-root, and ADK passthrough
-// spans uniformly. Trace itself only opens the span.
+// applies to this WORKFLOW root, the WrapGenAI auto-root, and spans created by
+// integrations using the private provider. Trace itself only opens the span.
 func Trace(ctx context.Context, name string) (context.Context, trace.Span, func()) {
-	childCtx, span := tracer().Start(ctx, name, trace.WithAttributes(
-		attribute.String(attrs.SpanKind, attrs.KindWorkflow),
-	))
-	return childCtx, span, func() { span.End() }
+	return StartSpan(ctx, name, attrs.KindWorkflow)
+}
+
+// StartSpan starts an explicitly typed Neatlogs span on the private provider.
+// Use it at framework and service boundaries where Trace's WORKFLOW kind is not
+// appropriate (for example a TOOL child extracted from an incoming trace).
+func StartSpan(
+	ctx context.Context,
+	name string,
+	kind string,
+	attributes ...attribute.KeyValue,
+) (context.Context, trace.Span, func()) {
+	attributes = append([]attribute.KeyValue{
+		attribute.String(attrs.SpanKind, kind),
+	}, attributes...)
+	_, span := tracer().Start(
+		privateStartContext(ctx),
+		name,
+		trace.WithAttributes(attributes...),
+	)
+	return withPrivateTraceContext(ctx, span.SpanContext()), span, func() { span.End() }
 }

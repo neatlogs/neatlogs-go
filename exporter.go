@@ -17,10 +17,8 @@ import (
 // normalize at the exporter boundary instead, round-tripping each span through
 // a tracetest.SpanStub whose attributes we can edit.
 //
-// This is what makes spans from any OTel-native source — notably Google ADK,
-// which emits OpenTelemetry GenAI semantic-convention attributes through the
-// global TracerProvider — arrive already keyed by the neatlogs.* contract, with
-// no per-call instrumentation.
+// This makes spans created through Neatlogs wrappers or an explicitly injected
+// private tracer arrive keyed by the neatlogs.* contract.
 type normalizingExporter struct {
 	next   trace.SpanExporter
 	mapper *attributes.Mapper

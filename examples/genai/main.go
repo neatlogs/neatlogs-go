@@ -22,15 +22,15 @@ import (
 	"google.golang.org/genai"
 
 	neatlogs "github.com/neatlogs/neatlogs-go"
+	nlgenai "github.com/neatlogs/neatlogs-go/contrib/genai"
 )
 
 func main() {
 	loadDotEnv(".env")
 	ctx := context.Background()
 
-	// 1. Initialize Neatlogs. This registers the global OpenTelemetry
-	//    TracerProvider, so spans from OTel-native frameworks (e.g. Google ADK)
-	//    are also captured automatically.
+	// 1. Initialize Neatlogs' private provider. Global OpenTelemetry state is
+	//    left unchanged so other tracing SDKs remain isolated.
 	shutdown, err := neatlogs.Init(ctx, neatlogs.Config{
 		APIKey:       os.Getenv("NEATLOGS_API_KEY"),
 		WorkflowName: "genai-example",
@@ -53,7 +53,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("genai client: %v", err)
 	}
-	gc := neatlogs.WrapGenAI(client)
+	gc := nlgenai.WrapGenAI(client)
 
 	// 3. Call exactly as you would the raw genai client.
 	temp := float32(0.7)

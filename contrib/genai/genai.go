@@ -1,4 +1,12 @@
-package neatlogs
+// Package genai adds Neatlogs tracing to google.golang.org/genai (Gemini /
+// Vertex AI) calls. It lives in its own module so the heavy google.golang.org/
+// genai dependency never reaches applications that import only the root
+// neatlogs package.
+//
+//	import nlgenai "github.com/neatlogs/neatlogs-go/contrib/genai"
+//	gc := nlgenai.WrapGenAI(client)
+//	resp, _ := gc.GenerateContent(ctx, "gemini-2.5-flash", contents, cfg)
+package genai
 
 import (
 	"context"
@@ -11,6 +19,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/genai"
 
+	neatlogs "github.com/neatlogs/neatlogs-go"
 	attrs "github.com/neatlogs/neatlogs-go/internal/attributes"
 )
 
@@ -37,7 +46,7 @@ type GenAIModels struct {
 // WrapGenAI wraps a genai.Client so its model calls emit Neatlogs spans.
 //
 //	client, _ := genai.NewClient(ctx, &genai.ClientConfig{APIKey: key})
-//	gc := neatlogs.WrapGenAI(client)
+//	gc := nlgenai.WrapGenAI(client)
 //	resp, _ := gc.GenerateContent(ctx, "gemini-2.5-flash", contents, cfg)
 //
 // Spans carry full request/response detail — input/output messages, tool
@@ -147,7 +156,7 @@ func (g *GenAIModels) GenerateContentStream(ctx context.Context, model string, c
 
 // EmbedContent traces an embedding call.
 func (g *GenAIModels) EmbedContent(ctx context.Context, model string, contents []*genai.Content, config *genai.EmbedContentConfig) (*genai.EmbedContentResponse, error) {
-	ctx, span, end := startProviderSpan(ctx, "google_genai.models.embed_content", attrs.KindEmbedding)
+	ctx, span, end := neatlogs.StartProviderSpan(ctx, "google_genai.models.embed_content", attrs.KindEmbedding)
 	defer end()
 	span.SetAttributes(
 		attribute.String(attrs.SpanKind, attrs.KindEmbedding),
@@ -172,7 +181,7 @@ func (g *GenAIModels) EmbedContent(ctx context.Context, model string, contents [
 
 // CountTokens traces a token-counting call.
 func (g *GenAIModels) CountTokens(ctx context.Context, model string, contents []*genai.Content, config *genai.CountTokensConfig) (*genai.CountTokensResponse, error) {
-	ctx, span, end := startProviderSpan(ctx, "google_genai.models.count_tokens", attrs.KindLLM)
+	ctx, span, end := neatlogs.StartProviderSpan(ctx, "google_genai.models.count_tokens", attrs.KindLLM)
 	defer end()
 	span.SetAttributes(
 		attribute.String(attrs.SpanKind, attrs.KindLLM),
@@ -199,7 +208,7 @@ func (g *GenAIModels) Raw() *genai.Models { return g.models }
 // ── helpers ──────────────────────────────────────────────────────────────
 
 func (g *GenAIModels) startLLMSpan(ctx context.Context, model string, _ *genai.GenerateContentConfig, streaming bool) (context.Context, trace.Span, func()) {
-	ctx, span, end := startProviderSpan(ctx, "google_genai.models.generate_content", attrs.KindLLM)
+	ctx, span, end := neatlogs.StartProviderSpan(ctx, "google_genai.models.generate_content", attrs.KindLLM)
 	span.SetAttributes(
 		attribute.String(attrs.SpanKind, attrs.KindLLM),
 		attribute.String(attrs.LLMProvider, g.provider),

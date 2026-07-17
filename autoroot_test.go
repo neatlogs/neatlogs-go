@@ -4,7 +4,6 @@ import (
 	"context"
 	"testing"
 
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
@@ -22,7 +21,7 @@ func TestAutoRoot_WrapsBareLLMSpan(t *testing.T) {
 	}
 	defer sd(ctx)
 
-	_, span, end := startProviderSpan(ctx, "google_genai.models.generate_content", attrs.KindLLM)
+	_, span, end := StartProviderSpan(ctx, "google_genai.models.generate_content", attrs.KindLLM)
 	span.SetAttributes(attribute.String(attrs.SpanKind, attrs.KindLLM))
 	end()
 
@@ -61,13 +60,13 @@ func TestAutoRoot_SkipsWhenParentRecording(t *testing.T) {
 	}
 	defer sd(ctx)
 
-	// Simulate a user-provided parent span (e.g. a framework root).
-	parentCtx, parent := otel.GetTracerProvider().Tracer("user").Start(ctx, "user-root")
+	// Simulate an existing Neatlogs parent (e.g. an explicit framework root).
+	parentCtx, _, endParent := StartSpan(ctx, "user-root", "chain")
 
-	_, span, end := startProviderSpan(parentCtx, "google_genai.models.generate_content", attrs.KindLLM)
+	_, span, end := StartProviderSpan(parentCtx, "google_genai.models.generate_content", attrs.KindLLM)
 	span.SetAttributes(attribute.String(attrs.SpanKind, attrs.KindLLM))
 	end()
-	parent.End()
+	endParent()
 
 	Flush(ctx)
 

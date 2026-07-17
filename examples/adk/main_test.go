@@ -1,3 +1,10 @@
+//go:build adk_legacy
+
+// DEPRECATED / QUARANTINED (build tag adk_legacy) — see DEPRECATED.md. This test
+// asserts ADK spans reach Neatlogs via the GLOBAL OTel provider, which the
+// isolated (private-provider) SDK no longer registers, so it can no longer pass.
+// Gated behind adk_legacy so `go test ./...` stays green.
+
 package main
 
 import (

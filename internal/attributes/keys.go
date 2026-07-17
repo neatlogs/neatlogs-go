@@ -62,6 +62,19 @@ const (
 	ToolOutput = "neatlogs.tool.output"
 )
 
+// Retriever attributes. Retrieval / semantic-memory operations (vector search,
+// RAG, agent memory recall) use span kind "retriever"; there is no separate
+// "memory" kind in the canonical mapping.
+const (
+	RetrieverQuery     = "neatlogs.retriever.query"
+	RetrieverTopK      = "neatlogs.retriever.top_k"
+	RetrieverDocuments = "neatlogs.vectordb.retrieval_documents"
+	DocumentsCount     = "neatlogs.db.documents_count"
+)
+
+// KindRetriever is the span-kind value for retrieval / semantic-memory spans.
+const KindRetriever = "retriever"
+
 // Identity / session resource attributes set by Init.
 const (
 	WorkflowName = "neatlogs.workflow_name"

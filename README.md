@@ -1,7 +1,8 @@
 # neatlogs-go
 
 The Go SDK for [Neatlogs](https://neatlogs.com) — OpenTelemetry-based tracing
-for Go LLM agents. v1 focuses on **Google Gemini** support.
+for Go LLM agents. The initial release line focuses on **Google Gemini** support
+and explicit instrumentation helpers.
 
 Spans are exported over OTLP/HTTP to the Neatlogs ingestion endpoint and keyed
 in the shared `neatlogs.*` attribute namespace used by the Python and TypeScript
@@ -11,6 +12,7 @@ SDKs.
 
 ```bash
 go get github.com/neatlogs/neatlogs-go
+go get github.com/neatlogs/neatlogs-go/contrib/genai
 ```
 
 ## Quick start
@@ -28,7 +30,7 @@ if err != nil {
 defer shutdown(ctx)
 
 client, _ := genai.NewClient(ctx, &genai.ClientConfig{APIKey: os.Getenv("GEMINI_API_KEY")})
-gc := neatlogs.WrapGenAI(client) // the one added line
+gc := nlgenai.WrapGenAI(client) // the one added line
 
 resp, _ := gc.GenerateContent(ctx, "gemini-2.5-flash", contents, config)
 ```
@@ -36,7 +38,7 @@ resp, _ := gc.GenerateContent(ctx, "gemini-2.5-flash", contents, config)
 `gc` has the same method signatures as `client.Models`, so wrapping is a
 one-line change. See [examples/genai](examples/genai/main.go).
 
-## Two ways spans reach Neatlogs
+## Instrumentation and isolation
 
 ### 1. Active wrapping — `WrapGenAI`
 
@@ -46,12 +48,11 @@ usage, and finish reason. `GenerateContent`, `GenerateContentStream`,
 `EmbedContent`, and `CountTokens` are traced. Any untraced method is reachable
 via `gc.Raw()`.
 
-### 2. Passive passthrough — Google ADK and other OTel-native frameworks
+### 2. Isolation from other tracing SDKs
 
-`Init` registers the **global** OpenTelemetry `TracerProvider`. Frameworks that
-emit OpenTelemetry GenAI semantic-convention spans — notably
-[Google ADK](https://github.com/google/adk-go) — flow through Neatlogs
-automatically, with no per-call wrapping.
+`Init` creates a private OpenTelemetry `TracerProvider`. It never replaces the
+process-global provider or propagator, so Datadog and other instrumentation
+cannot export, parent, or be parented by Neatlogs spans.
 
 Attribute normalization is driven by the canonical `attribute-mapping.json`
 shared verbatim with the Python and TypeScript SDKs, so every span kind
@@ -61,53 +62,25 @@ shared verbatim with the Python and TypeScript SDKs, so every span kind
 `neatlogs.*` namespace by one shared contract. The mapper only renames keys; it
 performs no value rewriting or derived computation — the backend owns that.
 
-> **ADK note:** ADK-Go records prompt/completion **text** on the OpenTelemetry
-> *logs* signal, not on spans, so plain passthrough captures model, token usage,
-> tool calls, and finish reasons — but not message text. To put the request and
-> response **on the trace**, wrap the ADK model with
-> [`contrib/adk`](contrib/adk)'s `WrapModel`:
->
-> ```go
-> import nladk "github.com/neatlogs/neatlogs-go/contrib/adk"
->
-> model, _ := gemini.NewModel(ctx, "gemini-2.5-flash", cfg)
-> agent, _ := llmagent.New(llmagent.Config{Model: nladk.WrapModel(model), ...})
-> ```
->
-> `WrapModel` writes input/output messages onto the `generate_content` span ADK
-> already emits. It lives in its own module so ADK's dependency tree stays out of
-> the core SDK.
+Frameworks that resolve tracers only from the global OTel API are not
+auto-instrumented. They require an explicit wrapper or an injected private
+tracer/provider integration. Google ADK support is therefore deferred until
+that integration can be isolated bidirectionally.
 
-### A2A (agent-to-agent)
+### Cross-process propagation
 
-A2A calls cross an HTTP boundary, so two extra pieces from `contrib/adk` keep the
-trace whole:
+Use `InjectTraceContext` and `ExtractTraceContext` at explicit HTTP/RPC
+boundaries. They use a private W3C trace-context propagator and do not touch the
+global OTel propagator.
 
-- `A2AHTTPClient()` — an HTTP client whose transport injects the W3C
-  `traceparent`; pass it to the A2A client factory so outbound calls carry the
-  trace context.
-- `A2ABeforeRequest` / `A2AAfterRequest` — request/response callbacks that record
-  the sent message and the reply on the client's `invoke_agent` span (which has
-  no local LLM to capture I/O from otherwise).
-- `A2AHandler(mux)` — server middleware that extracts the incoming `traceparent`,
-  so a server you own nests its spans under the caller's trace (one linked trace
-  end to end).
+For direct OpenAI/Anthropic calls and service boundaries, use
+`StartLLMSpan`, `StartRetrieverSpan`, `StartToolSpanFromHeaders`, or the
+lower-level `Trace`/`StartSpan` helpers. These all share the same private
+provider and automatic workflow-root behavior.
 
 ### Examples
 
 - [examples/genai](examples/genai/main.go) — the `WrapGenAI` path.
-- [examples/adk](examples/adk/main.go) — every ADK path (single agent, streaming,
-  tools, sequential/parallel/loop workflow agents, A2A, concurrent). Each runs
-  one at a time to keep traces clean:
-
-  ```bash
-  go run . -scenario=tools      # or non-streaming, streaming, sequential,
-                                # parallel, loop, a2a, concurrent, or 'all'
-  ```
-
-  Both example modules are separate from the core SDK so heavy deps (ADK, a2a)
-  stay out of it. The [end-to-end test](examples/adk/main_test.go) runs real ADK
-  agents and asserts the spans arrive normalized to `neatlogs.*`.
 
 Export runs on a background batch processor, so instrumentation never blocks or
 delays your agent code.
@@ -125,10 +98,12 @@ delays your agent code.
 Standard OTLP/HTTP via
 `go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp`, targeting
 `{endpoint}/v1/traces` with an `x-api-key` header. Attribute normalization to
-the `neatlogs.*` namespace happens at the exporter boundary, so spans from any
-source are translated before they leave the process.
+the `neatlogs.*` namespace happens at the exporter boundary, so spans created
+through Neatlogs wrappers or an injected private tracer are translated before
+they leave the process.
 
 ## Status
 
-v1 — Google Gemini (`google.golang.org/genai`) active wrapping + OTel/ADK
-passthrough. More providers to follow.
+v0.1 — Google Gemini (`google.golang.org/genai`) active wrapping, direct
+LLM/retriever/tool helpers, and an isolated private provider. More providers and
+explicit framework wrappers will follow.
