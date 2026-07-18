@@ -198,4 +198,32 @@ func TestStartRetrieverSpan_RecordsRetrieval(t *testing.T) {
 	if v, _ := attrInt(span.Attributes, attrs.DocumentsCount); v != 1 {
 		t.Errorf("doc count = %d, want 1", v)
 	}
+	if v, _ := attrString(span.Attributes, attrs.Output); v != `[{"title":"Runways"}]` {
+		t.Errorf("output = %q", v)
+	}
+}
+
+func TestRetrieverSpanSetDocumentsRecordsExplicitEmptyOutput(t *testing.T) {
+	ctx := context.Background()
+	sink := tracetest.NewInMemoryExporter()
+	sd, err := Init(ctx, Config{WorkflowName: "wf"}, WithExporter(sink))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sd(ctx)
+
+	_, r := StartRetrieverSpan(ctx, "empty_retrieval", "missing query", 5)
+	r.SetDocuments([]map[string]any{}, 0)
+	r.End()
+	if err := Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	span := byName(sink, "empty_retrieval")
+	if v, _ := attrString(span.Attributes, attrs.RetrieverDocuments); v != "[]" {
+		t.Errorf("documents = %q, want []", v)
+	}
+	if v, _ := attrString(span.Attributes, attrs.Output); v != "[]" {
+		t.Errorf("output = %q, want []", v)
+	}
 }

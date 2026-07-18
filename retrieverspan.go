@@ -43,13 +43,23 @@ func StartRetrieverSpan(ctx context.Context, name, query string, topK int) (cont
 }
 
 // SetDocuments records the retrieved documents (JSON-encoded) and their count.
+// It also writes the same JSON to the generic output field so every completed
+// retrieval, including an empty result set, has an explicit I/O output.
 func (r *RetrieverSpan) SetDocuments(documents any, count int) {
 	if r == nil {
 		return
 	}
+
+	encodedDocuments := "[]"
 	if documents != nil {
-		r.span.SetAttributes(attribute.String(attrs.RetrieverDocuments, jsonString(documents)))
+		if encoded := jsonString(documents); encoded != "" && encoded != "null" {
+			encodedDocuments = encoded
+		}
 	}
+	r.span.SetAttributes(
+		attribute.String(attrs.RetrieverDocuments, encodedDocuments),
+		attribute.String(attrs.Output, encodedDocuments),
+	)
 	r.SetDocumentCount(count)
 }
 

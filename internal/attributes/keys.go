@@ -14,6 +14,7 @@ package attributes
 const (
 	SpanKind = "neatlogs.span.kind" // value: "llm", "tool", "agent", "embedding", ...
 	Internal = "neatlogs.internal"  // bool: framework-internal span, not user-facing
+	Output   = "neatlogs.output.value"
 )
 
 // GenAIOperationName is the OpenTelemetry GenAI semantic-convention attribute
