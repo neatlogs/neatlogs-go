@@ -30,14 +30,17 @@ package neatlogs
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"math"
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
@@ -52,6 +55,12 @@ import (
 // defaultEndpoint is the Neatlogs ingestion base URL. Override via
 // Config.Endpoint or the NEATLOGS_ENDPOINT environment variable.
 const defaultEndpoint = "https://ingest.neatlogs.com"
+
+const (
+	defaultMaxQueueSize       = 2048
+	defaultMaxExportBatchSize = 100
+	defaultBatchTimeout       = 5 * time.Second
+)
 
 // tracerName is the instrumentation scope used by this SDK's own wrappers.
 const tracerName = "neatlogs-go"
@@ -113,9 +122,11 @@ var (
 // stateClosing until the old provider has fully shut down, preventing Init and
 // new spans from overlapping that close.
 type globalLifecycle struct {
-	mu      sync.Mutex
-	state   sdkState
-	runtime *sdkRuntime
+	mu           sync.Mutex
+	state        sdkState
+	runtime      *sdkRuntime
+	lastDelivery DeliveryDiagnosticsSnapshot
+	signature    string
 }
 
 // Option customizes Init or NewClient. Options are for advanced/testing use;
@@ -124,6 +135,7 @@ type Option func(*initOptions)
 
 type initOptions struct {
 	exporter sdktrace.SpanExporter
+	delivery *deliveryDiagnostics
 }
 
 // WithExporter overrides the OTLP/HTTP exporter with a custom SpanExporter. The
@@ -137,18 +149,31 @@ func WithExporter(exp sdktrace.SpanExporter) Option {
 
 // Init configures a private OpenTelemetry TracerProvider for Neatlogs and
 // returns a ShutdownFunc. It never changes process-global OpenTelemetry state.
-// It is safe to call once; a second call without an intervening shutdown
-// returns an error.
+// Repeating the same initialization is idempotent; conflicting configuration
+// requires the caller to run the returned shutdown first.
 func Init(ctx context.Context, cfg Config, opts ...Option) (ShutdownFunc, error) {
 	var io initOptions
 	for _, opt := range opts {
 		opt(&io)
 	}
 
+	signature := initializationSignature(cfg, io)
+
 	global.mu.Lock()
-	if global.state != stateUninitialized {
+	if global.state == stateRunning && global.runtime != nil {
+		runtime := global.runtime
+		if global.signature == signature {
+			global.mu.Unlock()
+			return func(ctx context.Context) error {
+				return global.shutdown(ctx, runtime, "shutdown")
+			}, nil
+		}
 		global.mu.Unlock()
-		return nil, fmt.Errorf("neatlogs: already initialized; call the returned shutdown first")
+		return nil, fmt.Errorf("neatlogs: already running with different configuration; call the returned shutdown first")
+	}
+	if global.state == stateClosing && global.runtime != nil {
+		global.mu.Unlock()
+		return nil, fmt.Errorf("neatlogs: shutdown is in progress; retry initialization after it completes")
 	}
 	runtime, base, exportEnabled, err := buildSDKRuntime(ctx, cfg, io)
 	if err != nil {
@@ -157,6 +182,7 @@ func Init(ctx context.Context, cfg Config, opts ...Option) (ShutdownFunc, error)
 	}
 	global.runtime = runtime
 	global.state = stateRunning
+	global.signature = signature
 
 	if cfg.EnableSignalHandlers && !cfg.DisableSignalHandlers {
 		signalController := newShutdownSignalController()
@@ -266,11 +292,59 @@ func (g *globalLifecycle) shutdown(ctx context.Context, runtime *sdkRuntime, rea
 
 	g.mu.Lock()
 	if g.runtime == runtime {
+		g.lastDelivery = runtime.delivery.snapshot()
 		g.runtime = nil
 		g.state = stateUninitialized
+		g.signature = ""
 	}
 	g.mu.Unlock()
 	return err
+}
+
+func initializationSignature(cfg Config, options initOptions) string {
+	apiKey := strings.TrimSpace(cfg.APIKey)
+	if apiKey == "" {
+		apiKey = strings.TrimSpace(os.Getenv("NEATLOGS_API_KEY"))
+	}
+	endpoint := strings.TrimSpace(cfg.Endpoint)
+	if endpoint == "" {
+		endpoint = strings.TrimSpace(os.Getenv("NEATLOGS_ENDPOINT"))
+	}
+	if endpoint == "" {
+		endpoint = defaultEndpoint
+	}
+	rate := 1.0
+	if cfg.SampleRate != nil {
+		rate = *cfg.SampleRate
+	}
+	keyDigest := sha256.Sum256([]byte(apiKey))
+	return fmt.Sprintf(
+		"key=%x|endpoint=%s|workflow=%s|tags=%q|debug=%t|rate=%g|disable=%t|mask=%s|exporter=%s|signals=%t/%t",
+		keyDigest,
+		endpoint,
+		resolvedWorkflowNameFrom(cfg),
+		strings.Join(cfg.Tags, "\x00"),
+		cfg.Debug,
+		rate,
+		cfg.DisableExport,
+		identityOf(cfg.Mask),
+		identityOf(options.exporter),
+		cfg.EnableSignalHandlers,
+		cfg.DisableSignalHandlers,
+	)
+}
+
+func identityOf(value any) string {
+	if value == nil {
+		return "nil"
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Map, reflect.Pointer, reflect.Slice, reflect.UnsafePointer:
+		return fmt.Sprintf("%T:%x", value, reflected.Pointer())
+	default:
+		return fmt.Sprintf("%T:%#v", value, value)
+	}
 }
 
 // buildSDKRuntime constructs one private provider. Supplying a custom exporter
@@ -329,9 +403,25 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 		// The batch processor is installed during provider construction. The
 		// completion processor is registered below, after this exporter/root
 		// path, so an ending root is queued before its completion marker.
-		tpOpts = append(tpOpts, sdktrace.WithBatcher(&normalizingExporter{
-			next: exp, mapper: attributes.Default(), mask: cfg.Mask,
+		byteLimited, byteErr := newByteLimitedExporter(exp, defaultMaxExportBytes)
+		if byteErr != nil {
+			return nil, nil, false, byteErr
+		}
+		delivery := &deliveryDiagnostics{}
+		queue := newDeliveryQueue(defaultMaxQueueSize, delivery)
+		batchProcessor := sdktrace.NewBatchSpanProcessor(
+			&normalizingExporter{
+				next: byteLimited, mapper: attributes.Default(), mask: cfg.Mask,
+				delivery: delivery, release: queue.release,
+			},
+			sdktrace.WithMaxQueueSize(defaultMaxQueueSize),
+			sdktrace.WithMaxExportBatchSize(defaultMaxExportBatchSize),
+			sdktrace.WithBatchTimeout(defaultBatchTimeout),
+		)
+		tpOpts = append(tpOpts, sdktrace.WithSpanProcessor(&boundedSpanProcessor{
+			next: batchProcessor, queue: queue,
 		}))
+		io.delivery = delivery
 	}
 
 	tp := sdktrace.NewTracerProvider(tpOpts...)
@@ -341,7 +431,7 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 	if !disable {
 		tp.RegisterSpanProcessor(&completionProcessor{tracer: tp.Tracer(tracerName, trace.WithInstrumentationVersion(Version))})
 	}
-	return newSDKRuntime(tp, lifecycle, resolvedWorkflowNameFrom(cfg)), base, !disable, nil
+	return newSDKRuntime(tp, lifecycle, resolvedWorkflowNameFrom(cfg), io.delivery), base, !disable, nil
 }
 
 // newOTLPExporter builds an OTLP/HTTP span exporter targeting {base}/v1/traces
@@ -351,6 +441,7 @@ func newOTLPExporter(ctx context.Context, base *url.URL, apiKey string) (sdktrac
 		otlptracehttp.WithEndpoint(base.Host),
 		otlptracehttp.WithURLPath("/v1/traces"),
 		otlptracehttp.WithHeaders(map[string]string{"x-api-key": apiKey}),
+		otlptracehttp.WithCompression(otlptracehttp.GzipCompression),
 	}
 	if base.Scheme == "http" {
 		opts = append(opts, otlptracehttp.WithInsecure())

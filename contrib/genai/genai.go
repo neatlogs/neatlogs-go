@@ -10,10 +10,12 @@ package genai
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"iter"
 	"sort"
+	"strings"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -42,6 +44,9 @@ type GenAIModels struct {
 	models   *genai.Models
 	provider string
 	system   string
+	// stream is injectable only so lazy-consumption lifecycle behavior can be
+	// proven without a network call. WrapGenAI always installs the real method.
+	stream func(context.Context, string, []*genai.Content, *genai.GenerateContentConfig) iter.Seq2[*genai.GenerateContentResponse, error]
 }
 
 // WrapGenAI wraps a genai.Client so its model calls emit Neatlogs spans.
@@ -64,7 +69,10 @@ func WrapGenAI(client *genai.Client) *GenAIModels {
 	if client.ClientConfig().Backend == genai.BackendVertexAI {
 		provider, system = vertexProvider, vertexSystem
 	}
-	return &GenAIModels{models: client.Models, provider: provider, system: system}
+	return &GenAIModels{
+		models: client.Models, provider: provider, system: system,
+		stream: client.Models.GenerateContentStream,
+	}
 }
 
 // GenerateContent traces a single content-generation call.
@@ -87,14 +95,17 @@ func (g *GenAIModels) GenerateContent(ctx context.Context, model string, content
 // GenerateContentStream traces a streaming generation, accumulating chunks to
 // reconstruct the response when the stream is fully consumed.
 func (g *GenAIModels) GenerateContentStream(ctx context.Context, model string, contents []*genai.Content, config *genai.GenerateContentConfig) iter.Seq2[*genai.GenerateContentResponse, error] {
-	ctx, span, endSpan := g.startLLMSpan(ctx, model, config, true)
-	setInputMessages(span, contents, config)
-	setInvocationParams(span, config)
-	setToolDefinitions(span, config)
-
-	seq := g.models.GenerateContentStream(ctx, model, contents, config)
-
 	return func(yield func(*genai.GenerateContentResponse, error) bool) {
+		ctx, span, endSpan := g.startLLMSpan(ctx, model, config, true)
+		setInputMessages(span, contents, config)
+		setInvocationParams(span, config)
+		setToolDefinitions(span, config)
+
+		stream := g.stream
+		if stream == nil {
+			stream = g.models.GenerateContentStream
+		}
+		seq := stream(ctx, model, contents, config)
 		var (
 			acc       = newResponseAccumulator()
 			sawError  bool
@@ -113,6 +124,15 @@ func (g *GenAIModels) GenerateContentStream(ctx context.Context, model string, c
 			}
 			endSpan()
 		}
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				sawError = true
+				recordError(span, fmt.Errorf("stream panic: %v", recovered))
+				end()
+				panic(recovered)
+			}
+			end()
+		}()
 
 		for resp, err := range seq {
 			if resp != nil {
@@ -122,7 +142,6 @@ func (g *GenAIModels) GenerateContentStream(ctx context.Context, model string, c
 				sawError = true
 				recordError(span, err)
 				yield(resp, err)
-				end()
 				return
 			}
 			if !yield(resp, nil) {
@@ -130,7 +149,9 @@ func (g *GenAIModels) GenerateContentStream(ctx context.Context, model string, c
 				break // consumer stopped early
 			}
 		}
-		end()
+		if ctx.Err() != nil {
+			cancelled = true
+		}
 	}
 }
 
@@ -206,6 +227,7 @@ func setInputMessages(span trace.Span, contents []*genai.Content, config *genai.
 			attribute.String(fmt.Sprintf("%s%d.role", attrs.LLMInputMessagePrefix, idx), "system"),
 			attribute.String(fmt.Sprintf("%s%d.content", attrs.LLMInputMessagePrefix, idx), contentText(config.SystemInstruction)),
 		)
+		setContentMedia(span, fmt.Sprintf("%s%d", attrs.LLMInputMessagePrefix, idx), config.SystemInstruction, "input")
 		idx++
 	}
 	for _, c := range contents {
@@ -220,6 +242,7 @@ func setInputMessages(span trace.Span, contents []*genai.Content, config *genai.
 			attribute.String(fmt.Sprintf("%s%d.role", attrs.LLMInputMessagePrefix, idx), role),
 			attribute.String(fmt.Sprintf("%s%d.content", attrs.LLMInputMessagePrefix, idx), contentText(c)),
 		)
+		setContentMedia(span, fmt.Sprintf("%s%d", attrs.LLMInputMessagePrefix, idx), c, "input")
 		idx++
 	}
 }
@@ -263,6 +286,23 @@ func setToolDefinitions(span trace.Span, config *genai.GenerateContentConfig) {
 		return
 	}
 	t := 0
+	emit := func(toolType, name, description string, schema, definition any) {
+		prefix := fmt.Sprintf("%s%d.", attrs.LLMToolPrefix, t)
+		span.SetAttributes(
+			attribute.String(prefix+"type", toolType),
+			attribute.String(prefix+"definition", mustJSON(definition)),
+		)
+		if name != "" {
+			span.SetAttributes(attribute.String(prefix+"name", name))
+		}
+		if description != "" {
+			span.SetAttributes(attribute.String(prefix+"description", description))
+		}
+		if schema != nil {
+			span.SetAttributes(attribute.String(prefix+"input_schema", mustJSON(schema)))
+		}
+		t++
+	}
 	for _, tool := range config.Tools {
 		if tool == nil {
 			continue
@@ -271,14 +311,53 @@ func setToolDefinitions(span trace.Span, config *genai.GenerateContentConfig) {
 			if fn == nil {
 				continue
 			}
-			span.SetAttributes(attribute.String(fmt.Sprintf("%s%d.name", attrs.LLMToolPrefix, t), fn.Name))
-			if fn.Description != "" {
-				span.SetAttributes(attribute.String(fmt.Sprintf("%s%d.description", attrs.LLMToolPrefix, t), fn.Description))
-			}
-			if fn.Parameters != nil {
-				span.SetAttributes(attribute.String(fmt.Sprintf("%s%d.input_schema", attrs.LLMToolPrefix, t), mustJSON(fn.Parameters)))
-			}
-			t++
+			emit("function", fn.Name, fn.Description, fn.Parameters, fn)
+		}
+		variants := make([]struct {
+			kind  string
+			value any
+		}, 0, 10)
+		appendVariant := func(kind string, value any) {
+			variants = append(variants, struct {
+				kind  string
+				value any
+			}{kind, value})
+		}
+		if tool.Retrieval != nil {
+			appendVariant("retrieval", tool.Retrieval)
+		}
+		if tool.ComputerUse != nil {
+			appendVariant("computer_use", tool.ComputerUse)
+		}
+		if tool.FileSearch != nil {
+			appendVariant("file_search", tool.FileSearch)
+		}
+		if tool.GoogleSearch != nil {
+			appendVariant("google_search", tool.GoogleSearch)
+		}
+		if tool.GoogleMaps != nil {
+			appendVariant("google_maps", tool.GoogleMaps)
+		}
+		if tool.CodeExecution != nil {
+			appendVariant("code_execution", tool.CodeExecution)
+		}
+		if tool.EnterpriseWebSearch != nil {
+			appendVariant("enterprise_web_search", tool.EnterpriseWebSearch)
+		}
+		if tool.GoogleSearchRetrieval != nil {
+			appendVariant("google_search_retrieval", tool.GoogleSearchRetrieval)
+		}
+		if tool.ParallelAISearch != nil {
+			appendVariant("parallel_ai_search", tool.ParallelAISearch)
+		}
+		if tool.URLContext != nil {
+			appendVariant("url_context", tool.URLContext)
+		}
+		for _, variant := range variants {
+			emit(variant.kind, "", "", nil, variant.value)
+		}
+		if len(tool.MCPServers) > 0 {
+			emit("mcp_servers", "", "", nil, tool.MCPServers)
 		}
 	}
 }
@@ -302,11 +381,14 @@ type accumulatedToolCall struct {
 }
 
 type accumulatedChoice struct {
-	role      string
-	text      string
-	thinking  string
-	finish    genai.FinishReason
-	toolCalls map[int]*accumulatedToolCall
+	role              string
+	text              string
+	thinking          string
+	finish            genai.FinishReason
+	toolCalls         map[int]*accumulatedToolCall
+	toolPositionsByID map[string]int
+	nextToolPosition  int
+	media             map[string]capturedMedia
 }
 
 type responseAccumulator struct {
@@ -335,8 +417,10 @@ func (a *responseAccumulator) add(resp *genai.GenerateContentResponse) {
 		choice := a.choices[index]
 		if choice == nil {
 			choice = &accumulatedChoice{
-				role:      "assistant",
-				toolCalls: make(map[int]*accumulatedToolCall),
+				role:              "assistant",
+				toolCalls:         make(map[int]*accumulatedToolCall),
+				toolPositionsByID: make(map[string]int),
+				media:             make(map[string]capturedMedia),
 			}
 			a.choices[index] = choice
 		}
@@ -344,10 +428,12 @@ func (a *responseAccumulator) add(resp *genai.GenerateContentResponse) {
 			if cand.Content.Role != "" && cand.Content.Role != "model" {
 				choice.role = cand.Content.Role
 			}
-			toolPosition := 0
 			for _, part := range cand.Content.Parts {
 				if part == nil {
 					continue
+				}
+				for _, media := range partMedia(part, "output") {
+					choice.media[media.key()] = media
 				}
 				switch {
 				case part.Thought && part.Text != "":
@@ -355,6 +441,14 @@ func (a *responseAccumulator) add(resp *genai.GenerateContentResponse) {
 				case part.Text != "":
 					choice.text += part.Text
 				case part.FunctionCall != nil:
+					toolPosition, linked := choice.toolPositionsByID[part.FunctionCall.ID]
+					if part.FunctionCall.ID == "" || !linked {
+						toolPosition = choice.nextToolPosition
+						choice.nextToolPosition++
+						if part.FunctionCall.ID != "" {
+							choice.toolPositionsByID[part.FunctionCall.ID] = toolPosition
+						}
+					}
 					call := choice.toolCalls[toolPosition]
 					if call == nil {
 						call = &accumulatedToolCall{
@@ -372,7 +466,6 @@ func (a *responseAccumulator) add(resp *genai.GenerateContentResponse) {
 					for key, value := range part.FunctionCall.Args {
 						call.arguments[key] = value
 					}
-					toolPosition++
 				}
 			}
 		}
@@ -390,6 +483,7 @@ func (a *responseAccumulator) add(resp *genai.GenerateContentResponse) {
 }
 
 func (a *responseAccumulator) apply(span trace.Span) {
+	span.SetAttributes(attribute.String("neatlogs.capture_fidelity", "native"))
 	indexes := make([]int, 0, len(a.choices))
 	for index := range a.choices {
 		indexes = append(indexes, index)
@@ -406,6 +500,14 @@ func (a *responseAccumulator) apply(span trace.Span) {
 		if choice.thinking != "" {
 			span.SetAttributes(attribute.String(prefix+"thinking", choice.thinking))
 		}
+		mediaKeys := make([]string, 0, len(choice.media))
+		for key := range choice.media {
+			mediaKeys = append(mediaKeys, key)
+		}
+		sort.Strings(mediaKeys)
+		for mediaIndex, key := range mediaKeys {
+			setMediaAttributes(span, fmt.Sprintf("%smedia.%d.", prefix, mediaIndex), choice.media[key])
+		}
 		if choice.finish != "" {
 			span.SetAttributes(attribute.String(fmt.Sprintf("%s%d.finish_reason", attrs.LLMChoicePrefix, index), string(choice.finish)))
 			if index == indexes[0] {
@@ -420,13 +522,28 @@ func (a *responseAccumulator) apply(span trace.Span) {
 		for _, position := range toolPositions {
 			call := choice.toolCalls[position]
 			callPrefix := fmt.Sprintf("%s%d.", attrs.LLMToolCallPrefix, toolIndex)
+			arguments := mustJSON(call.arguments)
+			synthetic := false
+			if call.id == "" {
+				context := span.SpanContext()
+				argumentDigest := sha256.Sum256([]byte(arguments))
+				identity := fmt.Sprintf(
+					"%s:%s:%d:%d:%s:%x",
+					context.TraceID(), context.SpanID(), index, position, call.name, argumentDigest,
+				)
+				digest := sha256.Sum256([]byte(identity))
+				call.id = fmt.Sprintf("nl_%x", digest[:12])
+				synthetic = true
+			}
 			span.SetAttributes(
+				attribute.String(callPrefix+"id", call.id),
 				attribute.String(callPrefix+"name", call.name),
 				attribute.Int(callPrefix+"choice_index", call.choiceIndex),
-				attribute.String(callPrefix+"arguments", mustJSON(call.arguments)),
+				attribute.Int(callPrefix+"tool_call_index", position),
+				attribute.String(callPrefix+"arguments", arguments),
 			)
-			if call.id != "" {
-				span.SetAttributes(attribute.String(callPrefix+"id", call.id))
+			if synthetic {
+				span.SetAttributes(attribute.Bool(callPrefix+"id_synthetic", true))
 			}
 			toolIndex++
 		}
@@ -437,18 +554,26 @@ func (a *responseAccumulator) apply(span trace.Span) {
 	setUsage(span, a.usage)
 }
 
+const maxSemanticStreamEvents = 128
+
 func recordStreamChunk(span trace.Span, acc *responseAccumulator, resp *genai.GenerateContentResponse) {
-	span.AddEvent(attrs.StreamChunkEvent, trace.WithAttributes(
-		attribute.Int(attrs.StreamChunkIndex, acc.chunkCount),
-		attribute.String(attrs.StreamChunkValue, mustJSON(resp)),
-		attribute.String(attrs.StreamChunkMIMEType, "application/json"),
-	))
+	chunkIndex := acc.chunkCount
 	acc.add(resp)
+	if chunkIndex >= maxSemanticStreamEvents {
+		return
+	}
+	span.AddEvent(attrs.StreamChunkEvent, trace.WithAttributes(
+		attribute.Int(attrs.StreamChunkIndex, chunkIndex),
+		attribute.String(attrs.StreamChunkSummary, semanticChunkSummary(resp)),
+	))
 }
 
 func finalizeStream(span trace.Span, acc *responseAccumulator, cancelled, sawError bool) {
 	acc.apply(span)
 	span.SetAttributes(attribute.Int(attrs.StreamChunkCount, acc.chunkCount))
+	if acc.chunkCount > maxSemanticStreamEvents {
+		span.SetAttributes(attribute.Int(attrs.StreamEventsDropped, acc.chunkCount-maxSemanticStreamEvents))
+	}
 	if sawError {
 		return
 	}
@@ -458,6 +583,50 @@ func finalizeStream(span trace.Span, acc *responseAccumulator, cancelled, sawErr
 		return
 	}
 	span.SetStatus(codes.Ok, "")
+}
+
+func semanticChunkSummary(resp *genai.GenerateContentResponse) string {
+	type choiceSummary struct {
+		Index         int    `json:"choice_index"`
+		TextBytes     int    `json:"text_bytes"`
+		ThinkingBytes int    `json:"thinking_bytes"`
+		ToolCalls     int    `json:"tool_calls"`
+		FinishReason  string `json:"finish_reason,omitempty"`
+	}
+	summary := struct {
+		Choices []choiceSummary `json:"choices"`
+		Usage   bool            `json:"usage"`
+	}{Usage: resp != nil && resp.UsageMetadata != nil}
+	if resp == nil {
+		return mustJSON(summary)
+	}
+	for position, candidate := range resp.Candidates {
+		if candidate == nil {
+			continue
+		}
+		index := int(candidate.Index)
+		if index == 0 && position > 0 {
+			index = position
+		}
+		choice := choiceSummary{Index: index, FinishReason: string(candidate.FinishReason)}
+		if candidate.Content != nil {
+			for _, part := range candidate.Content.Parts {
+				if part == nil {
+					continue
+				}
+				if part.Thought {
+					choice.ThinkingBytes += len(part.Text)
+				} else {
+					choice.TextBytes += len(part.Text)
+				}
+				if part.FunctionCall != nil {
+					choice.ToolCalls++
+				}
+			}
+		}
+		summary.Choices = append(summary.Choices, choice)
+	}
+	return mustJSON(summary)
 }
 
 // setUsage maps Gemini UsageMetadata onto neatlogs token-count attributes.
@@ -503,6 +672,99 @@ func contentText(c *genai.Content) string {
 		return text
 	}
 	return mustJSON(c.Parts)
+}
+
+type capturedMedia struct {
+	id         string
+	kind       string
+	source     string
+	mimeType   string
+	byteLength int
+	sha256     string
+	reference  string
+	purpose    string
+	state      string
+}
+
+func (m capturedMedia) key() string { return m.sha256 + ":" + m.reference + ":" + m.kind }
+
+func mediaKind(mimeType string) string {
+	switch {
+	case strings.HasPrefix(mimeType, "image/"):
+		return "image"
+	case strings.HasPrefix(mimeType, "audio/"):
+		return "audio"
+	case strings.HasPrefix(mimeType, "video/"):
+		return "video"
+	case mimeType == "application/pdf", strings.HasPrefix(mimeType, "text/"):
+		return "document"
+	default:
+		return "media"
+	}
+}
+
+func partMedia(part *genai.Part, purpose string) []capturedMedia {
+	if part == nil {
+		return nil
+	}
+	media := make([]capturedMedia, 0, 2)
+	if part.InlineData != nil {
+		digest := sha256.Sum256(part.InlineData.Data)
+		media = append(media, capturedMedia{
+			id: fmt.Sprintf("nl_media_%x", digest[:12]), kind: mediaKind(part.InlineData.MIMEType),
+			source: "inline", mimeType: part.InlineData.MIMEType, byteLength: len(part.InlineData.Data),
+			sha256: fmt.Sprintf("%x", digest), purpose: purpose, state: "inline",
+		})
+	}
+	if part.FileData != nil && part.FileData.FileURI != "" {
+		digest := sha256.Sum256([]byte(part.FileData.FileURI))
+		source := "provider"
+		if strings.HasPrefix(part.FileData.FileURI, "http://") || strings.HasPrefix(part.FileData.FileURI, "https://") {
+			source = "url"
+		}
+		media = append(media, capturedMedia{
+			id: fmt.Sprintf("nl_media_%x", digest[:12]), kind: mediaKind(part.FileData.MIMEType),
+			source: source, mimeType: part.FileData.MIMEType, reference: part.FileData.FileURI,
+			purpose: purpose, state: "available",
+		})
+	}
+	return media
+}
+
+func setContentMedia(span trace.Span, prefix string, content *genai.Content, purpose string) {
+	if content == nil {
+		return
+	}
+	index := 0
+	seen := make(map[string]struct{})
+	for _, part := range content.Parts {
+		for _, media := range partMedia(part, purpose) {
+			if _, exists := seen[media.key()]; exists {
+				continue
+			}
+			seen[media.key()] = struct{}{}
+			setMediaAttributes(span, fmt.Sprintf("%s.media.%d.", prefix, index), media)
+			index++
+		}
+	}
+}
+
+func setMediaAttributes(span trace.Span, prefix string, media capturedMedia) {
+	values := []attribute.KeyValue{
+		attribute.String(prefix+"id", media.id), attribute.String(prefix+"type", media.kind),
+		attribute.String(prefix+"source", media.source), attribute.String(prefix+"mime_type", media.mimeType),
+		attribute.String(prefix+"purpose", media.purpose), attribute.String(prefix+"state", media.state),
+	}
+	if media.byteLength > 0 {
+		values = append(values, attribute.Int(prefix+"byte_length", media.byteLength))
+	}
+	if media.sha256 != "" {
+		values = append(values, attribute.String(prefix+"sha256", media.sha256))
+	}
+	if media.reference != "" {
+		values = append(values, attribute.String(prefix+"reference", media.reference))
+	}
+	span.SetAttributes(values...)
 }
 
 // recordError marks the span as failed. It does NOT end the span; callers end

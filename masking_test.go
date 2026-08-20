@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
@@ -90,6 +91,35 @@ func TestMaskFailureAndNilResultFailClosed(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestMaskPanicFailsClosed(t *testing.T) {
+	masked, err := callMaskSafely(func(context.Context, SpanData) (*SpanData, error) {
+		panic("secret")
+	}, context.Background(), SpanData{})
+	if err == nil || masked != nil {
+		t.Fatalf("panic result = %#v, %v; want nil and error", masked, err)
+	}
+}
+
+func TestMaskBatchHonorsCallerDeadlineWhenCallbackDoesNot(t *testing.T) {
+	block := make(chan struct{})
+	exporter := &normalizingExporter{mask: func(context.Context, SpanData) (*SpanData, error) {
+		<-block
+		value := SpanData{}
+		return &value, nil
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	results := exporter.maskBatch(ctx, []spanStub{{}})
+	close(block)
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("mask deadline returned after %v", elapsed)
+	}
+	if results[0] != nil {
+		t.Fatalf("timed-out mask returned %#v, want nil", results[0])
 	}
 }
 

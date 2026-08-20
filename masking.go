@@ -23,7 +23,7 @@ type SpanData struct {
 // MaskFunc transforms a cloned span at the final Neatlogs exporter boundary.
 // Return nil to intentionally drop the span. Returning an error also drops the
 // span (fail closed); the unmasked original is never exported. The callback
-// runs on the OTel batch-export worker and should honor ctx cancellation.
+// runs in a bounded worker with a deadline and should honor ctx cancellation.
 type MaskFunc func(ctx context.Context, span SpanData) (*SpanData, error)
 
 func spanDataFrom(stub *spanStub) SpanData {

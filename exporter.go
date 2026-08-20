@@ -2,6 +2,9 @@ package neatlogs
 
 import (
 	"context"
+	"fmt"
+	"sync"
+	"time"
 
 	"go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
@@ -20,10 +23,19 @@ import (
 // This makes spans created through Neatlogs wrappers or an explicitly injected
 // private tracer arrive keyed by the neatlogs.* contract.
 type normalizingExporter struct {
-	next   trace.SpanExporter
-	mapper *attributes.Mapper
-	mask   MaskFunc
+	next      trace.SpanExporter
+	mapper    *attributes.Mapper
+	mask      MaskFunc
+	delivery  *deliveryDiagnostics
+	release   func(int)
+	maskOnce  sync.Once
+	maskSlots chan struct{}
 }
+
+const (
+	defaultMaskTimeout = 5 * time.Second
+	defaultMaskWorkers = 4
+)
 
 // Local alias keeps the mask conversion independent of tracetest naming in the
 // public API while retaining the SDK's lossless read-only-span clone.
@@ -32,23 +44,100 @@ type spanStub = tracetest.SpanStub
 var _ trace.SpanExporter = (*normalizingExporter)(nil)
 
 func (e *normalizingExporter) ExportSpans(ctx context.Context, spans []trace.ReadOnlySpan) error {
-	rewritten := make([]trace.ReadOnlySpan, 0, len(spans))
-	for _, s := range spans {
+	if e.release != nil {
+		defer e.release(len(spans))
+	}
+	stubs := make([]spanStub, len(spans))
+	for index, s := range spans {
 		stub := tracetest.SpanStubFromReadOnlySpan(s)
 		stub.Attributes = e.mapper.Normalize(stub.Attributes)
-		if e.mask != nil {
-			masked, err := e.mask(ctx, spanDataFrom(&stub))
-			if err != nil || masked == nil {
+		stubs[index] = stub
+	}
+
+	keep := make([]bool, len(stubs))
+	for index := range keep {
+		keep[index] = true
+	}
+	if e.mask != nil {
+		masked := e.maskBatch(ctx, stubs)
+		for index, result := range masked {
+			if result == nil {
+				keep[index] = false
+				if e.delivery != nil {
+					e.delivery.maskedSpanDrops.Add(1)
+				}
 				continue
 			}
-			applySpanData(&stub, masked)
+			applySpanData(&stubs[index], result)
 		}
-		rewritten = append(rewritten, stub.Snapshot())
+	}
+
+	rewritten := make([]trace.ReadOnlySpan, 0, len(stubs))
+	for index := range stubs {
+		if keep[index] {
+			rewritten = append(rewritten, stubs[index].Snapshot())
+		}
 	}
 	if len(rewritten) == 0 {
 		return nil
 	}
-	return e.next.ExportSpans(ctx, rewritten)
+	err := e.next.ExportSpans(ctx, rewritten)
+	if err != nil && e.delivery != nil {
+		e.delivery.spanExportFailures.Add(uint64(len(rewritten)))
+	}
+	return err
+}
+
+type maskBatchResult struct {
+	index int
+	data  *SpanData
+	err   error
+}
+
+func (e *normalizingExporter) maskBatch(ctx context.Context, stubs []spanStub) []*SpanData {
+	e.maskOnce.Do(func() { e.maskSlots = make(chan struct{}, defaultMaskWorkers) })
+	maskCtx, cancel := context.WithTimeout(ctx, defaultMaskTimeout)
+	defer cancel()
+	results := make([]*SpanData, len(stubs))
+	completed := make(chan maskBatchResult, len(stubs))
+
+	for index := range stubs {
+		index := index
+		data := spanDataFrom(&stubs[index])
+		go func() {
+			select {
+			case e.maskSlots <- struct{}{}:
+				defer func() { <-e.maskSlots }()
+			case <-maskCtx.Done():
+				completed <- maskBatchResult{index: index, err: maskCtx.Err()}
+				return
+			}
+			masked, err := callMaskSafely(e.mask, maskCtx, data)
+			completed <- maskBatchResult{index: index, data: masked, err: err}
+		}()
+	}
+
+	for received := 0; received < len(stubs); received++ {
+		select {
+		case result := <-completed:
+			if result.err == nil {
+				results[result.index] = result.data
+			}
+		case <-maskCtx.Done():
+			return results
+		}
+	}
+	return results
+}
+
+func callMaskSafely(mask MaskFunc, ctx context.Context, data SpanData) (masked *SpanData, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			masked = nil
+			err = fmt.Errorf("mask panic: %v", recovered)
+		}
+	}()
+	return mask(ctx, data)
 }
 
 func (e *normalizingExporter) Shutdown(ctx context.Context) error {

@@ -54,9 +54,9 @@ const (
 
 	StreamChunkEvent    = "neatlogs.stream.chunk"
 	StreamChunkIndex    = "neatlogs.stream.chunk.index"
-	StreamChunkValue    = "neatlogs.stream.chunk.value"
-	StreamChunkMIMEType = "neatlogs.stream.chunk.mime_type"
+	StreamChunkSummary  = "neatlogs.stream.chunk.summary"
 	StreamChunkCount    = "neatlogs.stream.chunk_count"
+	StreamEventsDropped = "neatlogs.stream.events_dropped"
 	StreamCancelled     = "neatlogs.stream.cancelled"
 )
 
