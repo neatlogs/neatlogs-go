@@ -33,7 +33,8 @@ func Trace(ctx context.Context, name string) (context.Context, trace.Span, func(
 	return StartSpan(ctx, name, attrs.KindWorkflow)
 }
 
-// StartSpan starts an explicitly typed Neatlogs span on the private provider.
+// StartSpan starts an explicitly typed Neatlogs span on the Client bound to ctx,
+// or on the process-wide Init provider when no Client is bound.
 // Use it at framework and service boundaries where Trace's WORKFLOW kind is not
 // appropriate (for example a TOOL child extracted from an incoming trace).
 func StartSpan(
@@ -45,10 +46,5 @@ func StartSpan(
 	attributes = append([]attribute.KeyValue{
 		attribute.String(attrs.SpanKind, kind),
 	}, attributes...)
-	_, span := tracer().Start(
-		privateStartContext(ctx),
-		name,
-		trace.WithAttributes(attributes...),
-	)
-	return withPrivateTraceContext(ctx, span.SpanContext()), span, func() { span.End() }
+	return startSpanForContext(ctx, name, trace.WithAttributes(attributes...))
 }

@@ -28,6 +28,35 @@ func byName(sink *tracetest.InMemoryExporter, name string) tracetest.SpanStub {
 	return tracetest.SpanStub{}
 }
 
+func TestCompletionProcessorQueuesMarkerAfterRoot(t *testing.T) {
+	ctx := context.Background()
+	sink := tracetest.NewInMemoryExporter()
+	shutdown, err := Init(ctx, Config{WorkflowName: "completion-order"}, WithExporter(sink))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdown(ctx)
+
+	_, _, end := Trace(ctx, "ordered.root")
+	end()
+	if err := Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	rootIndex, markerIndex := -1, -1
+	for i, span := range sink.GetSpans() {
+		switch span.Name {
+		case "ordered.root":
+			rootIndex = i
+		case completionMarkerName:
+			markerIndex = i
+		}
+	}
+	if rootIndex < 0 || markerIndex < 0 || rootIndex >= markerIndex {
+		t.Fatalf("export order root=%d marker=%d; completion processor must run after root exporter", rootIndex, markerIndex)
+	}
+}
+
 // Trace stamps session + end-user identity (bound on ctx via Identify) on the
 // WORKFLOW root.
 func TestTrace_StampsIdentityOnRoot(t *testing.T) {
@@ -281,7 +310,10 @@ func TestIdentityProcessor_StampsPrivateProviderRoot(t *testing.T) {
 	})
 
 	// Simulate a framework that accepts the private provider/tracer explicitly.
-	_, span := provider.Tracer("gcp.vertex.agent").Start(ctx, "adk.invoke")
+	global.mu.Lock()
+	tp := global.runtime.provider
+	global.mu.Unlock()
+	_, span := tp.Tracer("gcp.vertex.agent").Start(ctx, "adk.invoke")
 	span.End()
 	Flush(ctx)
 

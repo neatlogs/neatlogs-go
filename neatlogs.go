@@ -78,6 +78,16 @@ type Config struct {
 
 	// DisableExport drops all spans instead of sending them. Useful in tests.
 	DisableExport bool
+
+	// EnableSignalHandlers opts Init into handling SIGINT and SIGTERM. The zero
+	// value is false: by default Neatlogs never calls signal.Notify and the host
+	// retains complete signal ownership. Clients never install signal handlers.
+	EnableSignalHandlers bool
+
+	// DisableSignalHandlers is retained for source compatibility.
+	// Deprecated: signal handling is disabled by default. If both fields are
+	// true, DisableSignalHandlers wins.
+	DisableSignalHandlers bool
 }
 
 // ShutdownFunc flushes pending spans and releases SDK resources. Call it (often
@@ -85,13 +95,21 @@ type Config struct {
 type ShutdownFunc func(context.Context) error
 
 var (
-	mu       sync.Mutex
-	provider *sdktrace.TracerProvider
-	noopTP   = trace.NewNoopTracerProvider()
+	noopTP = trace.NewNoopTracerProvider()
+	global = globalLifecycle{state: stateUninitialized}
 )
 
-// Option customizes Init. Options are for advanced/testing use; the common path
-// needs only Config.
+// globalLifecycle is the process-wide Init gate. It deliberately remains in
+// stateClosing until the old provider has fully shut down, preventing Init and
+// new spans from overlapping that close.
+type globalLifecycle struct {
+	mu      sync.Mutex
+	state   sdkState
+	runtime *sdkRuntime
+}
+
+// Option customizes Init or NewClient. Options are for advanced/testing use;
+// the common path needs only Config.
 type Option func(*initOptions)
 
 type initOptions struct {
@@ -117,12 +135,137 @@ func Init(ctx context.Context, cfg Config, opts ...Option) (ShutdownFunc, error)
 		opt(&io)
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-	if provider != nil {
+	global.mu.Lock()
+	if global.state != stateUninitialized {
+		global.mu.Unlock()
 		return nil, fmt.Errorf("neatlogs: already initialized; call the returned shutdown first")
 	}
+	runtime, base, exportEnabled, err := buildSDKRuntime(ctx, cfg, io)
+	if err != nil {
+		global.mu.Unlock()
+		return nil, err
+	}
+	global.runtime = runtime
+	global.state = stateRunning
 
+	if cfg.EnableSignalHandlers && !cfg.DisableSignalHandlers {
+		signalController := newShutdownSignalController()
+		runtime.setSignalController(signalController)
+		signalController.Start(func(sig os.Signal) {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), gracefulSignalTimeout)
+			defer cancel()
+			_ = global.shutdown(shutdownCtx, runtime, signalTerminationReason(sig))
+		})
+	}
+	global.mu.Unlock()
+
+	if cfg.Debug {
+		fmt.Fprintf(os.Stderr, "neatlogs: initialized (workflow=%q, endpoint=%s, export=%v)\n", runtime.workflowName, base.String(), exportEnabled)
+	}
+
+	return func(ctx context.Context) error {
+		return global.shutdown(ctx, runtime, "shutdown")
+	}, nil
+}
+
+// Flush forces a synchronous export of all buffered spans. Safe to call even
+// when the SDK is not initialized (it is a no-op then).
+func Flush(ctx context.Context) error {
+	if client, ok := ClientFromContext(ctx); ok {
+		return client.Flush(ctx)
+	}
+	return global.forceFlush(ctx)
+}
+
+func (g *globalLifecycle) startSpan(
+	ctx context.Context,
+	name string,
+	options ...trace.SpanStartOption,
+) (context.Context, trace.Span, func()) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.state != stateRunning || g.runtime == nil {
+		return startNoopSpan(ctx, name, options...)
+	}
+	return g.runtime.startSpan(ctx, name, options...)
+}
+
+func (g *globalLifecycle) startProviderSpan(ctx context.Context, name, kind string) (context.Context, trace.Span, func()) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.state != stateRunning || g.runtime == nil {
+		return startNoopSpan(ctx, name)
+	}
+	return g.runtime.startProviderSpan(ctx, name, kind)
+}
+
+func startSpanForContext(
+	ctx context.Context,
+	name string,
+	options ...trace.SpanStartOption,
+) (context.Context, trace.Span, func()) {
+	if client, ok := ClientFromContext(ctx); ok {
+		if client.runtime == nil {
+			return startNoopSpan(ctx, name, options...)
+		}
+		return client.runtime.startSpan(ctx, name, options...)
+	}
+	return global.startSpan(ctx, name, options...)
+}
+
+func startProviderSpanForContext(ctx context.Context, name, kind string) (context.Context, trace.Span, func()) {
+	if client, ok := ClientFromContext(ctx); ok {
+		if client.runtime == nil {
+			return startNoopSpan(ctx, name)
+		}
+		return client.runtime.startProviderSpan(ctx, name, kind)
+	}
+	return global.startProviderSpan(ctx, name, kind)
+}
+
+func (g *globalLifecycle) forceFlush(ctx context.Context) error {
+	g.mu.Lock()
+	runtime := g.runtime
+	state := g.state
+	g.mu.Unlock()
+	if runtime == nil || state == stateUninitialized {
+		return nil
+	}
+	return runtime.forceFlush(ctx)
+}
+
+func (g *globalLifecycle) shutdown(ctx context.Context, runtime *sdkRuntime, reason string) error {
+	g.mu.Lock()
+	if g.runtime != runtime {
+		g.mu.Unlock()
+		return runtime.wait(ctx)
+	}
+	switch g.state {
+	case stateRunning:
+		g.state = stateClosing
+	case stateClosing:
+		g.mu.Unlock()
+		return runtime.wait(ctx)
+	case stateUninitialized:
+		g.mu.Unlock()
+		return runtime.wait(ctx)
+	}
+	g.mu.Unlock()
+
+	err := runtime.shutdown(ctx, reason)
+
+	g.mu.Lock()
+	if g.runtime == runtime {
+		g.runtime = nil
+		g.state = stateUninitialized
+	}
+	g.mu.Unlock()
+	return err
+}
+
+// buildSDKRuntime constructs one private provider. Supplying a custom exporter
+// transfers its shutdown ownership to the returned runtime.
+func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRuntime, *url.URL, bool, error) {
 	apiKey := strings.TrimSpace(cfg.APIKey)
 	if apiKey == "" {
 		apiKey = strings.TrimSpace(os.Getenv("NEATLOGS_API_KEY"))
@@ -138,75 +281,43 @@ func Init(ctx context.Context, cfg Config, opts ...Option) (ShutdownFunc, error)
 		}
 	}
 
-	endpoint := cfg.Endpoint
+	endpoint := strings.TrimSpace(cfg.Endpoint)
 	if endpoint == "" {
-		endpoint = os.Getenv("NEATLOGS_ENDPOINT")
+		endpoint = strings.TrimSpace(os.Getenv("NEATLOGS_ENDPOINT"))
 	}
 	if endpoint == "" {
 		endpoint = defaultEndpoint
 	}
 	base, err := url.Parse(endpoint)
 	if err != nil {
-		return nil, fmt.Errorf("neatlogs: invalid endpoint %q: %w", endpoint, err)
+		return nil, nil, false, fmt.Errorf("neatlogs: invalid endpoint %q: %w", endpoint, err)
 	}
 
-	res := buildResource(cfg)
-	setWorkflowName(resolvedWorkflowNameFrom(cfg))
-
 	var tpOpts []sdktrace.TracerProviderOption
-	tpOpts = append(tpOpts, sdktrace.WithResource(res))
+	tpOpts = append(tpOpts, sdktrace.WithResource(buildResource(ctx, cfg)))
 
 	if !disable {
 		exp := io.exporter
 		if exp == nil {
 			exp, err = newOTLPExporter(ctx, base, apiKey)
 			if err != nil {
-				return nil, fmt.Errorf("neatlogs: create exporter: %w", err)
+				return nil, nil, false, fmt.Errorf("neatlogs: create exporter: %w", err)
 			}
 		}
-		// Wrap so attributes are normalized to neatlogs.* before export.
+		// The batch processor is installed during provider construction. The
+		// completion processor is registered below, after this exporter/root
+		// path, so an ending root is queued before its completion marker.
 		tpOpts = append(tpOpts, sdktrace.WithBatcher(&normalizingExporter{next: exp, mapper: attributes.Default()}))
 	}
 
 	tp := sdktrace.NewTracerProvider(tpOpts...)
-	// Stamp session/end-user identity (bound via Identify) onto every root span
-	// at start — including spans the SDK doesn't create itself (e.g. ADK
-	// passthrough), which Trace()/the auto-root never see.
+	lifecycle := newActiveSpanRegistry()
+	tp.RegisterSpanProcessor(lifecycle)
 	tp.RegisterSpanProcessor(&identityProcessor{})
-	// Emit a trace-completion marker when each root span ends, so the backend
-	// finalizes and surfaces the trace. Registered after construction so it can
-	// use the provider's own tracer.
 	if !disable {
 		tp.RegisterSpanProcessor(&completionProcessor{tracer: tp.Tracer(tracerName, trace.WithInstrumentationVersion(Version))})
 	}
-	provider = tp
-
-	if cfg.Debug {
-		fmt.Fprintf(os.Stderr, "neatlogs: initialized (workflow=%q, endpoint=%s, export=%v)\n", resolvedWorkflowNameFrom(cfg), base.String(), !disable)
-	}
-
-	return func(ctx context.Context) error {
-		mu.Lock()
-		if provider != tp {
-			mu.Unlock()
-			return nil
-		}
-		provider = nil
-		mu.Unlock()
-		return tp.Shutdown(ctx)
-	}, nil
-}
-
-// Flush forces a synchronous export of all buffered spans. Safe to call even
-// when the SDK is not initialized (it is a no-op then).
-func Flush(ctx context.Context) error {
-	mu.Lock()
-	tp := provider
-	mu.Unlock()
-	if tp == nil {
-		return nil
-	}
-	return tp.ForceFlush(ctx)
+	return newSDKRuntime(tp, lifecycle, resolvedWorkflowNameFrom(cfg)), base, !disable, nil
 }
 
 // newOTLPExporter builds an OTLP/HTTP span exporter targeting {base}/v1/traces
@@ -233,7 +344,7 @@ func resolvedWorkflowNameFrom(cfg Config) string {
 	return defaultWorkflowName()
 }
 
-func buildResource(cfg Config) *resource.Resource {
+func buildResource(ctx context.Context, cfg Config) *resource.Resource {
 	workflow := resolvedWorkflowNameFrom(cfg)
 
 	attrs := []attribute.KeyValue{
@@ -245,8 +356,18 @@ func buildResource(cfg Config) *resource.Resource {
 		attrs = append(attrs, attribute.String(attributes.Tags, strings.Join(cfg.Tags, ",")))
 	}
 
-	// resource.Default carries SDK/runtime info; merge our attrs on top.
-	merged, err := resource.Merge(resource.Default(), resource.NewSchemaless(attrs...))
+	// Explicitly re-read OTEL_RESOURCE_ATTRIBUTES for each global runtime or
+	// Client. resource.Default may have been initialized before a process-scoped
+	// verification marker was installed; EnvironmentWithContext uses OTel's
+	// canonical escaping/parser and safely ignores malformed entries.
+	base := resource.DefaultWithContext(ctx)
+	if withEnv, err := resource.Merge(base, resource.EnvironmentWithContext(ctx)); err == nil {
+		base = withEnv
+	}
+
+	// SDK-owned attributes override environment values for their canonical keys;
+	// unrelated resource values such as neatlogs.verification.marker survive.
+	merged, err := resource.Merge(base, resource.NewSchemaless(attrs...))
 	if err != nil {
 		return resource.NewSchemaless(attrs...)
 	}
@@ -310,15 +431,4 @@ func shortSourcePath(file string) string {
 	default:
 		return parts[len(parts)-2] + "." + parts[len(parts)-1]
 	}
-}
-
-// tracer returns the SDK's tracer from its private provider.
-func tracer() trace.Tracer {
-	mu.Lock()
-	tp := provider
-	mu.Unlock()
-	if tp == nil {
-		return noopTP.Tracer(tracerName, trace.WithInstrumentationVersion(Version))
-	}
-	return tp.Tracer(tracerName, trace.WithInstrumentationVersion(Version))
 }

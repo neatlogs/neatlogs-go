@@ -38,6 +38,32 @@ resp, _ := gc.GenerateContent(ctx, "gemini-2.5-flash", contents, config)
 `gc` has the same method signatures as `client.Models`, so wrapping is a
 one-line change. See [examples/genai](examples/genai/main.go).
 
+### Independent context-scoped clients
+
+Use `NewClient` when one process must send different requests to different
+Neatlogs projects or own their lifecycles independently:
+
+```go
+project, err := neatlogs.NewClient(ctx, neatlogs.Config{
+    APIKey:       projectKey,
+    WorkflowName: "tenant-agent",
+})
+if err != nil {
+    log.Fatal(err)
+}
+defer project.Shutdown(context.Background())
+
+ctx = neatlogs.WithClient(ctx, project)
+resp, err := nlgenai.WrapGenAI(client).GenerateContent(ctx, model, contents, config)
+```
+
+The bound context routes `WrapGenAI`, `Trace`, `StartSpan`,
+`StartProviderSpan`, and the LLM/retriever/tool helpers through that Client.
+Each Client owns its provider, exporter, workflow resource, active spans,
+flush, and shutdown gate. Closing one Client does not affect global `Init` or
+another Client, and a context bound to a closed Client produces no-op spans
+rather than falling back to the global pipeline.
+
 ## Instrumentation and isolation
 
 ### 1. Active wrapping — `WrapGenAI`
@@ -92,6 +118,19 @@ delays your agent code.
 | `APIKey`       | `NEATLOGS_API_KEY` | Your Neatlogs project key. Required to export; if empty, spans are dropped. |
 | `WorkflowName` | —                  | Service/run label grouping your traces. Defaults to the caller source file (e.g. `main.go`). |
 | `Tags`         | —                  | Attached to every span (optional). |
+| `EnableSignalHandlers` | —           | Opt in to SDK-owned SIGINT/SIGTERM shutdown. Defaults to `false`; Neatlogs does not call `signal.Notify` unless enabled. Applies to `Init`, not `NewClient`. |
+
+`DisableSignalHandlers` remains as a deprecated source-compatibility field.
+Signal handling is now disabled by default; if both signal fields are true,
+`DisableSignalHandlers` wins. Hosts that own signals should leave
+`EnableSignalHandlers` false and call the returned shutdown function during
+their existing shutdown sequence.
+
+To correlate a one-off live verification run, append
+`neatlogs.verification.marker=<UUID>` to the launched process's existing
+`OTEL_RESOURCE_ATTRIBUTES`. The SDK uses OpenTelemetry's resource-environment
+parser for every global runtime and Client, so the marker and existing resource
+attributes reach every emitted span without a source or persistent-config edit.
 
 ## Transport
 

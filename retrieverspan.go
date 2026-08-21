@@ -27,7 +27,8 @@ type RetrieverSpan struct {
 // named name, recording the query and (optional) top-k. It auto-roots when the
 // context has no active parent and nests under an existing parent otherwise
 // (e.g. a TOOL span continued from an upstream service). Uses the private
-// Neatlogs provider only; when Neatlogs is not initialized the span is a no-op.
+// Neatlogs Client bound to ctx, or process-wide Init when no Client is bound;
+// when the selected pipeline is unavailable or closing, the span is a no-op.
 //
 // Call End on the returned RetrieverSpan exactly once, usually via defer.
 func StartRetrieverSpan(ctx context.Context, name, query string, topK int) (context.Context, *RetrieverSpan) {

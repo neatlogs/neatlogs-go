@@ -56,8 +56,9 @@ type LLMSpan struct {
 // WORKFLOW span when the context has no active parent (so a standalone call
 // still yields a renderable trace) and nesting under an existing parent
 // otherwise (e.g. a TOOL span continued from an upstream service). It uses the
-// private Neatlogs provider only; the process-global OTel / Datadog context is
-// never read or mutated. When Neatlogs is not initialized the span is a no-op.
+// Client bound to ctx, or process-wide Init when no Client is bound. The
+// process-global OTel / Datadog context is never read or mutated. When the
+// selected pipeline is unavailable or closing, the span is a no-op.
 //
 // Call End on the returned LLMSpan exactly once, usually via defer.
 func StartLLMSpan(ctx context.Context, opts LLMCallOptions) (context.Context, *LLMSpan) {

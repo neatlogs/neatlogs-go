@@ -27,9 +27,10 @@ type ToolSpan struct {
 // header extraction, the private W3C propagator, span-kind and tool.* attribute
 // keys, and error status are all handled here, so the caller imports only this
 // package — no OpenTelemetry types. It uses the private Neatlogs propagator and
-// provider only; the process-global OTel / Datadog context is never read or
-// mutated. When Neatlogs is not initialized the span is a no-op and this just
-// returns a wrapped context.
+// the Client bound to ctx (or process-wide Init); the process-global OTel /
+// Datadog context is never read or mutated. When the selected pipeline is
+// unavailable or closing, the span is a no-op and this returns a wrapped
+// context.
 //
 // Call End on the returned ToolSpan exactly once, usually via defer.
 func StartToolSpanFromHeaders(

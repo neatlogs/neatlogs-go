@@ -52,7 +52,9 @@ type GenAIModels struct {
 // Spans carry full request/response detail — input/output messages, tool
 // definitions and calls, invocation parameters, token usage and finish reason —
 // keyed in the neatlogs.* namespace. The Vertex AI backend is detected from the
-// client config and tagged distinctly from the Gemini API.
+// client config and tagged distinctly from the Gemini API. Passing a context
+// from neatlogs.WithClient routes every wrapped operation to that Client;
+// otherwise operations use process-wide neatlogs.Init.
 func WrapGenAI(client *genai.Client) *GenAIModels {
 	if client == nil {
 		return &GenAIModels{provider: geminiProvider, system: geminiSystem}

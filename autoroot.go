@@ -4,9 +4,7 @@ import (
 	"context"
 	"os"
 	"strings"
-	"sync"
 
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
 	attrs "github.com/neatlogs/neatlogs-go/internal/attributes"
@@ -39,29 +37,6 @@ var rootKinds = map[string]struct{}{
 	"mcp_tool":         {},
 }
 
-var (
-	workflowNameMu sync.RWMutex
-	workflowName   = "workflow"
-)
-
-// setWorkflowName records the resolved workflow name so auto-root spans can be
-// named after it. Called by Init.
-func setWorkflowName(name string) {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return
-	}
-	workflowNameMu.Lock()
-	workflowName = name
-	workflowNameMu.Unlock()
-}
-
-func resolveRootWorkflowName() string {
-	workflowNameMu.RLock()
-	defer workflowNameMu.RUnlock()
-	return workflowName
-}
-
 func autoRootEnabled() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("NEATLOGS_AUTO_ROOT"))) {
 	case "false", "0", "no", "off":
@@ -75,32 +50,8 @@ func autoRootEnabled() bool {
 // when needed. The returned end func ends the provider span and the auto-root
 // (if one was opened); callers must invoke it exactly once. Every provider-span
 // kind passes through here, so all wrapper paths (sync, stream finalize, error)
-// get auto-root coverage by calling end().
+// get auto-root coverage by calling end(). A Client bound to ctx owns both
+// spans; otherwise they use process-wide Init.
 func StartProviderSpan(ctx context.Context, name, kind string) (context.Context, trace.Span, func()) {
-	needsRoot := autoRootEnabled()
-	if _, isRoot := rootKinds[kind]; isRoot {
-		needsRoot = false
-	}
-	if privateSpanContext(ctx).IsValid() {
-		needsRoot = false // a local or extracted remote parent already anchors the trace
-	}
-
-	t := tracer()
-	if !needsRoot {
-		_, span := t.Start(privateStartContext(ctx), name)
-		return withPrivateTraceContext(ctx, span.SpanContext()), span, func() { span.End() }
-	}
-
-	// Session/end-user identity (bound via Identify) is stamped on this auto-root
-	// by the identityProcessor — it reads the start context, so no inline
-	// stamping is needed here.
-	rootCtx, root := t.Start(privateStartContext(ctx), resolveRootWorkflowName(), trace.WithAttributes(
-		attribute.String(attrs.SpanKind, attrs.KindWorkflow),
-		attribute.Bool("neatlogs.auto_root", true),
-	))
-	_, span := t.Start(rootCtx, name)
-	return withPrivateTraceContext(ctx, span.SpanContext()), span, func() {
-		span.End()
-		root.End()
-	}
+	return startProviderSpanForContext(ctx, name, kind)
 }
