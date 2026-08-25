@@ -13,6 +13,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"iter"
+	"sync"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -41,6 +43,7 @@ type GenAIModels struct {
 	models   *genai.Models
 	provider string
 	system   string
+	stream   func(context.Context, string, []*genai.Content, *genai.GenerateContentConfig) iter.Seq2[*genai.GenerateContentResponse, error]
 }
 
 // WrapGenAI wraps a genai.Client so its model calls emit Neatlogs spans.
@@ -63,13 +66,14 @@ func WrapGenAI(client *genai.Client) *GenAIModels {
 	if client.ClientConfig().Backend == genai.BackendVertexAI {
 		provider, system = vertexProvider, vertexSystem
 	}
-	return &GenAIModels{models: client.Models, provider: provider, system: system}
+	return &GenAIModels{models: client.Models, provider: provider, system: system, stream: client.Models.GenerateContentStream}
 }
 
 // GenerateContent traces a single content-generation call.
 func (g *GenAIModels) GenerateContent(ctx context.Context, model string, contents []*genai.Content, config *genai.GenerateContentConfig) (*genai.GenerateContentResponse, error) {
 	ctx, span, end := g.startLLMSpan(ctx, model, config, false)
 	defer end()
+	span.SetAttributes(attribute.String(attrs.LLMStreamCompletionState, "not_streamed"))
 	setInputMessages(span, contents, config)
 	setInvocationParams(span, config)
 	setToolDefinitions(span, config)
@@ -86,58 +90,84 @@ func (g *GenAIModels) GenerateContent(ctx context.Context, model string, content
 // GenerateContentStream traces a streaming generation, accumulating chunks to
 // reconstruct the response when the stream is fully consumed.
 func (g *GenAIModels) GenerateContentStream(ctx context.Context, model string, contents []*genai.Content, config *genai.GenerateContentConfig) iter.Seq2[*genai.GenerateContentResponse, error] {
-	ctx, span, endSpan := g.startLLMSpan(ctx, model, config, true)
-	setInputMessages(span, contents, config)
-	setInvocationParams(span, config)
-	setToolDefinitions(span, config)
-
-	seq := g.models.GenerateContentStream(ctx, model, contents, config)
-
 	return func(yield func(*genai.GenerateContentResponse, error) bool) {
-		var (
-			text     string
-			finish   genai.FinishReason
-			usage    *genai.GenerateContentResponseUsageMetadata
-			respID   string
-			sawError bool
-			ended    bool
+		streamCtx, span, endSpan := g.startLLMSpan(ctx, model, config, true)
+		setInputMessages(span, contents, config)
+		setInvocationParams(span, config)
+		setToolDefinitions(span, config)
+		span.SetAttributes(
+			attribute.String(attrs.LLMStreamCompletionState, "consumer_cancelled"),
+			attribute.Int(attrs.LLMStreamChunkCount, 0),
+			attribute.Bool(attrs.LLMStreamOutputTruncated, false),
 		)
-		end := func() {
-			if ended {
-				return
-			}
-			ended = true
-			if sawError {
-				endSpan() // status already set by recordError; close span + auto-root
-				return
-			}
-			if text != "" {
+		var (
+			text      string
+			truncated bool
+			chunks    int
+			finish    genai.FinishReason
+			usage     *genai.GenerateContentResponseUsageMetadata
+			respID    string
+			endOnce   sync.Once
+		)
+		finishStream := func(state string, err error) {
+			endOnce.Do(func() {
 				span.SetAttributes(
-					attribute.String(attrs.LLMOutputMessagePrefix+"0.role", "assistant"),
-					attribute.String(attrs.LLMOutputMessagePrefix+"0.content", text),
+					attribute.String(attrs.LLMStreamCompletionState, state),
+					attribute.Int(attrs.LLMStreamChunkCount, chunks),
+					attribute.Bool(attrs.LLMStreamOutputTruncated, truncated),
 				)
-			}
-			if finish != "" {
-				span.SetAttributes(attribute.String(attrs.LLMFinishReason, string(finish)))
-			}
-			if respID != "" {
-				span.SetAttributes(attribute.String(attrs.LLMResponseID, respID))
-			}
-			setUsage(span, usage)
-			span.SetStatus(codes.Ok, "")
-			endSpan()
+				if text != "" {
+					span.SetAttributes(
+						attribute.String(attrs.LLMOutputMessagePrefix+"0.role", "assistant"),
+						attribute.String(attrs.LLMOutputMessagePrefix+"0.content", text),
+						attribute.String(attrs.LLMStreamPartialOutput, text),
+					)
+				}
+				if finish != "" {
+					span.SetAttributes(attribute.String(attrs.LLMFinishReason, string(finish)))
+				}
+				if respID != "" {
+					span.SetAttributes(attribute.String(attrs.LLMResponseID, respID))
+				}
+				setUsage(span, usage)
+				if err != nil {
+					recordError(span, err)
+				} else {
+					span.SetStatus(codes.Ok, "")
+				}
+				endSpan()
+			})
 		}
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				finishStream("provider_error", fmt.Errorf("stream panic: %T", recovered))
+				panic(recovered)
+			}
+		}()
+		stream := g.stream
+		if stream == nil {
+			stream = g.models.GenerateContentStream
+		}
+		seq := stream(streamCtx, model, contents, config)
 
 		for resp, err := range seq {
 			if err != nil {
-				sawError = true
-				recordError(span, err)
+				state := "provider_error"
+				if streamCtx.Err() != nil {
+					state = "consumer_cancelled"
+				}
+				finishStream(state, err)
 				yield(resp, err)
-				end()
 				return
 			}
+			chunks++
 			if resp != nil {
-				text += extractText(resp)
+				text, truncated = appendBounded(text, extractText(resp), maxStreamOutputRunes, truncated)
+				span.SetAttributes(
+					attribute.Int(attrs.LLMStreamChunkCount, chunks),
+					attribute.Bool(attrs.LLMStreamOutputTruncated, truncated),
+					attribute.String(attrs.LLMStreamPartialOutput, text),
+				)
 				if resp.UsageMetadata != nil {
 					usage = resp.UsageMetadata
 				}
@@ -148,12 +178,46 @@ func (g *GenAIModels) GenerateContentStream(ctx context.Context, model string, c
 					finish = fr
 				}
 			}
-			if !yield(resp, nil) {
-				break // consumer stopped early
+			continued, panicValue := callConsumer(yield, resp)
+			if panicValue != nil {
+				finishStream("consumer_cancelled", fmt.Errorf("stream consumer panic: %T", panicValue))
+				panic(panicValue)
+			}
+			if !continued {
+				finishStream("consumer_cancelled", context.Canceled)
+				return
+			}
+			if err := streamCtx.Err(); err != nil {
+				finishStream("consumer_cancelled", err)
+				return
 			}
 		}
-		end()
+		if err := streamCtx.Err(); err != nil {
+			finishStream("consumer_cancelled", err)
+			return
+		}
+		finishStream("complete", nil)
 	}
+}
+
+const maxStreamOutputRunes = 64 * 1024
+
+func appendBounded(current, addition string, limit int, alreadyTruncated bool) (string, bool) {
+	remaining := limit - utf8.RuneCountInString(current)
+	if remaining <= 0 {
+		return current, alreadyTruncated || addition != ""
+	}
+	runes := []rune(addition)
+	if len(runes) <= remaining {
+		return current + addition, alreadyTruncated
+	}
+	return current + string(runes[:remaining]), true
+}
+
+func callConsumer(yield func(*genai.GenerateContentResponse, error) bool, resp *genai.GenerateContentResponse) (continued bool, panicValue any) {
+	defer func() { panicValue = recover() }()
+	continued = yield(resp, nil)
+	return continued, nil
 }
 
 // EmbedContent traces an embedding call.

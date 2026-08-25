@@ -46,6 +46,33 @@ func (p *activeSpanRegistry) OnEnd(span sdktrace.ReadOnlySpan) {
 	p.mu.Unlock()
 }
 
+func (p *activeSpanRegistry) setTraceOutput(current trace.SpanContext, output string) bool {
+	if !current.IsValid() {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	span, ok := p.spans[current.SpanID()]
+	if !ok || span.SpanContext().TraceID() != current.TraceID() {
+		return false
+	}
+	seen := make(map[trace.SpanID]struct{})
+	for span.Parent().IsValid() {
+		parentID := span.Parent().SpanID()
+		if _, duplicate := seen[parentID]; duplicate {
+			return false
+		}
+		seen[parentID] = struct{}{}
+		parent, exists := p.spans[parentID]
+		if !exists || parent.SpanContext().TraceID() != current.TraceID() {
+			return false
+		}
+		span = parent
+	}
+	span.SetAttributes(attribute.String("neatlogs.output.value", output))
+	return true
+}
+
 func (p *activeSpanRegistry) Shutdown(context.Context) error   { return nil }
 func (p *activeSpanRegistry) ForceFlush(context.Context) error { return nil }
 

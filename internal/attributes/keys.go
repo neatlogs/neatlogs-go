@@ -26,10 +26,14 @@ const GenAIOperationName = "gen_ai.operation.name"
 
 // LLM attributes emitted by the genai wrapper.
 const (
-	LLMProvider  = "neatlogs.llm.provider"
-	LLMSystem    = "neatlogs.llm.system"
-	LLMModelName = "neatlogs.llm.model_name"
-	LLMStreaming = "neatlogs.llm.is_streaming"
+	LLMProvider              = "neatlogs.llm.provider"
+	LLMSystem                = "neatlogs.llm.system"
+	LLMModelName             = "neatlogs.llm.model_name"
+	LLMStreaming             = "neatlogs.llm.is_streaming"
+	LLMStreamCompletionState = "neatlogs.v2.llm.stream.completion_state"
+	LLMStreamPartialOutput   = "neatlogs.v2.llm.stream.partial_output"
+	LLMStreamOutputTruncated = "neatlogs.v2.llm.stream.output_truncated"
+	LLMStreamChunkCount      = "neatlogs.v2.llm.stream.chunk_count"
 
 	LLMTokenPrompt     = "neatlogs.llm.token_count.prompt"
 	LLMTokenCompletion = "neatlogs.llm.token_count.completion"

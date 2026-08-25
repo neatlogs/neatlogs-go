@@ -2,12 +2,19 @@ package neatlogs
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
 	attrs "github.com/neatlogs/neatlogs-go/internal/attributes"
 )
+
+// ErrNoActiveTrace is returned when SetTraceOutput cannot find a live root
+// owned by the Neatlogs runtime selected by ctx.
+var ErrNoActiveTrace = errors.New("neatlogs: no active owned trace root")
 
 // Trace opens a WORKFLOW root span named `name` and returns the child context,
 // the span, and an end func the caller must invoke exactly once (usually via
@@ -31,6 +38,43 @@ import (
 // integrations using the private provider. Trace itself only opens the span.
 func Trace(ctx context.Context, name string) (context.Context, trace.Span, func()) {
 	return StartSpan(ctx, name, attrs.KindWorkflow)
+}
+
+// SetTraceOutput records the application result on the live root of the
+// Neatlogs trace carried by ctx. It never writes to the current child span, a
+// foreign global span, an extracted remote parent, or another Client.
+func SetTraceOutput(ctx context.Context, output any) error {
+	encoded, err := encodeTraceOutput(output)
+	if err != nil {
+		return fmt.Errorf("neatlogs: encode trace output: %w", err)
+	}
+	var runtime *sdkRuntime
+	if client, ok := ClientFromContext(ctx); ok {
+		runtime = client.runtime
+	} else {
+		global.mu.Lock()
+		runtime = global.runtime
+		global.mu.Unlock()
+	}
+	if runtime == nil {
+		return ErrNoActiveTrace
+	}
+	current, owned := privateOwnedSpanContextFor(ctx, runtime)
+	if !owned || !runtime.lifecycle.setTraceOutput(current, encoded) {
+		return ErrNoActiveTrace
+	}
+	return nil
+}
+
+func encodeTraceOutput(output any) (string, error) {
+	if value, ok := output.(string); ok {
+		return value, nil
+	}
+	encoded, err := json.Marshal(output)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
 }
 
 // StartSpan starts an explicitly typed Neatlogs span on the Client bound to ctx,
