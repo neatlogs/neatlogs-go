@@ -73,6 +73,32 @@ func (p *activeSpanRegistry) setTraceOutput(current trace.SpanContext, output st
 	return true
 }
 
+func (p *activeSpanRegistry) rootSpanContext(current trace.SpanContext) (trace.SpanContext, bool) {
+	if !current.IsValid() {
+		return trace.SpanContext{}, false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	span, ok := p.spans[current.SpanID()]
+	if !ok || span.SpanContext().TraceID() != current.TraceID() {
+		return trace.SpanContext{}, false
+	}
+	seen := make(map[trace.SpanID]struct{})
+	for span.Parent().IsValid() {
+		parentID := span.Parent().SpanID()
+		if _, duplicate := seen[parentID]; duplicate {
+			return trace.SpanContext{}, false
+		}
+		seen[parentID] = struct{}{}
+		parent, exists := p.spans[parentID]
+		if !exists || parent.SpanContext().TraceID() != current.TraceID() {
+			return trace.SpanContext{}, false
+		}
+		span = parent
+	}
+	return span.SpanContext(), span.SpanContext().IsValid()
+}
+
 func (p *activeSpanRegistry) Shutdown(context.Context) error   { return nil }
 func (p *activeSpanRegistry) ForceFlush(context.Context) error { return nil }
 
