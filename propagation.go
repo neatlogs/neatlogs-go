@@ -50,6 +50,11 @@ func privateSpanContextFor(ctx context.Context, owner *sdkRuntime) trace.SpanCon
 	return binding.spanContext
 }
 
+func privateOwnedSpanContextFor(ctx context.Context, owner *sdkRuntime) (trace.SpanContext, bool) {
+	binding, _ := ctx.Value(privateTraceContextKey{}).(privateTraceContext)
+	return binding.spanContext, owner != nil && binding.owner == owner && binding.spanContext.IsValid()
+}
+
 // privateStartContext builds the temporary OTel context used only while
 // starting a Neatlogs span. It clears a foreign active span, then installs the
 // private Neatlogs parent (when one exists).

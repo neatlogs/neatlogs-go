@@ -31,6 +31,7 @@ package neatlogs
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -78,6 +79,11 @@ type Config struct {
 
 	// DisableExport drops all spans instead of sending them. Useful in tests.
 	DisableExport bool
+
+	// SampleRate controls root-trace sampling in the inclusive range [0, 1].
+	// Nil records every root. Sampling is always ParentBased: a valid local or
+	// extracted remote parent keeps its sampling decision for every descendant.
+	SampleRate *float64
 
 	// EnableSignalHandlers opts Init into handling SIGINT and SIGTERM. The zero
 	// value is false: by default Neatlogs never calls signal.Notify and the host
@@ -266,6 +272,10 @@ func (g *globalLifecycle) shutdown(ctx context.Context, runtime *sdkRuntime, rea
 // buildSDKRuntime constructs one private provider. Supplying a custom exporter
 // transfers its shutdown ownership to the returned runtime.
 func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRuntime, *url.URL, bool, error) {
+	sampler, err := samplerFromConfig(cfg)
+	if err != nil {
+		return nil, nil, false, err
+	}
 	apiKey := strings.TrimSpace(cfg.APIKey)
 	if apiKey == "" {
 		apiKey = strings.TrimSpace(os.Getenv("NEATLOGS_API_KEY"))
@@ -295,6 +305,7 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 
 	var tpOpts []sdktrace.TracerProviderOption
 	tpOpts = append(tpOpts, sdktrace.WithResource(buildResource(ctx, cfg)))
+	tpOpts = append(tpOpts, sdktrace.WithSampler(sampler))
 
 	if !disable {
 		exp := io.exporter
@@ -318,6 +329,17 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 		tp.RegisterSpanProcessor(&completionProcessor{tracer: tp.Tracer(tracerName, trace.WithInstrumentationVersion(Version))})
 	}
 	return newSDKRuntime(tp, lifecycle, resolvedWorkflowNameFrom(cfg)), base, !disable, nil
+}
+
+func samplerFromConfig(cfg Config) (sdktrace.Sampler, error) {
+	rate := 1.0
+	if cfg.SampleRate != nil {
+		rate = *cfg.SampleRate
+	}
+	if math.IsNaN(rate) || math.IsInf(rate, 0) || rate < 0 || rate > 1 {
+		return nil, fmt.Errorf("neatlogs: sample rate must be finite and between 0 and 1, got %v", rate)
+	}
+	return sdktrace.ParentBased(sdktrace.TraceIDRatioBased(rate)), nil
 }
 
 // newOTLPExporter builds an OTLP/HTTP span exporter targeting {base}/v1/traces
