@@ -1,0 +1,94 @@
+{
+  "schema_version": 2,
+  "trace_id": "0123456789abcdef0123456789abcdef",
+  "span_id": "1111111111111111",
+  "parent_span_id": "0123456789abcdef",
+  "name": "weather",
+  "kind": "TOOL",
+  "start_time_unix_nano": "1787184000030000000",
+  "end_time_unix_nano": "1787184000040000000",
+  "ownership": {
+    "owner": "neatlogs-sdk",
+    "provider_generation": 1,
+    "project_key_id": "project-key-fingerprint",
+    "propagation": "local-private-context"
+  },
+  "wrapper": {
+    "captured": true,
+    "integration": "custom-tool",
+    "integration_version": null,
+    "capture_fidelity": "native"
+  },
+  "input": {
+    "type": "json",
+    "value": {
+      "city": "Kolkata"
+    },
+    "media": []
+  },
+  "output": {
+    "type": "json",
+    "value": {
+      "temperature_c": 31
+    },
+    "media": []
+  },
+  "status": {
+    "code": "OK",
+    "message": null,
+    "source": "application"
+  },
+  "error": null,
+  "code": null,
+  "provenance": [
+    {
+      "target": "semantic.call.id",
+      "source_dialect": "neatlogs-direct",
+      "source_key": "neatlogs.tool.call.id",
+      "precedence": 2,
+      "action": "accepted"
+    }
+  ],
+  "conflicts": [],
+  "semantic": {
+    "kind": "TOOL",
+    "definition": {
+      "type": "function",
+      "name": "weather",
+      "description": "Return current weather",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string"
+          }
+        }
+      },
+      "configuration": {}
+    },
+    "call": {
+      "id": "call_weather_1",
+      "id_origin": "neatlogs-direct",
+      "type": "function",
+      "name": "weather",
+      "arguments": {
+        "city": "Kolkata"
+      },
+      "choice_index": 0,
+      "tool_index": 0
+    },
+    "result": {
+      "call_id": "call_weather_1",
+      "value": {
+        "temperature_c": 31
+      },
+      "is_error": false,
+      "media": []
+    },
+    "requesting_span_id": "0123456789abcdef",
+    "transport": null
+  },
+  "attributes": {
+    "neatlogs.tool.call.id": "call_weather_1"
+  }
+}

@@ -1,0 +1,238 @@
+{
+  "schema_version": 2,
+  "trace_id": "0123456789abcdef0123456789abcdef",
+  "span_id": "0123456789abcdef",
+  "parent_span_id": "fedcba9876543210",
+  "name": "openai.responses.create",
+  "kind": "LLM",
+  "start_time_unix_nano": "1787184000000000000",
+  "end_time_unix_nano": "1787184000123000000",
+  "ownership": {
+    "owner": "neatlogs-sdk",
+    "provider_generation": 1,
+    "project_key_id": "project-key-fingerprint",
+    "propagation": "local-private-context"
+  },
+  "wrapper": {
+    "captured": true,
+    "integration": "openai",
+    "integration_version": "1.0.0",
+    "capture_fidelity": "native"
+  },
+  "input": {
+    "type": "messages",
+    "value": [
+      {
+        "role": "user",
+        "content": "What is the weather?"
+      }
+    ],
+    "media": []
+  },
+  "output": {
+    "type": "messages",
+    "value": [
+      {
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "id": "call_weather_1",
+            "name": "weather",
+            "arguments": {
+              "city": "Kolkata"
+            }
+          }
+        ]
+      }
+    ],
+    "media": []
+  },
+  "status": {
+    "code": "OK",
+    "message": null,
+    "source": "provider"
+  },
+  "error": null,
+  "code": {
+    "file": "src/weather.ts",
+    "function": "answerWeather",
+    "line": 42,
+    "column": 18,
+    "namespace": "weather-service"
+  },
+  "provenance": [
+    {
+      "target": "semantic.response.choices.0.message.tool_calls.0.id",
+      "source_dialect": "neatlogs-direct",
+      "source_key": "neatlogs.llm.tool_calls.0.id",
+      "precedence": 2,
+      "action": "accepted"
+    },
+    {
+      "target": "semantic.request.model",
+      "source_dialect": "otel-genai",
+      "source_key": "gen_ai.request.model",
+      "precedence": 3,
+      "action": "accepted"
+    }
+  ],
+  "conflicts": [
+    {
+      "target": "semantic.request.model",
+      "winner_source_key": "gen_ai.request.model",
+      "loser_source_key": "llm.model_name",
+      "reason_code": "LOWER_PRECEDENCE"
+    }
+  ],
+  "semantic": {
+    "kind": "LLM",
+    "request": {
+      "provider": "openai",
+      "model": "gpt-5",
+      "operation": "responses",
+      "messages": [
+        {
+          "role": "user",
+          "name": null,
+          "content": [
+            {
+              "type": "text",
+              "text": "What is the weather?"
+            }
+          ],
+          "tool_calls": [],
+          "tool_call_id": null
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "name": "weather",
+          "description": "Return current weather",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "city"
+            ]
+          },
+          "configuration": {
+            "strict": true
+          }
+        }
+      ],
+      "parameters": {
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "top_k": null,
+        "max_output_tokens": 4096,
+        "stop": [],
+        "seed": 42,
+        "frequency_penalty": 0,
+        "presence_penalty": 0,
+        "response_format": {
+          "type": "text"
+        },
+        "reasoning": {
+          "effort": "medium"
+        },
+        "service_tier": "auto",
+        "provider_options": {}
+      }
+    },
+    "response": {
+      "id": "resp_1",
+      "model": "gpt-5-2026-08-01",
+      "choices": [
+        {
+          "choice_index": 0,
+          "message": {
+            "role": "assistant",
+            "name": null,
+            "content": [],
+            "tool_calls": [
+              {
+                "id": "call_weather_1",
+                "id_origin": "neatlogs-direct",
+                "type": "function",
+                "name": "weather",
+                "arguments": {
+                  "city": "Kolkata"
+                },
+                "choice_index": 0,
+                "tool_index": 0
+              }
+            ],
+            "tool_call_id": null
+          },
+          "finish_reason": "tool_calls"
+        },
+        {
+          "choice_index": 1,
+          "message": {
+            "role": "assistant",
+            "name": null,
+            "content": [
+              {
+                "type": "text",
+                "text": "I can answer without a tool."
+              }
+            ],
+            "tool_calls": [],
+            "tool_call_id": null
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "finish_reasons": [
+        "tool_calls",
+        "stop"
+      ]
+    },
+    "usage": {
+      "input_tokens": 21,
+      "output_tokens": 12,
+      "total_tokens": 33,
+      "reasoning_tokens": 4,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "cost_usd": 0.00012
+    },
+    "stream": {
+      "completion_state": "complete",
+      "time_to_first_token_ms": 18.4,
+      "chunk_count": 4,
+      "choice_count": 2,
+      "events": [
+        {
+          "sequence": 0,
+          "time_unix_nano": "1787184000018000000",
+          "type": "tool_call.delta",
+          "choice_index": 0,
+          "tool_index": 0,
+          "value": {
+            "arguments_delta": "{\"city\":"
+          }
+        },
+        {
+          "sequence": 1,
+          "time_unix_nano": "1787184000020000000",
+          "type": "output_text.delta",
+          "choice_index": 1,
+          "tool_index": null,
+          "value": "I can answer"
+        }
+      ],
+      "raw_chunks": null
+    }
+  },
+  "attributes": {
+    "gen_ai.request.model": "gpt-5",
+    "llm.model_name": "legacy-model",
+    "neatlogs.llm.tool_calls.0.id": "call_weather_1"
+  }
+}

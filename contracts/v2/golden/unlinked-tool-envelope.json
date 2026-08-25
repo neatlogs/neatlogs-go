@@ -1,0 +1,87 @@
+{
+  "schema_version": 2,
+  "trace_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "span_id": "bbbbbbbbbbbbbbbb",
+  "parent_span_id": null,
+  "name": "direct_database_lookup",
+  "kind": "TOOL",
+  "start_time_unix_nano": "1787184000030000000",
+  "end_time_unix_nano": "1787184000040000000",
+  "ownership": {
+    "owner": "neatlogs-sdk",
+    "provider_generation": 1,
+    "project_key_id": "project-key-fingerprint",
+    "propagation": "local-private-context"
+  },
+  "wrapper": {
+    "captured": true,
+    "integration": "custom-tool",
+    "integration_version": null,
+    "capture_fidelity": "native"
+  },
+  "input": {
+    "type": "json",
+    "value": {
+      "customer_id": "customer-17"
+    },
+    "media": []
+  },
+  "output": {
+    "type": "json",
+    "value": {
+      "tier": "enterprise"
+    },
+    "media": []
+  },
+  "status": {
+    "code": "OK",
+    "message": null,
+    "source": "application"
+  },
+  "error": null,
+  "code": null,
+  "provenance": [
+    {
+      "target": "semantic.requesting_span_id",
+      "source_dialect": "neatlogs-direct",
+      "source_key": "neatlogs.tool.requesting_span_id",
+      "precedence": 2,
+      "action": "missing"
+    }
+  ],
+  "conflicts": [],
+  "semantic": {
+    "kind": "TOOL",
+    "definition": {
+      "type": "function",
+      "name": "direct_database_lookup",
+      "description": null,
+      "schema": {},
+      "configuration": {}
+    },
+    "call": {
+      "id": "synthetic_4d4b26ee7b4e1791",
+      "id_origin": "deterministic-synthetic",
+      "type": "function",
+      "name": "direct_database_lookup",
+      "arguments": {
+        "customer_id": "customer-17"
+      },
+      "choice_index": 0,
+      "tool_index": 0
+    },
+    "result": {
+      "call_id": "synthetic_4d4b26ee7b4e1791",
+      "value": {
+        "tier": "enterprise"
+      },
+      "is_error": false,
+      "media": []
+    },
+    "requesting_span_id": null,
+    "transport": null
+  },
+  "attributes": {
+    "neatlogs.diagnostic.reason_code": "TOOL_REQUESTING_SPAN_MISSING"
+  }
+}

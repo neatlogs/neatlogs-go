@@ -1,0 +1,65 @@
+{
+  "schema_version": 2,
+  "trace_id": "cccccccccccccccccccccccccccccccc",
+  "span_id": "dddddddddddddddd",
+  "parent_span_id": null,
+  "name": "trace-recovery",
+  "kind": "WORKFLOW",
+  "start_time_unix_nano": "1787184000000000000",
+  "end_time_unix_nano": "1787184000100000000",
+  "ownership": {
+    "owner": "neatlogs-backend-recovery",
+    "provider_generation": 0,
+    "project_key_id": "project-key-fingerprint",
+    "propagation": "backend-projection"
+  },
+  "wrapper": {
+    "captured": false,
+    "integration": "trace-recovery",
+    "integration_version": null,
+    "capture_fidelity": "synthetic-recovery"
+  },
+  "input": {
+    "type": "none",
+    "value": null,
+    "media": []
+  },
+  "output": {
+    "type": "none",
+    "value": null,
+    "media": []
+  },
+  "status": {
+    "code": "UNSET",
+    "message": "No application root arrived before recovery",
+    "source": "backend-recovery"
+  },
+  "error": null,
+  "code": null,
+  "provenance": [
+    {
+      "target": "semantic.recovery",
+      "source_dialect": "native-v2",
+      "source_key": "trace-recovery-state",
+      "precedence": 1,
+      "action": "synthesized"
+    }
+  ],
+  "conflicts": [],
+  "semantic": {
+    "kind": "WORKFLOW",
+    "operation": "trace-recovery",
+    "role": "recovery-projection",
+    "metadata": {},
+    "recovery": {
+      "synthetic": true,
+      "reason": "stale-rootless-trace",
+      "recovery_span_id": "dddddddddddddddd",
+      "genuine_root_span_id": null,
+      "reconciled": false
+    }
+  },
+  "attributes": {
+    "neatlogs.internal.synthetic_recovery_root": true
+  }
+}
