@@ -38,6 +38,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
@@ -84,6 +85,14 @@ type Config struct {
 	// Nil records every root. Sampling is always ParentBased: a valid local or
 	// extracted remote parent keeps its sampling decision for every descendant.
 	SampleRate *float64
+
+	// Mask redacts each detached, normalized export snapshot before transport.
+	// A context-scoped WithMask callback takes precedence for its spans.
+	Mask MaskFunc
+
+	// MaskTimeout bounds every callback. Zero uses one second. Timeout, panic,
+	// callback error, or invalid callback output drops the span fail-closed.
+	MaskTimeout time.Duration
 
 	// EnableSignalHandlers opts Init into handling SIGINT and SIGTERM. The zero
 	// value is false: by default Neatlogs never calls signal.Notify and the host
@@ -303,9 +312,18 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 		return nil, nil, false, fmt.Errorf("neatlogs: invalid endpoint %q: %w", endpoint, err)
 	}
 
+	maskTimeout := cfg.MaskTimeout
+	if maskTimeout < 0 {
+		return nil, nil, false, fmt.Errorf("neatlogs: mask timeout must not be negative")
+	}
+	if maskTimeout == 0 {
+		maskTimeout = time.Second
+	}
 	var tpOpts []sdktrace.TracerProviderOption
 	tpOpts = append(tpOpts, sdktrace.WithResource(buildResource(ctx, cfg)))
 	tpOpts = append(tpOpts, sdktrace.WithSampler(sampler))
+	maskRegistry := newSpanMaskRegistry()
+	health := &exportHealthState{}
 
 	if !disable {
 		exp := io.exporter
@@ -318,7 +336,10 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 		// The batch processor is installed during provider construction. The
 		// completion processor is registered below, after this exporter/root
 		// path, so an ending root is queued before its completion marker.
-		tpOpts = append(tpOpts, sdktrace.WithBatcher(&normalizingExporter{next: exp, mapper: attributes.Default()}))
+		tpOpts = append(tpOpts, sdktrace.WithBatcher(&normalizingExporter{
+			next: exp, mapper: attributes.Default(), globalMask: cfg.Mask,
+			maskTimeout: maskTimeout, masks: maskRegistry, health: health,
+		}))
 	}
 
 	tp := sdktrace.NewTracerProvider(tpOpts...)
@@ -328,7 +349,7 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 	if !disable {
 		tp.RegisterSpanProcessor(&completionProcessor{tracer: tp.Tracer(tracerName, trace.WithInstrumentationVersion(Version))})
 	}
-	return newSDKRuntime(tp, lifecycle, resolvedWorkflowNameFrom(cfg)), base, !disable, nil
+	return newSDKRuntime(tp, lifecycle, resolvedWorkflowNameFrom(cfg), maskRegistry, health), base, !disable, nil
 }
 
 func samplerFromConfig(cfg Config) (sdktrace.Sampler, error) {

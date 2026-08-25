@@ -74,6 +74,15 @@ func (c *Client) Flush(ctx context.Context) error {
 	return c.runtime.forceFlush(ctx)
 }
 
+// ExportHealth returns cumulative fail-closed masking drops and downstream
+// exporter failures for this Client.
+func (c *Client) ExportHealth() ExportHealth {
+	if c == nil || c.runtime == nil {
+		return ExportHealth{}
+	}
+	return c.runtime.exportHealth()
+}
+
 // Shutdown closes this Client's active spans child-first and shuts down only
 // its provider/exporter. It is safe to call concurrently and repeatedly.
 func (c *Client) Shutdown(ctx context.Context) error {

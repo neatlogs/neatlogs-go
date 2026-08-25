@@ -2,6 +2,7 @@ package neatlogs
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -34,19 +35,23 @@ type sdkRuntime struct {
 	tracer       trace.Tracer
 	lifecycle    *activeSpanRegistry
 	workflowName string
+	masks        *spanMaskRegistry
+	health       *exportHealthState
 
 	done        chan struct{}
 	shutdownErr error
 	signals     *shutdownSignalController
 }
 
-func newSDKRuntime(tp *sdktrace.TracerProvider, lifecycle *activeSpanRegistry, workflowName string) *sdkRuntime {
+func newSDKRuntime(tp *sdktrace.TracerProvider, lifecycle *activeSpanRegistry, workflowName string, masks *spanMaskRegistry, health *exportHealthState) *sdkRuntime {
 	return &sdkRuntime{
 		state:        stateRunning,
 		provider:     tp,
 		tracer:       tp.Tracer(tracerName, trace.WithInstrumentationVersion(Version)),
 		lifecycle:    lifecycle,
 		workflowName: workflowName,
+		masks:        masks,
+		health:       health,
 		done:         make(chan struct{}),
 	}
 }
@@ -72,6 +77,7 @@ func (r *sdkRuntime) startSpan(
 		return startNoopSpan(ctx, name, options...)
 	}
 	_, span := r.tracer.Start(privateStartContext(ctx, r), name, options...)
+	r.masks.register(span, maskFromContext(ctx))
 	return withPrivateTraceContext(ctx, span.SpanContext(), r), span, func() { span.End() }
 }
 
@@ -95,6 +101,7 @@ func (r *sdkRuntime) startProviderSpan(ctx context.Context, name, kind string) (
 
 	if !needsRoot {
 		_, span := r.tracer.Start(privateStartContext(ctx, r), name)
+		r.masks.register(span, maskFromContext(ctx))
 		return withPrivateTraceContext(ctx, span.SpanContext(), r), span, func() { span.End() }
 	}
 
@@ -103,6 +110,8 @@ func (r *sdkRuntime) startProviderSpan(ctx context.Context, name, kind string) (
 		attribute.Bool("neatlogs.auto_root", true),
 	))
 	_, span := r.tracer.Start(rootCtx, name)
+	r.masks.register(root, maskFromContext(ctx))
+	r.masks.register(span, maskFromContext(ctx))
 	return withPrivateTraceContext(ctx, span.SpanContext(), r), span, func() {
 		span.End()
 		root.End()
@@ -143,8 +152,9 @@ func (r *sdkRuntime) forceFlush(ctx context.Context) error {
 		}
 	}
 	err := r.provider.ForceFlush(ctx)
+	healthErr := r.exportHealth().Err()
 	r.mu.Unlock()
-	return err
+	return errors.Join(err, healthErr)
 }
 
 // shutdown changes state before ending spans. Calls that arrive after closing
@@ -179,6 +189,8 @@ func (r *sdkRuntime) shutdown(ctx context.Context, reason string) error {
 	}
 	r.lifecycle.endActiveSpans(reason)
 	err := r.provider.Shutdown(ctx)
+	err = errors.Join(err, r.exportHealth().Err())
+	r.masks.clear()
 
 	r.mu.Lock()
 	r.shutdownErr = err
@@ -186,6 +198,13 @@ func (r *sdkRuntime) shutdown(ctx context.Context, reason string) error {
 	close(r.done)
 	r.mu.Unlock()
 	return err
+}
+
+func (r *sdkRuntime) exportHealth() ExportHealth {
+	if r == nil {
+		return ExportHealth{}
+	}
+	return r.health.snapshot()
 }
 
 func (r *sdkRuntime) wait(ctx context.Context) error {
