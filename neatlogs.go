@@ -324,6 +324,7 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 	tpOpts = append(tpOpts, sdktrace.WithSampler(sampler))
 	maskRegistry := newSpanMaskRegistry()
 	health := &exportHealthState{}
+	captures := newDoctorCaptureStore(128)
 
 	if !disable {
 		exp := io.exporter
@@ -338,7 +339,7 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 		// path, so an ending root is queued before its completion marker.
 		tpOpts = append(tpOpts, sdktrace.WithBatcher(&normalizingExporter{
 			next: exp, mapper: attributes.Default(), globalMask: cfg.Mask,
-			maskTimeout: maskTimeout, masks: maskRegistry, health: health,
+			maskTimeout: maskTimeout, masks: maskRegistry, health: health, captures: captures,
 		}))
 	}
 
@@ -349,7 +350,7 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 	if !disable {
 		tp.RegisterSpanProcessor(&completionProcessor{tracer: tp.Tracer(tracerName, trace.WithInstrumentationVersion(Version))})
 	}
-	return newSDKRuntime(tp, lifecycle, resolvedWorkflowNameFrom(cfg), maskRegistry, health), base, !disable, nil
+	return newSDKRuntime(tp, lifecycle, resolvedWorkflowNameFrom(cfg), maskRegistry, health, captures), base, !disable, nil
 }
 
 func samplerFromConfig(cfg Config) (sdktrace.Sampler, error) {
