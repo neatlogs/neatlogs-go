@@ -146,3 +146,32 @@ they leave the process.
 v0.1 — Google Gemini (`google.golang.org/genai`) active wrapping, direct
 LLM/retriever/tool helpers, and an isolated private provider. More providers and
 explicit framework wrappers will follow.
+
+## Doctor v2
+
+Run the read-only local self-test after installing the command:
+
+```bash
+neatlogs doctor --local --json
+```
+
+Standalone local mode creates generated, non-user telemetry on an isolated
+in-memory exporter. It validates SDK construction, normalization, masking,
+canonical envelope capture, hierarchy, sampling, and flush without contacting
+a backend. A pass proves that the installed SDK's local pipeline works; it does
+not prove that the application's own instrumentation produced a valid envelope.
+
+For the application's actual final masked export envelope, call
+`DoctorCapturedLocalV2` inside the instrumented process after flushing and pass
+the trace ID. Captures are private to the selected `Client` or `Init` runtime.
+
+Run the authenticated backend probe with:
+
+```bash
+NEATLOGS_API_KEY='<project-key>' \
+NEATLOGS_ENDPOINT='https://ingest.neatlogs.com' \
+neatlogs doctor --probe --json
+```
+
+Probe success requires accepted receipts through authenticated visibility.
+Session creation or HTTP acceptance alone never reports success.
