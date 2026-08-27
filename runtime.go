@@ -37,13 +37,14 @@ type sdkRuntime struct {
 	workflowName string
 	masks        *spanMaskRegistry
 	health       *exportHealthState
+	captures     *doctorCaptureStore
 
 	done        chan struct{}
 	shutdownErr error
 	signals     *shutdownSignalController
 }
 
-func newSDKRuntime(tp *sdktrace.TracerProvider, lifecycle *activeSpanRegistry, workflowName string, masks *spanMaskRegistry, health *exportHealthState) *sdkRuntime {
+func newSDKRuntime(tp *sdktrace.TracerProvider, lifecycle *activeSpanRegistry, workflowName string, masks *spanMaskRegistry, health *exportHealthState, captures *doctorCaptureStore) *sdkRuntime {
 	return &sdkRuntime{
 		state:        stateRunning,
 		provider:     tp,
@@ -52,6 +53,7 @@ func newSDKRuntime(tp *sdktrace.TracerProvider, lifecycle *activeSpanRegistry, w
 		workflowName: workflowName,
 		masks:        masks,
 		health:       health,
+		captures:     captures,
 		done:         make(chan struct{}),
 	}
 }

@@ -31,6 +31,7 @@ type normalizingExporter struct {
 	maskTimeout time.Duration
 	masks       *spanMaskRegistry
 	health      *exportHealthState
+	captures    *doctorCaptureStore
 }
 
 var _ trace.SpanExporter = (*normalizingExporter)(nil)
@@ -59,6 +60,9 @@ func (e *normalizingExporter) ExportSpans(ctx context.Context, spans []trace.Rea
 
 	var result error
 	if len(rewritten) > 0 {
+		// Doctor observes only the final detached snapshots after normalization
+		// and fail-closed masking, immediately before transport.
+		e.captures.capture(rewritten)
 		if err := e.next.ExportSpans(ctx, rewritten); err != nil {
 			e.health.recordExportFailure()
 			result = ErrExportFailed
