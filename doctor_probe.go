@@ -96,13 +96,17 @@ func DoctorProbeV2(ctx context.Context, local DoctorV2Result, options DoctorProb
 	request.Header.Set("x-api-key", options.APIKey)
 	response, err := client.Do(request)
 	if err != nil {
-		return probeTransportFailure(result)
+		return probeTransportFailure(result, "BACKEND_PROBE_UNAVAILABLE", "The backend diagnostic session is unavailable", "CHECK_DIAGNOSTIC_ENDPOINT")
+	}
+	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+		response.Body.Close()
+		return probeTransportFailure(result, "AUTH_FAILED", "The authenticated diagnostic session was rejected", "CHECK_INGEST_CREDENTIAL")
 	}
 	var session diagnosticSession
 	err = decodeLimited(response, &session)
 	response.Body.Close()
 	if err != nil || response.StatusCode < 200 || response.StatusCode >= 300 || !strings.HasPrefix(session.DiagnosticID, "diag_") {
-		return probeTransportFailure(result)
+		return probeTransportFailure(result, "BACKEND_PROBE_UNAVAILABLE", "The backend diagnostic session is unavailable", "CHECK_DIAGNOSTIC_ENDPOINT")
 	}
 	receiptURL := strings.TrimSuffix(base.String(), "/") + "/" + url.PathEscape(session.DiagnosticID)
 	defer func() {
@@ -175,8 +179,8 @@ func probeStagesComplete(stages []DoctorV2Stage) bool {
 	}
 	return true
 }
-func probeTransportFailure(result DoctorV2Result) DoctorV2Result {
-	result.Checks = append(result.Checks, failV2("probe_transport", "AUTH_FAILED", "The authenticated diagnostic session could not be reached", "CHECK_INGEST_CREDENTIAL"))
+func probeTransportFailure(result DoctorV2Result, code, message, remediation string) DoctorV2Result {
+	result.Checks = append(result.Checks, failV2("probe_transport", code, message, remediation))
 	return finishDoctorV2(result)
 }
 func decodeLimited(response *http.Response, destination any) error {
