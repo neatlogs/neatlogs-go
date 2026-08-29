@@ -111,7 +111,9 @@ func DoctorCapturedLocalV2(ctx context.Context, options DoctorLocalOptions) Doct
 		sampled = envelope.Spans[0].Sampled
 	}
 	result.Sampling = &DoctorV2Sampling{EffectiveSampler: "parentbased_traceidratio", RootSampleRate: rate, Sampled: sampled}
-	result.Ownership = &DoctorV2Ownership{Provider: "private", InstrumentorCount: 1}
+	// Manual Doctor spans do not activate an integration instrumentor. Provider
+	// ownership and instrumentor count are separate cross-SDK signals.
+	result.Ownership = &DoctorV2Ownership{Provider: "private", InstrumentorCount: 0}
 	health := runtime.exportHealth()
 	capacity := 2048
 	result.Queue = &DoctorV2Queue{Mode: "diagnostic_capture", DroppedSpans: health.DroppedSpans, Capacity: &capacity}

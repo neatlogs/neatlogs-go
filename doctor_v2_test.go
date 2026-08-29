@@ -41,6 +41,9 @@ func TestDoctorV2CapturesFinalEnvelope(t *testing.T) {
 	if result.FormatVersion != DoctorV2FormatVersion || result.Status != DoctorPass || result.Capture == nil || result.Capture.SpanCount < 2 || result.FirstFailure != nil {
 		t.Fatalf("unexpected result: %#v", result)
 	}
+	if result.Ownership == nil || result.Ownership.Provider != "private" || result.Ownership.InstrumentorCount != 0 {
+		t.Fatalf("manual local doctor must report private ownership with no integration instrumentor: %+v", result.Ownership)
+	}
 	encoded, _ := json.Marshal(result)
 	if strings.Contains(string(encoded), "secret") {
 		t.Fatal("doctor leaked pre-mask content")
