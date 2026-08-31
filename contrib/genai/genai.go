@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"iter"
+	"sort"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -95,40 +96,28 @@ func (g *GenAIModels) GenerateContentStream(ctx context.Context, model string, c
 
 	return func(yield func(*genai.GenerateContentResponse, error) bool) {
 		var (
-			text     string
-			finish   genai.FinishReason
-			usage    *genai.GenerateContentResponseUsageMetadata
-			respID   string
-			sawError bool
-			ended    bool
+			acc       = newResponseAccumulator()
+			sawError  bool
+			cancelled bool
+			ended     bool
 		)
 		end := func() {
 			if ended {
 				return
 			}
 			ended = true
+			finalizeStream(span, acc, cancelled, sawError)
 			if sawError {
 				endSpan() // status already set by recordError; close span + auto-root
 				return
 			}
-			if text != "" {
-				span.SetAttributes(
-					attribute.String(attrs.LLMOutputMessagePrefix+"0.role", "assistant"),
-					attribute.String(attrs.LLMOutputMessagePrefix+"0.content", text),
-				)
-			}
-			if finish != "" {
-				span.SetAttributes(attribute.String(attrs.LLMFinishReason, string(finish)))
-			}
-			if respID != "" {
-				span.SetAttributes(attribute.String(attrs.LLMResponseID, respID))
-			}
-			setUsage(span, usage)
-			span.SetStatus(codes.Ok, "")
 			endSpan()
 		}
 
 		for resp, err := range seq {
+			if resp != nil {
+				recordStreamChunk(span, acc, resp)
+			}
 			if err != nil {
 				sawError = true
 				recordError(span, err)
@@ -136,19 +125,8 @@ func (g *GenAIModels) GenerateContentStream(ctx context.Context, model string, c
 				end()
 				return
 			}
-			if resp != nil {
-				text += extractText(resp)
-				if resp.UsageMetadata != nil {
-					usage = resp.UsageMetadata
-				}
-				if resp.ResponseID != "" {
-					respID = resp.ResponseID
-				}
-				if fr := finishReason(resp); fr != "" {
-					finish = fr
-				}
-			}
 			if !yield(resp, nil) {
+				cancelled = true
 				break // consumer stopped early
 			}
 		}
@@ -310,45 +288,175 @@ func finalizeResponse(span trace.Span, resp *genai.GenerateContentResponse) {
 		span.SetStatus(codes.Ok, "")
 		return
 	}
-	var text string
-	toolIdx := 0
-	for _, cand := range resp.Candidates {
-		if cand == nil || cand.Content == nil {
+	acc := newResponseAccumulator()
+	acc.add(resp)
+	acc.apply(span)
+	span.SetStatus(codes.Ok, "")
+}
+
+type accumulatedToolCall struct {
+	choiceIndex int
+	name        string
+	id          string
+	arguments   map[string]any
+}
+
+type accumulatedChoice struct {
+	role      string
+	text      string
+	thinking  string
+	finish    genai.FinishReason
+	toolCalls map[int]*accumulatedToolCall
+}
+
+type responseAccumulator struct {
+	choices    map[int]*accumulatedChoice
+	usage      *genai.GenerateContentResponseUsageMetadata
+	responseID string
+	chunkCount int
+}
+
+func newResponseAccumulator() *responseAccumulator {
+	return &responseAccumulator{choices: make(map[int]*accumulatedChoice)}
+}
+
+func (a *responseAccumulator) add(resp *genai.GenerateContentResponse) {
+	if resp == nil {
+		return
+	}
+	for position, cand := range resp.Candidates {
+		if cand == nil {
 			continue
 		}
-		for _, part := range cand.Content.Parts {
-			if part == nil {
-				continue
+		index := int(cand.Index)
+		if index == 0 && position > 0 {
+			index = position
+		}
+		choice := a.choices[index]
+		if choice == nil {
+			choice = &accumulatedChoice{
+				role:      "assistant",
+				toolCalls: make(map[int]*accumulatedToolCall),
 			}
-			switch {
-			case part.Thought && part.Text != "":
-				span.SetAttributes(attribute.String(attrs.LLMOutputMessagePrefix+"0.thinking", part.Text))
-			case part.Text != "":
-				text += part.Text
-			case part.FunctionCall != nil:
-				fc := part.FunctionCall
-				span.SetAttributes(attribute.String(fmt.Sprintf("%s%d.name", attrs.LLMToolCallPrefix, toolIdx), fc.Name))
-				if fc.ID != "" {
-					span.SetAttributes(attribute.String(fmt.Sprintf("%s%d.id", attrs.LLMToolCallPrefix, toolIdx), fc.ID))
+			a.choices[index] = choice
+		}
+		if cand.Content != nil {
+			if cand.Content.Role != "" && cand.Content.Role != "model" {
+				choice.role = cand.Content.Role
+			}
+			toolPosition := 0
+			for _, part := range cand.Content.Parts {
+				if part == nil {
+					continue
 				}
-				span.SetAttributes(attribute.String(fmt.Sprintf("%s%d.arguments", attrs.LLMToolCallPrefix, toolIdx), mustJSON(fc.Args)))
-				toolIdx++
+				switch {
+				case part.Thought && part.Text != "":
+					choice.thinking += part.Text
+				case part.Text != "":
+					choice.text += part.Text
+				case part.FunctionCall != nil:
+					call := choice.toolCalls[toolPosition]
+					if call == nil {
+						call = &accumulatedToolCall{
+							choiceIndex: index,
+							arguments:   make(map[string]any),
+						}
+						choice.toolCalls[toolPosition] = call
+					}
+					if part.FunctionCall.Name != "" {
+						call.name = part.FunctionCall.Name
+					}
+					if part.FunctionCall.ID != "" {
+						call.id = part.FunctionCall.ID
+					}
+					for key, value := range part.FunctionCall.Args {
+						call.arguments[key] = value
+					}
+					toolPosition++
+				}
 			}
 		}
 		if cand.FinishReason != "" {
-			span.SetAttributes(attribute.String(attrs.LLMFinishReason, string(cand.FinishReason)))
+			choice.finish = cand.FinishReason
 		}
 	}
-	if text != "" {
-		span.SetAttributes(
-			attribute.String(attrs.LLMOutputMessagePrefix+"0.role", "assistant"),
-			attribute.String(attrs.LLMOutputMessagePrefix+"0.content", text),
-		)
+	if resp.UsageMetadata != nil {
+		a.usage = resp.UsageMetadata
 	}
 	if resp.ResponseID != "" {
-		span.SetAttributes(attribute.String(attrs.LLMResponseID, resp.ResponseID))
+		a.responseID = resp.ResponseID
 	}
-	setUsage(span, resp.UsageMetadata)
+	a.chunkCount++
+}
+
+func (a *responseAccumulator) apply(span trace.Span) {
+	indexes := make([]int, 0, len(a.choices))
+	for index := range a.choices {
+		indexes = append(indexes, index)
+	}
+	sort.Ints(indexes)
+	toolIndex := 0
+	for _, index := range indexes {
+		choice := a.choices[index]
+		prefix := fmt.Sprintf("%s%d.", attrs.LLMOutputMessagePrefix, index)
+		span.SetAttributes(attribute.String(prefix+"role", choice.role))
+		if choice.text != "" {
+			span.SetAttributes(attribute.String(prefix+"content", choice.text))
+		}
+		if choice.thinking != "" {
+			span.SetAttributes(attribute.String(prefix+"thinking", choice.thinking))
+		}
+		if choice.finish != "" {
+			span.SetAttributes(attribute.String(fmt.Sprintf("%s%d.finish_reason", attrs.LLMChoicePrefix, index), string(choice.finish)))
+			if index == indexes[0] {
+				span.SetAttributes(attribute.String(attrs.LLMFinishReason, string(choice.finish)))
+			}
+		}
+		toolPositions := make([]int, 0, len(choice.toolCalls))
+		for position := range choice.toolCalls {
+			toolPositions = append(toolPositions, position)
+		}
+		sort.Ints(toolPositions)
+		for _, position := range toolPositions {
+			call := choice.toolCalls[position]
+			callPrefix := fmt.Sprintf("%s%d.", attrs.LLMToolCallPrefix, toolIndex)
+			span.SetAttributes(
+				attribute.String(callPrefix+"name", call.name),
+				attribute.Int(callPrefix+"choice_index", call.choiceIndex),
+				attribute.String(callPrefix+"arguments", mustJSON(call.arguments)),
+			)
+			if call.id != "" {
+				span.SetAttributes(attribute.String(callPrefix+"id", call.id))
+			}
+			toolIndex++
+		}
+	}
+	if a.responseID != "" {
+		span.SetAttributes(attribute.String(attrs.LLMResponseID, a.responseID))
+	}
+	setUsage(span, a.usage)
+}
+
+func recordStreamChunk(span trace.Span, acc *responseAccumulator, resp *genai.GenerateContentResponse) {
+	span.AddEvent(attrs.StreamChunkEvent, trace.WithAttributes(
+		attribute.Int(attrs.StreamChunkIndex, acc.chunkCount),
+		attribute.String(attrs.StreamChunkValue, mustJSON(resp)),
+		attribute.String(attrs.StreamChunkMIMEType, "application/json"),
+	))
+	acc.add(resp)
+}
+
+func finalizeStream(span trace.Span, acc *responseAccumulator, cancelled, sawError bool) {
+	acc.apply(span)
+	span.SetAttributes(attribute.Int(attrs.StreamChunkCount, acc.chunkCount))
+	if sawError {
+		return
+	}
+	if cancelled {
+		span.SetAttributes(attribute.Bool(attrs.StreamCancelled, true))
+		span.SetStatus(codes.Unset, "")
+		return
+	}
 	span.SetStatus(codes.Ok, "")
 }
 
@@ -374,30 +482,6 @@ func setUsage(span trace.Span, usage *genai.GenerateContentResponseUsageMetadata
 	if usage.CachedContentTokenCount != 0 {
 		span.SetAttributes(attribute.Int(attrs.LLMTokenCacheRead, int(usage.CachedContentTokenCount)))
 	}
-}
-
-func extractText(resp *genai.GenerateContentResponse) string {
-	var text string
-	for _, cand := range resp.Candidates {
-		if cand == nil || cand.Content == nil {
-			continue
-		}
-		for _, part := range cand.Content.Parts {
-			if part != nil && part.Text != "" && !part.Thought {
-				text += part.Text
-			}
-		}
-	}
-	return text
-}
-
-func finishReason(resp *genai.GenerateContentResponse) genai.FinishReason {
-	for _, cand := range resp.Candidates {
-		if cand != nil && cand.FinishReason != "" {
-			return cand.FinishReason
-		}
-	}
-	return ""
 }
 
 func contentText(c *genai.Content) string {

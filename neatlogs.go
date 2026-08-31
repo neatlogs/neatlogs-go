@@ -31,6 +31,7 @@ package neatlogs
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -76,8 +77,17 @@ type Config struct {
 	// Debug enables verbose diagnostics on stderr.
 	Debug bool
 
+	// SampleRate is the head-sampling probability for a complete trace. Nil
+	// means 1.0 (keep every trace); a non-nil value must be within [0, 1]. The
+	// root decision is inherited by every descendant and completion marker.
+	SampleRate *float64
+
 	// DisableExport drops all spans instead of sending them. Useful in tests.
 	DisableExport bool
+
+	// Mask transforms a cloned, normalized span on the batch-export worker.
+	// Errors and nil results fail closed: the original span is never exported.
+	Mask MaskFunc
 
 	// EnableSignalHandlers opts Init into handling SIGINT and SIGTERM. The zero
 	// value is false: by default Neatlogs never calls signal.Notify and the host
@@ -293,8 +303,20 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 		return nil, nil, false, fmt.Errorf("neatlogs: invalid endpoint %q: %w", endpoint, err)
 	}
 
+	sampleRate := 1.0
+	if cfg.SampleRate != nil {
+		sampleRate = *cfg.SampleRate
+		if math.IsNaN(sampleRate) || math.IsInf(sampleRate, 0) || sampleRate < 0 || sampleRate > 1 {
+			return nil, nil, false, fmt.Errorf("neatlogs: sample rate must be between 0 and 1, got %v", sampleRate)
+		}
+	}
+
 	var tpOpts []sdktrace.TracerProviderOption
-	tpOpts = append(tpOpts, sdktrace.WithResource(buildResource(ctx, cfg)))
+	tpOpts = append(
+		tpOpts,
+		sdktrace.WithResource(buildResource(ctx, cfg)),
+		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(sampleRate))),
+	)
 
 	if !disable {
 		exp := io.exporter
@@ -307,7 +329,9 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 		// The batch processor is installed during provider construction. The
 		// completion processor is registered below, after this exporter/root
 		// path, so an ending root is queued before its completion marker.
-		tpOpts = append(tpOpts, sdktrace.WithBatcher(&normalizingExporter{next: exp, mapper: attributes.Default()}))
+		tpOpts = append(tpOpts, sdktrace.WithBatcher(&normalizingExporter{
+			next: exp, mapper: attributes.Default(), mask: cfg.Mask,
+		}))
 	}
 
 	tp := sdktrace.NewTracerProvider(tpOpts...)

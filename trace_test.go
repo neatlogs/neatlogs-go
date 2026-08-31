@@ -92,6 +92,78 @@ func TestTrace_StampsIdentityOnRoot(t *testing.T) {
 	}
 }
 
+func TestSetTraceOutput_RecordsStructuredRootOutput(t *testing.T) {
+	ctx := context.Background()
+	sink := tracetest.NewInMemoryExporter()
+	sd, err := Init(ctx, Config{WorkflowName: "wf"}, WithExporter(sink))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sd(ctx)
+
+	_, root, end := Trace(ctx, "chat_turn")
+	if err := SetTraceOutput(root, map[string]any{"answer": "sunny", "sources": 2}); err != nil {
+		t.Fatal(err)
+	}
+	end()
+	if err := Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	captured := byName(sink, "chat_turn")
+	if got, ok := attrString(captured.Attributes, attrs.TraceOutput); !ok || got != `{"answer":"sunny","sources":2}` {
+		t.Fatalf("trace output = %q (present %v), want canonical JSON", got, ok)
+	}
+}
+
+func TestSetTraceOutput_RejectsUnencodableValue(t *testing.T) {
+	ctx := context.Background()
+	sink := tracetest.NewInMemoryExporter()
+	sd, err := Init(ctx, Config{WorkflowName: "wf"}, WithExporter(sink))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sd(ctx)
+
+	_, root, end := Trace(ctx, "chat_turn")
+	if err := SetTraceOutput(root, make(chan int)); err == nil {
+		t.Fatal("expected an encoding error")
+	}
+	end()
+	if err := Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	captured := byName(sink, "chat_turn")
+	if _, ok := attrString(captured.Attributes, attrs.TraceOutput); ok {
+		t.Fatal("unencodable output must not set a partial trace output")
+	}
+}
+
+func TestSetTraceInput_RecordsStructuredRootInput(t *testing.T) {
+	ctx := context.Background()
+	exporter := tracetest.NewInMemoryExporter()
+	shutdown, err := Init(ctx, Config{WorkflowName: "root-input"}, WithExporter(exporter))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdown(ctx)
+
+	_, root, end := Trace(ctx, "workflow")
+	if err := SetTraceInput(root, map[string]any{"question": "weather", "turn": 2}); err != nil {
+		t.Fatal(err)
+	}
+	end()
+	if err := Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	span := byName(exporter, "workflow")
+	if got, ok := attrString(span.Attributes, attrs.Input); !ok || got != `{"question":"weather","turn":2}` {
+		t.Fatalf("trace input = %q (present %v), want canonical JSON", got, ok)
+	}
+}
+
 func TestTrace_StampsAdditiveSessionMetadata(t *testing.T) {
 	ctx := context.Background()
 	sink := tracetest.NewInMemoryExporter()

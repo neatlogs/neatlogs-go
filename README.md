@@ -104,6 +104,22 @@ For direct OpenAI/Anthropic calls and service boundaries, use
 lower-level `Trace`/`StartSpan` helpers. These all share the same private
 provider and automatic workflow-root behavior.
 
+For an explicit workflow root, record the final application result before
+ending the span:
+
+```go
+ctx, root, end := neatlogs.Trace(ctx, "chat_turn")
+defer end()
+
+if err := neatlogs.SetTraceInput(root, map[string]any{"question": "weather"}); err != nil {
+    return err
+}
+result := map[string]any{"answer": "sunny"}
+if err := neatlogs.SetTraceOutput(root, result); err != nil {
+    return err
+}
+```
+
 ### Examples
 
 - [examples/genai](examples/genai/main.go) — the `WrapGenAI` path.
@@ -118,6 +134,8 @@ delays your agent code.
 | `APIKey`       | `NEATLOGS_API_KEY` | Your Neatlogs project key. Required to export; if empty, spans are dropped. |
 | `WorkflowName` | —                  | Service/run label grouping your traces. Defaults to the caller source file (e.g. `main.go`). |
 | `Tags`         | —                  | Attached to every span (optional). |
+| `SampleRate`   | —                  | Optional pointer to a trace sampling rate in `[0, 1]`; nil keeps every trace. The root decision is inherited by all descendants. |
+| `Mask`         | —                  | Context-aware local transform applied to a cloned, normalized span on the export worker. An error or nil result drops that span; unmasked content is never sent. |
 | `EnableSignalHandlers` | —           | Opt in to SDK-owned SIGINT/SIGTERM shutdown. Defaults to `false`; Neatlogs does not call `signal.Notify` unless enabled. Applies to `Init`, not `NewClient`. |
 
 `DisableSignalHandlers` remains as a deprecated source-compatibility field.

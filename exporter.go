@@ -22,16 +22,31 @@ import (
 type normalizingExporter struct {
 	next   trace.SpanExporter
 	mapper *attributes.Mapper
+	mask   MaskFunc
 }
+
+// Local alias keeps the mask conversion independent of tracetest naming in the
+// public API while retaining the SDK's lossless read-only-span clone.
+type spanStub = tracetest.SpanStub
 
 var _ trace.SpanExporter = (*normalizingExporter)(nil)
 
 func (e *normalizingExporter) ExportSpans(ctx context.Context, spans []trace.ReadOnlySpan) error {
-	rewritten := make([]trace.ReadOnlySpan, len(spans))
-	for i, s := range spans {
+	rewritten := make([]trace.ReadOnlySpan, 0, len(spans))
+	for _, s := range spans {
 		stub := tracetest.SpanStubFromReadOnlySpan(s)
 		stub.Attributes = e.mapper.Normalize(stub.Attributes)
-		rewritten[i] = stub.Snapshot()
+		if e.mask != nil {
+			masked, err := e.mask(ctx, spanDataFrom(&stub))
+			if err != nil || masked == nil {
+				continue
+			}
+			applySpanData(&stub, masked)
+		}
+		rewritten = append(rewritten, stub.Snapshot())
+	}
+	if len(rewritten) == 0 {
+		return nil
 	}
 	return e.next.ExportSpans(ctx, rewritten)
 }
