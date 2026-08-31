@@ -2,8 +2,10 @@ package neatlogs
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -33,6 +35,103 @@ type MaskableSpan struct {
 // MaskFunc redacts a detached canonical export snapshot. Returning an error,
 // panicking, or exceeding the configured timeout drops that span fail-closed.
 type MaskFunc func(ctx context.Context, span *MaskableSpan) error
+
+// RewriteSerializedJSON exposes JSON-encoded string attributes to a masking
+// callback and serializes its result back into the OTel wire-compatible string.
+// It covers span, event, link, resource, and instrumentation-scope attributes.
+// Call it from MaskFunc when structured inputs/outputs may be JSON strings.
+func (s *MaskableSpan) RewriteSerializedJSON(rewrite func(any) any) error {
+	if s == nil || rewrite == nil {
+		return nil
+	}
+	var err error
+	s.Attributes, err = rewriteJSONAttributes(s.Attributes, rewrite)
+	if err != nil {
+		return err
+	}
+	for i := range s.Events {
+		s.Events[i].Attributes, err = rewriteJSONAttributes(s.Events[i].Attributes, rewrite)
+		if err != nil {
+			return err
+		}
+	}
+	for i := range s.Links {
+		s.Links[i].Attributes, err = rewriteJSONAttributes(s.Links[i].Attributes, rewrite)
+		if err != nil {
+			return err
+		}
+	}
+	if s.Resource != nil {
+		values, rewriteErr := rewriteJSONAttributes(s.Resource.Attributes(), rewrite)
+		if rewriteErr != nil {
+			return rewriteErr
+		}
+		s.Resource = resource.NewWithAttributes(s.Resource.SchemaURL(), values...)
+	}
+	values, err := rewriteJSONAttributes(s.Scope.Attributes.ToSlice(), rewrite)
+	if err != nil {
+		return err
+	}
+	s.Scope.Attributes = attribute.NewSet(values...)
+	return nil
+}
+
+func rewriteJSONAttributes(values []attribute.KeyValue, rewrite func(any) any) ([]attribute.KeyValue, error) {
+	output := cloneAttributes(values)
+	for i, kv := range output {
+		switch kv.Value.Type() {
+		case attribute.STRING:
+			encoded, changed, err := rewriteJSONString(kv.Value.AsString(), rewrite)
+			if err != nil {
+				return nil, fmt.Errorf("rewrite serialized JSON attribute %q: %w", kv.Key, err)
+			}
+			if changed {
+				output[i] = attribute.String(string(kv.Key), encoded)
+			}
+		case attribute.STRINGSLICE:
+			items := append([]string(nil), kv.Value.AsStringSlice()...)
+			for index, raw := range items {
+				encoded, changed, err := rewriteJSONString(raw, rewrite)
+				if err != nil {
+					return nil, fmt.Errorf("rewrite serialized JSON attribute %q[%d]: %w", kv.Key, index, err)
+				}
+				if changed {
+					items[index] = encoded
+				}
+			}
+			output[i] = attribute.StringSlice(string(kv.Key), items)
+		}
+	}
+	return output, nil
+}
+
+func rewriteJSONString(raw string, rewrite func(any) any) (encoded string, changed bool, err error) {
+	trimmed := strings.TrimSpace(raw)
+	if !strings.HasPrefix(trimmed, "{") && !strings.HasPrefix(trimmed, "[") {
+		return raw, false, nil
+	}
+	var decoded any
+	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+		return raw, false, nil // malformed or ordinary text stays untouched
+	}
+	var rewritten any
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				err = errors.New("rewrite callback panicked")
+			}
+		}()
+		rewritten = rewrite(decoded)
+	}()
+	if err != nil {
+		return "", false, err
+	}
+	bytes, err := json.Marshal(rewritten)
+	if err != nil {
+		return "", false, err
+	}
+	return string(bytes), true, nil
+}
 
 type maskContextKey struct{}
 
