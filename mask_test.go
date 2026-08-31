@@ -2,6 +2,7 @@ package neatlogs
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -74,6 +75,58 @@ func TestMaskRunsOnDetachedNormalizedSnapshot(t *testing.T) {
 	}
 	if containsSentinel(exported[0]) {
 		t.Fatal("raw sentinel reached Neatlogs transport")
+	}
+}
+
+func TestMaskRewritesSerializedJSONAttributes(t *testing.T) {
+	encoded := `{"request":{"api_key":"` + maskSentinel + `","safe":true}}`
+	snapshot := &MaskableSpan{
+		Attributes: []attribute.KeyValue{
+			attribute.String(attrs.Input, encoded),
+			attribute.StringSlice("batch", []string{"ordinary", encoded}),
+		},
+		Events:   []sdktrace.Event{{Attributes: []attribute.KeyValue{attribute.String("event.input", encoded)}}},
+		Links:    []sdktrace.Link{{Attributes: []attribute.KeyValue{attribute.String("link.input", encoded)}}},
+		Resource: resource.NewSchemaless(attribute.String("resource.input", encoded)),
+		Scope:    instrumentation.Scope{Attributes: attribute.NewSet(attribute.String("scope.input", encoded))},
+	}
+	err := snapshot.RewriteSerializedJSON(func(value any) any {
+		object := value.(map[string]any)
+		object["request"].(map[string]any)["api_key"] = "[REDACTED]"
+		return object
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(snapshot.Attributes[0].Value.AsString()), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	request := decoded["request"].(map[string]any)
+	if request["api_key"] != "[REDACTED]" || request["safe"] != true {
+		t.Fatalf("rewritten JSON = %#v", decoded)
+	}
+	for label, raw := range map[string]string{
+		"slice":    snapshot.Attributes[1].Value.AsStringSlice()[1],
+		"event":    snapshot.Events[0].Attributes[0].Value.AsString(),
+		"link":     snapshot.Links[0].Attributes[0].Value.AsString(),
+		"resource": snapshot.Resource.Attributes()[0].Value.AsString(),
+		"scope":    func() string { value, _ := snapshot.Scope.Attributes.Value("scope.input"); return value.AsString() }(),
+	} {
+		if strings.Contains(raw, maskSentinel) {
+			t.Fatalf("%s JSON was not rewritten: %s", label, raw)
+		}
+	}
+	if snapshot.Attributes[1].Value.AsStringSlice()[0] != "ordinary" {
+		t.Fatal("ordinary string-slice member changed")
+	}
+}
+
+func TestRewriteSerializedJSONConvertsCallbackPanicToError(t *testing.T) {
+	snapshot := &MaskableSpan{Attributes: []attribute.KeyValue{attribute.String(attrs.Input, `{"safe":true}`)}}
+	err := snapshot.RewriteSerializedJSON(func(any) any { panic(maskSentinel) })
+	if err == nil || strings.Contains(err.Error(), maskSentinel) {
+		t.Fatalf("error = %v, want sanitized callback error", err)
 	}
 }
 
