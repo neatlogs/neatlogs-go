@@ -27,6 +27,7 @@ type normalizingExporter struct {
 	mapper    *attributes.Mapper
 	mask      MaskFunc
 	delivery  *deliveryDiagnostics
+	uploads   uploadAuthority
 	release   func(int)
 	maskOnce  sync.Once
 	maskSlots chan struct{}
@@ -74,6 +75,17 @@ func (e *normalizingExporter) ExportSpans(ctx context.Context, spans []trace.Rea
 			applySpanData(&stubs[index], result)
 		}
 	}
+
+	// Typed media bytes are deliberately held in private attributes until the
+	// normalized clone has passed through the caller's mask. This is the first
+	// point at which an upload authority may see content.
+	uploadCtx, cancelUploads := context.WithTimeout(ctx, defaultUploadTimeout)
+	for index := range stubs {
+		if keep[index] {
+			uploadTypedMedia(uploadCtx, &stubs[index], e.uploads, e.delivery)
+		}
+	}
+	cancelUploads()
 
 	rewritten := make([]trace.ReadOnlySpan, 0, len(stubs))
 	for index := range stubs {

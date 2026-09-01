@@ -2,6 +2,7 @@ package neatlogs
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -11,15 +12,38 @@ import (
 // DeliveryDiagnosticsSnapshot reports bounded-queue, privacy, and final-export
 // loss for one private Neatlogs pipeline.
 type DeliveryDiagnosticsSnapshot struct {
-	SpanQueueDrops     uint64 `json:"span_queue_drops"`
-	SpanExportFailures uint64 `json:"span_export_failures"`
-	MaskedSpanDrops    uint64 `json:"masked_span_drops"`
+	SpanQueueDrops           uint64                   `json:"span_queue_drops"`
+	SpanExportFailures       uint64                   `json:"span_export_failures"`
+	MaskedSpanDrops          uint64                   `json:"masked_span_drops"`
+	UploadAuthorityAvailable bool                     `json:"upload_authority_available"`
+	TypedMediaUploads        uint64                   `json:"typed_media_uploads"`
+	TypedMediaUploadFailures uint64                   `json:"typed_media_upload_failures"`
+	OTLPOverflowUploads      uint64                   `json:"otlp_overflow_uploads"`
+	OTLPOverflowFailures     uint64                   `json:"otlp_overflow_failures"`
+	OTLPOverflowUnavailable  uint64                   `json:"otlp_overflow_unavailable"`
+	LastUploadFailure        *UploadFailureDiagnostic `json:"last_upload_failure,omitempty"`
+}
+
+// UploadFailureDiagnostic is a secret-free report of the most recent upload
+// failure. It deliberately cannot contain a signed URL, upload headers, API
+// key, response body, or payload content.
+type UploadFailureDiagnostic struct {
+	Stage      string `json:"stage"`
+	ReasonCode string `json:"reason_code"`
+	Retryable  bool   `json:"retryable"`
 }
 
 type deliveryDiagnostics struct {
-	spanQueueDrops     atomic.Uint64
-	spanExportFailures atomic.Uint64
-	maskedSpanDrops    atomic.Uint64
+	spanQueueDrops           atomic.Uint64
+	spanExportFailures       atomic.Uint64
+	maskedSpanDrops          atomic.Uint64
+	uploadAuthorityAvailable atomic.Bool
+	typedMediaUploads        atomic.Uint64
+	typedMediaUploadFailures atomic.Uint64
+	otlpOverflowUploads      atomic.Uint64
+	otlpOverflowFailures     atomic.Uint64
+	otlpOverflowUnavailable  atomic.Uint64
+	lastUploadFailure        atomic.Pointer[UploadFailureDiagnostic]
 }
 
 func (d *deliveryDiagnostics) snapshot() DeliveryDiagnosticsSnapshot {
@@ -28,8 +52,33 @@ func (d *deliveryDiagnostics) snapshot() DeliveryDiagnosticsSnapshot {
 	}
 	return DeliveryDiagnosticsSnapshot{
 		SpanQueueDrops: d.spanQueueDrops.Load(), SpanExportFailures: d.spanExportFailures.Load(),
-		MaskedSpanDrops: d.maskedSpanDrops.Load(),
+		MaskedSpanDrops: d.maskedSpanDrops.Load(), UploadAuthorityAvailable: d.uploadAuthorityAvailable.Load(),
+		TypedMediaUploads: d.typedMediaUploads.Load(), TypedMediaUploadFailures: d.typedMediaUploadFailures.Load(),
+		OTLPOverflowUploads: d.otlpOverflowUploads.Load(), OTLPOverflowFailures: d.otlpOverflowFailures.Load(),
+		OTLPOverflowUnavailable: d.otlpOverflowUnavailable.Load(), LastUploadFailure: cloneUploadFailure(d.lastUploadFailure.Load()),
 	}
+}
+
+func (d *deliveryDiagnostics) recordUploadFailure(err error) {
+	if d == nil {
+		return
+	}
+	diagnostic := &UploadFailureDiagnostic{Stage: "upload", ReasonCode: "unknown", Retryable: false}
+	var failure *uploadFailure
+	if errors.As(err, &failure) {
+		diagnostic.Stage = failure.stage
+		diagnostic.ReasonCode = failure.reasonCode
+		diagnostic.Retryable = failure.retryable
+	}
+	d.lastUploadFailure.Store(diagnostic)
+}
+
+func cloneUploadFailure(value *UploadFailureDiagnostic) *UploadFailureDiagnostic {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
 }
 
 type deliveryQueue struct {

@@ -38,6 +38,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -93,6 +94,12 @@ type Config struct {
 
 	// DisableExport drops all spans instead of sending them. Useful in tests.
 	DisableExport bool
+
+	// EnableUploads opts this pipeline into the draft authenticated upload
+	// authority for large typed media and individually oversized masked OTLP
+	// spans. It defaults to false and may also be enabled with
+	// NEATLOGS_UPLOADS_ENABLED=true. Uploads use the same API key and endpoint.
+	EnableUploads bool
 
 	// Mask transforms a cloned, normalized span on the batch-export worker.
 	// Callbacks run serially. Errors and nil results fail closed: the original
@@ -325,7 +332,7 @@ func initializationSignature(cfg Config, options initOptions) string {
 	}
 	keyDigest := sha256.Sum256([]byte(apiKey))
 	return fmt.Sprintf(
-		"key=%x|endpoint=%s|workflow=%s|tags=%q|debug=%t|rate=%g|disable=%t|mask=%s|exporter=%s|signals=%t/%t",
+		"key=%x|endpoint=%s|workflow=%s|tags=%q|debug=%t|rate=%g|disable=%t|uploads=%s|mask=%s|exporter=%s|signals=%t/%t",
 		keyDigest,
 		endpoint,
 		resolvedWorkflowNameFrom(cfg),
@@ -333,6 +340,7 @@ func initializationSignature(cfg Config, options initOptions) string {
 		cfg.Debug,
 		rate,
 		cfg.DisableExport,
+		uploadsSignature(cfg),
 		maskSignature(cfg.Mask),
 		identityOf(options.exporter),
 		cfg.EnableSignalHandlers,
@@ -375,6 +383,14 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 	apiKey := strings.TrimSpace(cfg.APIKey)
 	if apiKey == "" {
 		apiKey = strings.TrimSpace(os.Getenv("NEATLOGS_API_KEY"))
+	}
+
+	uploadsEnabled, uploadsErr := resolveUploadsEnabled(cfg)
+	if uploadsErr != nil {
+		return nil, nil, false, uploadsErr
+	}
+	if uploadsEnabled && apiKey == "" && !cfg.DisableExport {
+		return nil, nil, false, fmt.Errorf("neatlogs: uploads require NEATLOGS_API_KEY or Config.APIKey")
 	}
 
 	disable := cfg.DisableExport
@@ -426,6 +442,11 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 		// completion processor is registered below, after this exporter/root
 		// path, so an ending root is queued before its completion marker.
 		delivery := &deliveryDiagnostics{}
+		var uploads uploadAuthority
+		if uploadsEnabled {
+			uploads = newHTTPUploadAuthority(base, apiKey)
+			delivery.uploadAuthorityAvailable.Store(true)
+		}
 		byteLimited, byteErr := newByteLimitedExporter(exp, defaultMaxExportBytes, delivery)
 		if byteErr != nil {
 			return nil, nil, false, byteErr
@@ -434,12 +455,13 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 		batchProcessor := sdktrace.NewBatchSpanProcessor(
 			&normalizingExporter{
 				next: byteLimited, mapper: attributes.Default(), mask: cfg.Mask,
-				delivery: delivery, release: queue.release,
+				delivery: delivery, uploads: uploads, release: queue.release,
 			},
 			sdktrace.WithMaxQueueSize(defaultMaxQueueSize),
 			sdktrace.WithMaxExportBatchSize(defaultMaxExportBatchSize),
 			sdktrace.WithBatchTimeout(defaultBatchTimeout),
 		)
+		byteLimited.uploads = uploads
 		tpOpts = append(tpOpts, sdktrace.WithSpanProcessor(&boundedSpanProcessor{
 			next: batchProcessor, queue: queue,
 		}))
@@ -454,6 +476,32 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 		tp.RegisterSpanProcessor(&completionProcessor{tracer: tp.Tracer(tracerName, trace.WithInstrumentationVersion(Version))})
 	}
 	return newSDKRuntime(tp, lifecycle, resolvedWorkflowNameFrom(cfg), io.delivery), base, !disable, nil
+}
+
+func resolveUploadsEnabled(cfg Config) (bool, error) {
+	if cfg.EnableUploads {
+		return true, nil
+	}
+	raw := strings.TrimSpace(os.Getenv("NEATLOGS_UPLOADS_ENABLED"))
+	if raw == "" {
+		return false, nil
+	}
+	enabled, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("neatlogs: NEATLOGS_UPLOADS_ENABLED must be true or false")
+	}
+	return enabled, nil
+}
+
+func uploadsSignature(cfg Config) string {
+	if cfg.EnableUploads {
+		return "true"
+	}
+	raw := strings.TrimSpace(os.Getenv("NEATLOGS_UPLOADS_ENABLED"))
+	if raw == "" {
+		return "false"
+	}
+	return raw
 }
 
 // newOTLPExporter builds an OTLP/HTTP span exporter targeting {base}/v1/traces

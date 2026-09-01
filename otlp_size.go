@@ -24,8 +24,19 @@ func encodedSpanUpperBound(span sdktrace.ReadOnlySpan) int {
 	if span == nil {
 		return 0
 	}
+	return proto.Size(otlpRequestForSpan(span))
+}
+
+func encodeSpanEnvelope(span sdktrace.ReadOnlySpan) ([]byte, error) {
+	if span == nil {
+		return nil, nil
+	}
+	return proto.Marshal(otlpRequestForSpan(span))
+}
+
+func otlpRequestForSpan(span sdktrace.ReadOnlySpan) *collectortracepb.ExportTraceServiceRequest {
 	scope := span.InstrumentationScope()
-	request := &collectortracepb.ExportTraceServiceRequest{
+	return &collectortracepb.ExportTraceServiceRequest{
 		ResourceSpans: []*tracepb.ResourceSpans{{
 			Resource:  &resourcepb.Resource{Attributes: otlpKeyValues(span.Resource().Attributes())},
 			SchemaUrl: span.Resource().SchemaURL(),
@@ -39,7 +50,6 @@ func encodedSpanUpperBound(span sdktrace.ReadOnlySpan) int {
 			}},
 		}},
 	}
-	return proto.Size(request)
 }
 
 func otlpSpan(span sdktrace.ReadOnlySpan) *tracepb.Span {
