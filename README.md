@@ -177,3 +177,23 @@ token, and shutdown or any dropped span releases its staged bytes.
 v0.1 — Google Gemini (`google.golang.org/genai`) active wrapping, direct
 LLM/retriever/tool helpers, and an isolated private provider. More providers and
 explicit framework wrappers will follow.
+
+## Doctor v2
+
+Run the isolated, network-free SDK check:
+
+```bash
+neatlogs doctor --local --json
+```
+
+Run the authenticated backend path probe:
+
+```bash
+NEATLOGS_API_KEY='<project-key>' \
+NEATLOGS_ENDPOINT='https://ingest.neatlogs.com' \
+neatlogs doctor --probe --json
+```
+
+Local mode validates SDK construction, normalization, masking, hierarchy,
+sampling, capture, and flush. Probe success additionally requires accepted
+receipts through authenticated visibility; HTTP acceptance alone is not a pass.
