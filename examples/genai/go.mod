@@ -3,8 +3,9 @@ module neatlogs-go-example-genai
 go 1.25.0
 
 require (
-	github.com/neatlogs/neatlogs-go v0.0.0
+	github.com/neatlogs/neatlogs-go v0.1.7
 	github.com/neatlogs/neatlogs-go/contrib/genai v0.0.0
+	go.opentelemetry.io/otel v1.44.0
 	google.golang.org/genai v1.61.0
 )
 
@@ -25,7 +26,6 @@ require (
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 // indirect
 	go.opencensus.io v0.24.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
-	go.opentelemetry.io/otel v1.44.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.44.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.44.0 // indirect
 	go.opentelemetry.io/otel/metric v1.44.0 // indirect
