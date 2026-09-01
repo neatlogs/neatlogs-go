@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -304,11 +305,11 @@ func setInvocationParams(span trace.Span, config *genai.GenerateContentConfig) {
 const maxCapturedToolDefinitions = 8
 
 type capturedToolDefinition struct {
-	toolType       string
-	name           string
-	description    string
-	inputSchema    string
-	definitionJSON string
+	toolType          string
+	name              string
+	description       string
+	inputSchema       string
+	configurationJSON string
 }
 
 // The DTOs below are deliberately independent of provider JSON structs. New
@@ -316,13 +317,11 @@ type capturedToolDefinition struct {
 // material (keys, tokens, headers, and Secret Manager references) has no field
 // through which it can enter telemetry.
 type safeFunctionDefinition struct {
-	Name                 string         `json:"name,omitempty"`
-	Description          string         `json:"description,omitempty"`
-	Parameters           *genai.Schema  `json:"parameters,omitempty"`
-	ParametersJSONSchema any            `json:"parametersJsonSchema,omitempty"`
-	Response             *genai.Schema  `json:"response,omitempty"`
-	ResponseJSONSchema   any            `json:"responseJsonSchema,omitempty"`
-	Behavior             genai.Behavior `json:"behavior,omitempty"`
+	// Name, description, and input schema are intentionally absent: their
+	// canonical attributes are the only copies the backend must classify.
+	Response           *genai.Schema  `json:"response,omitempty"`
+	ResponseJSONSchema any            `json:"responseJsonSchema,omitempty"`
+	Behavior           genai.Behavior `json:"behavior,omitempty"`
 }
 
 type safeExternalAPIDefinition struct {
@@ -464,14 +463,14 @@ func collectToolDefinitions(config *genai.GenerateContentConfig) ([]capturedTool
 	}
 	definitions := make([]capturedToolDefinition, 0, maxCapturedToolDefinitions)
 	truncated := 0
-	capture := func(toolType, name, description string, schema, definition any) {
+	capture := func(toolType, name, description string, schema, configuration any) {
 		if len(definitions) >= maxCapturedToolDefinitions {
 			truncated++
 			return
 		}
 		captured := capturedToolDefinition{
 			toolType: toolType, name: name, description: description,
-			definitionJSON: mustJSON(definition),
+			configurationJSON: mustJSON(configuration),
 		}
 		if schema != nil {
 			captured.inputSchema = mustJSON(schema)
@@ -486,14 +485,14 @@ func collectToolDefinitions(config *genai.GenerateContentConfig) ([]capturedTool
 			if fn == nil {
 				continue
 			}
-			schema := any(fn.Parameters)
-			if schema == nil {
+			var schema any
+			if fn.Parameters != nil {
+				schema = fn.Parameters
+			} else {
 				schema = fn.ParametersJsonSchema
 			}
 			capture("function", fn.Name, fn.Description, schema, safeFunctionDefinition{
-				Name: fn.Name, Description: fn.Description, Parameters: fn.Parameters,
-				ParametersJSONSchema: fn.ParametersJsonSchema, Response: fn.Response,
-				ResponseJSONSchema: fn.ResponseJsonSchema, Behavior: fn.Behavior,
+				Response: fn.Response, ResponseJSONSchema: fn.ResponseJsonSchema, Behavior: fn.Behavior,
 			})
 		}
 		if tool.Retrieval != nil {
@@ -555,7 +554,7 @@ func setCapturedToolDefinitions(span trace.Span, definitions []capturedToolDefin
 		prefix := fmt.Sprintf("%s%d.", attrs.LLMToolPrefix, index)
 		span.SetAttributes(
 			attribute.String(prefix+"type", definition.toolType),
-			attribute.String(prefix+"definition", definition.definitionJSON),
+			attribute.String(prefix+"configuration", definition.configurationJSON),
 		)
 		if definition.name != "" {
 			span.SetAttributes(attribute.String(prefix+"name", definition.name))
@@ -773,6 +772,7 @@ func (a *responseAccumulator) add(resp *genai.GenerateContentResponse) {
 				choice.role = cand.Content.Role
 			}
 			functionPosition := 0
+			nextActiveIDlessCalls := make(map[int]int)
 			for _, part := range cand.Content.Parts {
 				if part == nil {
 					continue
@@ -824,12 +824,16 @@ func (a *responseAccumulator) add(resp *genai.GenerateContentResponse) {
 						call.applyPartialArg(partial)
 					}
 					if functionCall.WillContinue != nil && *functionCall.WillContinue {
-						choice.activeIDlessCalls[functionPosition] = toolPosition
-					} else {
-						delete(choice.activeIDlessCalls, functionPosition)
+						// Provider positions are relative to the calls present in each
+						// chunk. Compact the surviving calls so a later B-only chunk
+						// still links to B after A completed in the preceding chunk.
+						nextActiveIDlessCalls[len(nextActiveIDlessCalls)] = toolPosition
 					}
 					functionPosition++
 				}
+			}
+			if functionPosition > 0 {
+				choice.activeIDlessCalls = nextActiveIDlessCalls
 			}
 		}
 		if cand.FinishReason != "" {
@@ -850,6 +854,12 @@ type jsonPathSegment struct {
 	index int
 	isKey bool
 }
+
+const (
+	maxJSONPathLength     = 4096
+	maxJSONPathSegments   = 64
+	maxJSONPathArrayIndex = 1024
+)
 
 func (c *accumulatedToolCall) applyPartialArg(partial *genai.PartialArg) {
 	if partial == nil {
@@ -888,54 +898,159 @@ func partialArgValue(partial *genai.PartialArg) (any, bool) {
 	}
 }
 
+// parseJSONPath accepts the provider's child-selector subset of RFC 9535:
+// member-name shorthand, quoted names, and non-negative array indexes. Limits
+// keep malformed telemetry from causing unbounded parsing or array allocation;
+// unsupported or over-limit selectors are rejected atomically.
 func parseJSONPath(path string) ([]jsonPathSegment, bool) {
-	if path == "" || path[0] != '$' {
+	if path == "" || len(path) > maxJSONPathLength || path[0] != '$' || !utf8.ValidString(path) {
 		return nil, false
 	}
 	segments := make([]jsonPathSegment, 0, 4)
 	for index := 1; index < len(path); {
+		if len(segments) >= maxJSONPathSegments {
+			return nil, false
+		}
 		switch path[index] {
 		case '.':
 			index++
-			start := index
-			for index < len(path) && path[index] != '.' && path[index] != '[' {
-				index++
-			}
-			if start == index {
+			key, next, ok := parseJSONPathMemberName(path, index)
+			if !ok {
 				return nil, false
 			}
-			segments = append(segments, jsonPathSegment{key: path[start:index], isKey: true})
+			segments = append(segments, jsonPathSegment{key: key, isKey: true})
+			index = next
 		case '[':
-			end := strings.IndexByte(path[index:], ']')
-			if end < 0 {
+			index++
+			index = skipJSONPathWhitespace(path, index)
+			if index >= len(path) {
 				return nil, false
 			}
-			end += index
-			token := path[index+1 : end]
-			if len(token) >= 2 && ((token[0] == '\'' && token[len(token)-1] == '\'') ||
-				(token[0] == '"' && token[len(token)-1] == '"')) {
-				quoted := token
-				if token[0] == '\'' {
-					quoted = `"` + strings.ReplaceAll(token[1:len(token)-1], `"`, `\"`) + `"`
+			if path[index] == '\'' || path[index] == '"' {
+				key, next, ok := parseJSONPathQuotedName(path, index)
+				if !ok {
+					return nil, false
 				}
-				key, err := strconv.Unquote(quoted)
-				if err != nil {
+				index = skipJSONPathWhitespace(path, next)
+				if index >= len(path) || path[index] != ']' {
 					return nil, false
 				}
 				segments = append(segments, jsonPathSegment{key: key, isKey: true})
+				index++
 			} else {
-				position, err := strconv.Atoi(token)
-				if err != nil || position < 0 {
+				start := index
+				for index < len(path) && path[index] >= '0' && path[index] <= '9' {
+					index++
+				}
+				if start == index || (path[start] == '0' && index-start > 1) {
+					return nil, false
+				}
+				position, err := strconv.Atoi(path[start:index])
+				if err != nil || position > maxJSONPathArrayIndex {
+					return nil, false
+				}
+				index = skipJSONPathWhitespace(path, index)
+				if index >= len(path) || path[index] != ']' {
 					return nil, false
 				}
 				segments = append(segments, jsonPathSegment{index: position})
+				index++
 			}
-			index = end + 1
 		default:
 			return nil, false
 		}
 	}
 	return segments, true
+}
+
+func parseJSONPathMemberName(path string, start int) (string, int, bool) {
+	index := start
+	for index < len(path) && path[index] != '.' && path[index] != '[' {
+		value, size := utf8.DecodeRuneInString(path[index:])
+		if value == utf8.RuneError && size == 1 {
+			return "", 0, false
+		}
+		valid := value == '_' || value >= 0x80 || value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z'
+		if index > start {
+			valid = valid || value >= '0' && value <= '9'
+		}
+		if !valid {
+			return "", 0, false
+		}
+		index += size
+	}
+	if start == index {
+		return "", 0, false
+	}
+	return path[start:index], index, true
+}
+
+func skipJSONPathWhitespace(path string, index int) int {
+	for index < len(path) {
+		switch path[index] {
+		case ' ', '\t', '\n', '\r':
+			index++
+		default:
+			return index
+		}
+	}
+	return index
+}
+
+// parseJSONPathQuotedName parses the RFC 9535 single- and double-quoted name
+// selector forms. It converts the single-quoted form to a JSON string so the
+// standard decoder validates escape syntax and decodes Unicode sequences.
+func parseJSONPathQuotedName(path string, start int) (string, int, bool) {
+	quote := path[start]
+	var encoded strings.Builder
+	encoded.Grow(16)
+	encoded.WriteByte('"')
+	for index := start + 1; index < len(path); index++ {
+		char := path[index]
+		if char == quote {
+			encoded.WriteByte('"')
+			var key string
+			if err := json.Unmarshal([]byte(encoded.String()), &key); err != nil {
+				return "", 0, false
+			}
+			return key, index + 1, true
+		}
+		if char < 0x20 {
+			return "", 0, false
+		}
+		if char == '"' {
+			// A double quote is ordinary content only inside a single-quoted
+			// selector; escape it in the JSON representation.
+			encoded.WriteString(`\"`)
+			continue
+		}
+		if char != '\\' {
+			encoded.WriteByte(char)
+			continue
+		}
+		if index+1 >= len(path) {
+			return "", 0, false
+		}
+		escaped := path[index+1]
+		if escaped == quote {
+			if quote == '"' {
+				encoded.WriteString(`\"`)
+			} else {
+				encoded.WriteByte('\'')
+			}
+			index++
+			continue
+		}
+		// Escaping the other quote is not part of the RFC grammar. The
+		// unescaped form is already valid in this quoting style.
+		if escaped == '\'' || escaped == '"' {
+			return "", 0, false
+		}
+		encoded.WriteByte('\\')
+		encoded.WriteByte(escaped)
+		index++
+	}
+	return "", 0, false
 }
 
 func assignJSONPath(root map[string]any, segments []jsonPathSegment, value any) {

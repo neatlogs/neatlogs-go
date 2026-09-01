@@ -3,6 +3,7 @@ package genai
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"iter"
@@ -270,6 +271,100 @@ func TestIDLessStreamedToolCallsMergePartialArgsByChoiceAndPosition(t *testing.T
 	t.Fatal("partial tool span not exported")
 }
 
+func TestIDLessMultiCallContinuationCompactsAfterEarlierCallCompletes(t *testing.T) {
+	continued, complete := true, false
+	acc := newResponseAccumulator()
+	acc.add(&google.GenerateContentResponse{Candidates: []*google.Candidate{{
+		Content: &google.Content{Parts: []*google.Part{
+			{FunctionCall: &google.FunctionCall{Name: "first", WillContinue: &continued, PartialArgs: []*google.PartialArg{
+				{JsonPath: "$.value", StringValue: "A1", WillContinue: &continued},
+			}}},
+			{FunctionCall: &google.FunctionCall{Name: "second", WillContinue: &continued, PartialArgs: []*google.PartialArg{
+				{JsonPath: "$.value", StringValue: "B1", WillContinue: &continued},
+			}}},
+		}},
+	}}})
+	acc.add(&google.GenerateContentResponse{Candidates: []*google.Candidate{{
+		Content: &google.Content{Parts: []*google.Part{
+			{FunctionCall: &google.FunctionCall{WillContinue: &complete, PartialArgs: []*google.PartialArg{
+				{JsonPath: "$.value", StringValue: "A2", WillContinue: &complete},
+			}}},
+			{FunctionCall: &google.FunctionCall{WillContinue: &continued, PartialArgs: []*google.PartialArg{
+				{JsonPath: "$.value", StringValue: "B2", WillContinue: &continued},
+			}}},
+		}},
+	}}})
+	acc.add(&google.GenerateContentResponse{Candidates: []*google.Candidate{{
+		Content: &google.Content{Parts: []*google.Part{{FunctionCall: &google.FunctionCall{
+			WillContinue: &complete, PartialArgs: []*google.PartialArg{
+				{JsonPath: "$.value", StringValue: "B3", WillContinue: &complete},
+			},
+		}}}},
+	}}})
+
+	choice := acc.choices[0]
+	if choice == nil || len(choice.toolCalls) != 2 {
+		t.Fatalf("tool calls = %#v, want exactly two logical calls", choice)
+	}
+	if got := mustJSON(choice.toolCalls[0].arguments); got != `{"value":"A1A2"}` {
+		t.Fatalf("first arguments = %s", got)
+	}
+	if got := mustJSON(choice.toolCalls[1].arguments); got != `{"value":"B1B2B3"}` {
+		t.Fatalf("second arguments = %s", got)
+	}
+	if got := len(choice.activeIDlessCalls); got != 0 {
+		t.Fatalf("active calls after completion = %d, want 0", got)
+	}
+}
+
+func TestPartialArgJSONPathSupportsQuotedEscapesAndEmbeddedBrackets(t *testing.T) {
+	call := &accumulatedToolCall{
+		arguments:            make(map[string]any),
+		partialContinuations: make(map[string]bool),
+	}
+	call.applyPartialArg(&google.PartialArg{
+		JsonPath:    `$["double\"quote]"]`,
+		StringValue: "double",
+	})
+	call.applyPartialArg(&google.PartialArg{
+		JsonPath:    `$[ "array]key" ][0]['single\'quote']`,
+		StringValue: "nested",
+	})
+
+	if got := mustJSON(call.arguments); got != `{"array]key":[{"single'quote":"nested"}],"double\"quote]":"double"}` {
+		t.Fatalf("partial arguments = %s", got)
+	}
+}
+
+func TestPartialArgJSONPathParserIsBounded(t *testing.T) {
+	tooDeep := "$" + strings.Repeat(".a", maxJSONPathSegments+1)
+	invalid := []string{
+		"$." + strings.Repeat("a", maxJSONPathLength),
+		tooDeep,
+		fmt.Sprintf("$.items[%d]", maxJSONPathArrayIndex+1),
+		"$.items[01]",
+		"$.items[*]",
+		"$..name",
+		`$["unterminated]`,
+	}
+	for _, path := range invalid {
+		if segments, ok := parseJSONPath(path); ok {
+			t.Fatalf("parseJSONPath(%q) = %#v, true; want rejected", path, segments)
+		}
+	}
+
+	call := &accumulatedToolCall{
+		arguments:            map[string]any{"retained": true},
+		partialContinuations: make(map[string]bool),
+	}
+	for _, path := range invalid {
+		call.applyPartialArg(&google.PartialArg{JsonPath: path, StringValue: "must-not-apply"})
+	}
+	if got := mustJSON(call.arguments); got != `{"retained":true}` {
+		t.Fatalf("rejected selectors partially mutated arguments: %s", got)
+	}
+}
+
 func TestToolDefinitionsPreserveTypeAndCompleteConfiguration(t *testing.T) {
 	ctx := context.Background()
 	sink := tracetest.NewInMemoryExporter()
@@ -281,8 +376,12 @@ func TestToolDefinitionsPreserveTypeAndCompleteConfiguration(t *testing.T) {
 
 	_, span, end := neatlogs.StartProviderSpan(ctx, "tool-definitions", attrs.KindLLM)
 	setToolDefinitions(span, &google.GenerateContentConfig{Tools: []*google.Tool{{
-		FunctionDeclarations: []*google.FunctionDeclaration{{Name: "lookup", Description: "Find a record"}},
-		GoogleSearch:         &google.GoogleSearch{},
+		FunctionDeclarations: []*google.FunctionDeclaration{{
+			Name: "lookup", Description: "Find a record",
+			ParametersJsonSchema: map[string]any{"type": "object"},
+			ResponseJsonSchema:   map[string]any{"description": "response-sensitive-marker"},
+		}},
+		GoogleSearch: &google.GoogleSearch{ExcludeDomains: []string{"private.example"}},
 	}}})
 	end()
 	if err := neatlogs.Flush(ctx); err != nil {
@@ -295,13 +394,62 @@ func TestToolDefinitionsPreserveTypeAndCompleteConfiguration(t *testing.T) {
 		}
 		assertStringAttribute(t, candidate.Attributes, attrs.LLMToolPrefix+"0.type", "function")
 		assertStringAttribute(t, candidate.Attributes, attrs.LLMToolPrefix+"0.name", "lookup")
+		assertStringAttribute(t, candidate.Attributes, attrs.LLMToolPrefix+"0.description", "Find a record")
+		assertStringAttribute(t, candidate.Attributes, attrs.LLMToolPrefix+"0.input_schema", `{"type":"object"}`)
 		assertStringAttribute(t, candidate.Attributes, attrs.LLMToolPrefix+"1.type", "google_search")
-		if definition, ok := findAttribute(candidate.Attributes, attrs.LLMToolPrefix+"1.definition"); !ok || definition.AsString() == "" {
-			t.Fatal("google_search definition was not preserved")
+		for index, marker := range []string{"response-sensitive-marker", "private.example"} {
+			configuration, ok := findAttribute(candidate.Attributes, attrs.LLMToolPrefix+fmt.Sprintf("%d.configuration", index))
+			if !ok || !strings.Contains(configuration.AsString(), marker) {
+				t.Fatalf("tool %d configuration = %q, %v; want marker %q", index, configuration.AsString(), ok, marker)
+			}
+		}
+		for index := range 2 {
+			if _, ok := findAttribute(candidate.Attributes, attrs.LLMToolPrefix+fmt.Sprintf("%d.definition", index)); ok {
+				t.Fatalf("legacy unclassified definition attribute was emitted for tool %d", index)
+			}
 		}
 		return
 	}
 	t.Fatal("tool definition span not exported")
+}
+
+func TestFunctionToolConfigurationUsesCanonicalSensitiveFieldsOnce(t *testing.T) {
+	definitions, truncated := collectToolDefinitions(&google.GenerateContentConfig{Tools: []*google.Tool{{
+		FunctionDeclarations: []*google.FunctionDeclaration{{
+			Name:        "lookup-sensitive-marker",
+			Description: "description-sensitive-marker",
+			ParametersJsonSchema: map[string]any{
+				"type":        "object",
+				"description": "schema-sensitive-marker",
+			},
+		}},
+	}}})
+	if truncated != 0 || len(definitions) != 1 {
+		t.Fatalf("definitions, truncated = %#v, %d; want one definition", definitions, truncated)
+	}
+	definition := definitions[0]
+	if definition.name != "lookup-sensitive-marker" || definition.description != "description-sensitive-marker" {
+		t.Fatalf("canonical name/description = %q/%q", definition.name, definition.description)
+	}
+	if !strings.Contains(definition.inputSchema, "schema-sensitive-marker") {
+		t.Fatalf("canonical input schema = %s", definition.inputSchema)
+	}
+	for _, duplicate := range []string{
+		"lookup-sensitive-marker", "description-sensitive-marker", "schema-sensitive-marker",
+	} {
+		if strings.Contains(definition.configurationJSON, duplicate) {
+			t.Fatalf("configuration duplicates canonical sensitive field %q: %s", duplicate, definition.configurationJSON)
+		}
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal([]byte(definition.configurationJSON), &metadata); err != nil {
+		t.Fatal(err)
+	}
+	for _, duplicateKey := range []string{"name", "description", "parameters", "parametersJsonSchema"} {
+		if _, exists := metadata[duplicateKey]; exists {
+			t.Fatalf("configuration contains duplicate key %q: %s", duplicateKey, definition.configurationJSON)
+		}
+	}
 }
 
 func TestToolDefinitionsExcludeAllProviderAuthenticationShapes(t *testing.T) {
