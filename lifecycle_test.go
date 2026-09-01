@@ -274,6 +274,26 @@ func TestConflictingInitRequiresShutdown(t *testing.T) {
 	}
 }
 
+func TestRepeatedInitWithCapturedMaskAlwaysConflicts(t *testing.T) {
+	ctx := context.Background()
+	makeMask := func(replacement string) MaskFunc {
+		return func(_ context.Context, data SpanData) (*SpanData, error) {
+			data.Name = replacement
+			return &data, nil
+		}
+	}
+	shutdown, err := Init(ctx, Config{DisableExport: true, Mask: makeMask("tenant-a")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdown(ctx)
+
+	if _, err := Init(ctx, Config{DisableExport: true, Mask: makeMask("tenant-b")}); err == nil ||
+		!strings.Contains(err.Error(), "different configuration") {
+		t.Fatalf("repeated Init with captured mask error = %v", err)
+	}
+}
+
 type blockingStartProcessor struct {
 	entered chan struct{}
 	release chan struct{}

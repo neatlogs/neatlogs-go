@@ -95,7 +95,9 @@ type Config struct {
 	DisableExport bool
 
 	// Mask transforms a cloned, normalized span on the batch-export worker.
-	// Errors and nil results fail closed: the original span is never exported.
+	// Callbacks run serially. Errors and nil results fail closed: the original
+	// span is never exported. Because Go function values have no stable identity,
+	// any repeated Init while a Mask is configured is treated as conflicting.
 	Mask MaskFunc
 
 	// EnableSignalHandlers opts Init into handling SIGINT and SIGTERM. The zero
@@ -149,8 +151,9 @@ func WithExporter(exp sdktrace.SpanExporter) Option {
 
 // Init configures a private OpenTelemetry TracerProvider for Neatlogs and
 // returns a ShutdownFunc. It never changes process-global OpenTelemetry state.
-// Repeating the same initialization is idempotent; conflicting configuration
-// requires the caller to run the returned shutdown first.
+// Repeating the same initialization without a Mask is idempotent; conflicting
+// configuration, including any repeated Init with a Mask, requires the caller
+// to run the returned shutdown first.
 func Init(ctx context.Context, cfg Config, opts ...Option) (ShutdownFunc, error) {
 	var io initOptions
 	for _, opt := range opts {
@@ -162,7 +165,10 @@ func Init(ctx context.Context, cfg Config, opts ...Option) (ShutdownFunc, error)
 	global.mu.Lock()
 	if global.state == stateRunning && global.runtime != nil {
 		runtime := global.runtime
-		if global.signature == signature {
+		// Function values do not have a stable identity in Go: closures with
+		// different captures may share a code pointer. A configured mask therefore
+		// makes repeated Init calls explicitly conflicting.
+		if global.signature == signature && !hasUnstableFunctionIdentity(cfg, io) {
 			global.mu.Unlock()
 			return func(ctx context.Context) error {
 				return global.shutdown(ctx, runtime, "shutdown")
@@ -327,11 +333,25 @@ func initializationSignature(cfg Config, options initOptions) string {
 		cfg.Debug,
 		rate,
 		cfg.DisableExport,
-		identityOf(cfg.Mask),
+		maskSignature(cfg.Mask),
 		identityOf(options.exporter),
 		cfg.EnableSignalHandlers,
 		cfg.DisableSignalHandlers,
 	)
+}
+
+func maskSignature(mask MaskFunc) string {
+	if mask == nil {
+		return "nil"
+	}
+	return "configured"
+}
+
+func hasUnstableFunctionIdentity(cfg Config, options initOptions) bool {
+	if cfg.Mask != nil {
+		return true
+	}
+	return options.exporter != nil && reflect.ValueOf(options.exporter).Kind() == reflect.Func
 }
 
 func identityOf(value any) string {
@@ -340,7 +360,9 @@ func identityOf(value any) string {
 	}
 	reflected := reflect.ValueOf(value)
 	switch reflected.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Map, reflect.Pointer, reflect.Slice, reflect.UnsafePointer:
+	case reflect.Func:
+		return fmt.Sprintf("%T:function", value)
+	case reflect.Chan, reflect.Map, reflect.Pointer, reflect.Slice, reflect.UnsafePointer:
 		return fmt.Sprintf("%T:%x", value, reflected.Pointer())
 	default:
 		return fmt.Sprintf("%T:%#v", value, value)
@@ -403,11 +425,11 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 		// The batch processor is installed during provider construction. The
 		// completion processor is registered below, after this exporter/root
 		// path, so an ending root is queued before its completion marker.
-		byteLimited, byteErr := newByteLimitedExporter(exp, defaultMaxExportBytes)
+		delivery := &deliveryDiagnostics{}
+		byteLimited, byteErr := newByteLimitedExporter(exp, defaultMaxExportBytes, delivery)
 		if byteErr != nil {
 			return nil, nil, false, byteErr
 		}
-		delivery := &deliveryDiagnostics{}
 		queue := newDeliveryQueue(defaultMaxQueueSize, delivery)
 		batchProcessor := sdktrace.NewBatchSpanProcessor(
 			&normalizingExporter{

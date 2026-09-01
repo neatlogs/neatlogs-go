@@ -2,6 +2,7 @@ package neatlogs
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -42,7 +43,7 @@ func sizedTestSpans(count, payloadBytes int) []sdktrace.ReadOnlySpan {
 func TestByteLimitedExporterSplitsOnEncodedProtobufUpperBound(t *testing.T) {
 	spans := sizedTestSpans(3, 2048)
 	sink := &batchRecordingExporter{}
-	exporter, err := newByteLimitedExporter(sink, encodedSpanUpperBound(spans[0])*2)
+	exporter, err := newByteLimitedExporter(sink, encodedSpanUpperBound(spans[0])*2, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +62,7 @@ func TestByteLimitedExporterSplitsOnEncodedProtobufUpperBound(t *testing.T) {
 func TestByteLimitedExporterForwardsOneOversizedSpanIntact(t *testing.T) {
 	spans := sizedTestSpans(1, 16_384)
 	sink := &batchRecordingExporter{}
-	exporter, err := newByteLimitedExporter(sink, 128)
+	exporter, err := newByteLimitedExporter(sink, 128, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,5 +72,43 @@ func TestByteLimitedExporterForwardsOneOversizedSpanIntact(t *testing.T) {
 	if len(sink.batches) != 1 || len(sink.batches[0]) != 1 ||
 		sink.batches[0][0].SpanContext().SpanID() != spans[0].SpanContext().SpanID() {
 		t.Fatal("oversized span was not forwarded intact")
+	}
+}
+
+type failAfterExporter struct {
+	batches   [][]sdktrace.ReadOnlySpan
+	successes int
+}
+
+func (e *failAfterExporter) ExportSpans(_ context.Context, spans []sdktrace.ReadOnlySpan) error {
+	e.batches = append(e.batches, append([]sdktrace.ReadOnlySpan(nil), spans...))
+	if len(e.batches) > e.successes {
+		return errors.New("delegate failed")
+	}
+	return nil
+}
+
+func (*failAfterExporter) Shutdown(context.Context) error { return nil }
+
+func TestByteLimitedExporterCountsOnlyFailedAndUnattemptedSpans(t *testing.T) {
+	spans := sizedTestSpans(5, 2048)
+	diagnostics := &deliveryDiagnostics{}
+	sink := &failAfterExporter{successes: 1}
+	exporter, err := newByteLimitedExporter(sink, encodedSpanUpperBound(spans[0])*2, diagnostics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := exporter.ExportSpans(context.Background(), spans); err == nil {
+		t.Fatal("split export unexpectedly succeeded")
+	}
+	if got := diagnostics.snapshot().SpanExportFailures; got != 3 {
+		t.Fatalf("export failures = %d, want failed second batch plus unattempted span (3)", got)
+	}
+	batchSizes := make([]int, len(sink.batches))
+	for index := range sink.batches {
+		batchSizes[index] = len(sink.batches[index])
+	}
+	if len(batchSizes) != 2 || batchSizes[0] != 2 || batchSizes[1] != 2 {
+		t.Fatalf("attempted batches = %v, want [2 2]", batchSizes)
 	}
 }

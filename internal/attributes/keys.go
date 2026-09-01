@@ -114,6 +114,7 @@ const (
 	LLMOutputMessagePrefix = "neatlogs.llm.output_messages."
 	LLMToolCallPrefix      = "neatlogs.llm.tool_calls."
 	LLMToolPrefix          = "neatlogs.llm.tools."
+	LLMToolsTruncated      = "neatlogs.llm.tools_truncated_count"
 )
 
 // Span-kind values (lowercase normalized forms; full vocabulary in the JSON).

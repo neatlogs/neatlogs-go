@@ -34,7 +34,10 @@ type normalizingExporter struct {
 
 const (
 	defaultMaskTimeout = 5 * time.Second
-	defaultMaskWorkers = 4
+	// Mask callbacks historically ran serially on the export worker. Keep one
+	// shared slot so existing stateful callbacks remain safe even when an
+	// exporter is invoked concurrently.
+	defaultMaskWorkers = 1
 )
 
 // Local alias keeps the mask conversion independent of tracetest naming in the
@@ -81,11 +84,7 @@ func (e *normalizingExporter) ExportSpans(ctx context.Context, spans []trace.Rea
 	if len(rewritten) == 0 {
 		return nil
 	}
-	err := e.next.ExportSpans(ctx, rewritten)
-	if err != nil && e.delivery != nil {
-		e.delivery.spanExportFailures.Add(uint64(len(rewritten)))
-	}
-	return err
+	return e.next.ExportSpans(ctx, rewritten)
 }
 
 type maskBatchResult struct {
@@ -99,25 +98,20 @@ func (e *normalizingExporter) maskBatch(ctx context.Context, stubs []spanStub) [
 	maskCtx, cancel := context.WithTimeout(ctx, defaultMaskTimeout)
 	defer cancel()
 	results := make([]*SpanData, len(stubs))
-	completed := make(chan maskBatchResult, len(stubs))
 
 	for index := range stubs {
-		index := index
+		select {
+		case e.maskSlots <- struct{}{}:
+		case <-maskCtx.Done():
+			return results
+		}
 		data := spanDataFrom(&stubs[index])
+		completed := make(chan maskBatchResult, 1)
 		go func() {
-			select {
-			case e.maskSlots <- struct{}{}:
-				defer func() { <-e.maskSlots }()
-			case <-maskCtx.Done():
-				completed <- maskBatchResult{index: index, err: maskCtx.Err()}
-				return
-			}
+			defer func() { <-e.maskSlots }()
 			masked, err := callMaskSafely(e.mask, maskCtx, data)
 			completed <- maskBatchResult{index: index, data: masked, err: err}
 		}()
-	}
-
-	for received := 0; received < len(stubs); received++ {
 		select {
 		case result := <-completed:
 			if result.err == nil {

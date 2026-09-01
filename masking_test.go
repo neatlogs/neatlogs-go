@@ -3,6 +3,8 @@ package neatlogs
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -120,6 +122,46 @@ func TestMaskBatchHonorsCallerDeadlineWhenCallbackDoesNot(t *testing.T) {
 	}
 	if results[0] != nil {
 		t.Fatalf("timed-out mask returned %#v, want nil", results[0])
+	}
+}
+
+func TestMaskBatchRemainsSerialAcrossConcurrentExports(t *testing.T) {
+	var active atomic.Int32
+	var maximum atomic.Int32
+	release := make(chan struct{})
+	started := make(chan struct{}, 2)
+	exporter := &normalizingExporter{mask: func(_ context.Context, data SpanData) (*SpanData, error) {
+		current := active.Add(1)
+		defer active.Add(-1)
+		for {
+			observed := maximum.Load()
+			if current <= observed || maximum.CompareAndSwap(observed, current) {
+				break
+			}
+		}
+		started <- struct{}{}
+		<-release
+		return &data, nil
+	}}
+
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			exporter.maskBatch(context.Background(), []spanStub{{}})
+		}()
+	}
+	<-started
+	select {
+	case <-started:
+		t.Fatal("second mask callback started before the first completed")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(release)
+	wg.Wait()
+	if got := maximum.Load(); got != 1 {
+		t.Fatalf("maximum concurrent mask callbacks = %d, want 1", got)
 	}
 }
 

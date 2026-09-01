@@ -12,10 +12,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"iter"
+	"net/url"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -81,14 +85,16 @@ func (g *GenAIModels) GenerateContent(ctx context.Context, model string, content
 	defer end()
 	setInputMessages(span, contents, config)
 	setInvocationParams(span, config)
-	setToolDefinitions(span, config)
+	toolDefinitions, truncatedTools := collectToolDefinitions(config)
 
 	resp, err := g.models.GenerateContent(ctx, model, contents, config)
 	if err != nil {
 		recordError(span, err)
+		setCapturedToolDefinitions(span, toolDefinitions, truncatedTools)
 		return resp, err
 	}
 	finalizeResponse(span, resp)
+	setCapturedToolDefinitions(span, toolDefinitions, truncatedTools)
 	return resp, nil
 }
 
@@ -99,7 +105,7 @@ func (g *GenAIModels) GenerateContentStream(ctx context.Context, model string, c
 		ctx, span, endSpan := g.startLLMSpan(ctx, model, config, true)
 		setInputMessages(span, contents, config)
 		setInvocationParams(span, config)
-		setToolDefinitions(span, config)
+		toolDefinitions, truncatedTools := collectToolDefinitions(config)
 
 		stream := g.stream
 		if stream == nil {
@@ -118,6 +124,10 @@ func (g *GenAIModels) GenerateContentStream(ctx context.Context, model string, c
 			}
 			ended = true
 			finalizeStream(span, acc, cancelled, sawError)
+			// Response and usage attributes are authoritative. Write bounded tool
+			// definitions afterwards so they cannot consume the default OTel
+			// 128-attribute budget first.
+			setCapturedToolDefinitions(span, toolDefinitions, truncatedTools)
 			if sawError {
 				endSpan() // status already set by recordError; close span + auto-root
 				return
@@ -139,6 +149,11 @@ func (g *GenAIModels) GenerateContentStream(ctx context.Context, model string, c
 				recordStreamChunk(span, acc, resp)
 			}
 			if err != nil {
+				if isContextCancellation(ctx, err) {
+					cancelled = true
+					yield(resp, err)
+					return
+				}
 				sawError = true
 				recordError(span, err)
 				yield(resp, err)
@@ -153,6 +168,11 @@ func (g *GenAIModels) GenerateContentStream(ctx context.Context, model string, c
 			cancelled = true
 		}
 	}
+}
+
+func isContextCancellation(ctx context.Context, err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded)
 }
 
 // EmbedContent traces an embedding call.
@@ -281,27 +301,182 @@ func setInvocationParams(span trace.Span, config *genai.GenerateContentConfig) {
 	}
 }
 
+const maxCapturedToolDefinitions = 8
+
+type capturedToolDefinition struct {
+	toolType       string
+	name           string
+	description    string
+	inputSchema    string
+	definitionJSON string
+}
+
+// The DTOs below are deliberately independent of provider JSON structs. New
+// Google GenAI fields are excluded until explicitly reviewed, and known auth
+// material (keys, tokens, headers, and Secret Manager references) has no field
+// through which it can enter telemetry.
+type safeFunctionDefinition struct {
+	Name                 string         `json:"name,omitempty"`
+	Description          string         `json:"description,omitempty"`
+	Parameters           *genai.Schema  `json:"parameters,omitempty"`
+	ParametersJSONSchema any            `json:"parametersJsonSchema,omitempty"`
+	Response             *genai.Schema  `json:"response,omitempty"`
+	ResponseJSONSchema   any            `json:"responseJsonSchema,omitempty"`
+	Behavior             genai.Behavior `json:"behavior,omitempty"`
+}
+
+type safeExternalAPIDefinition struct {
+	APISpec             genai.APISpec                    `json:"apiSpec,omitempty"`
+	ElasticSearchParams *safeExternalAPISearchDefinition `json:"elasticSearchParams,omitempty"`
+	Endpoint            string                           `json:"endpoint,omitempty"`
+	SimpleSearchParams  *struct{}                        `json:"simpleSearchParams,omitempty"`
+}
+
+type safeExternalAPISearchDefinition struct {
+	Index          string `json:"index,omitempty"`
+	NumHits        *int32 `json:"numHits,omitempty"`
+	SearchTemplate string `json:"searchTemplate,omitempty"`
+}
+
+type safeVertexAISearchDataStoreDefinition struct {
+	DataStore string `json:"dataStore,omitempty"`
+	Filter    string `json:"filter,omitempty"`
+}
+
+type safeVertexAISearchDefinition struct {
+	DataStoreSpecs []safeVertexAISearchDataStoreDefinition `json:"dataStoreSpecs,omitempty"`
+	Datastore      string                                  `json:"datastore,omitempty"`
+	Engine         string                                  `json:"engine,omitempty"`
+	Filter         string                                  `json:"filter,omitempty"`
+	MaxResults     *int32                                  `json:"maxResults,omitempty"`
+}
+
+type safeRAGResourceDefinition struct {
+	RAGCorpus  string   `json:"ragCorpus,omitempty"`
+	RAGFileIDs []string `json:"ragFileIds,omitempty"`
+}
+
+type safeRAGFilterDefinition struct {
+	MetadataFilter            string   `json:"metadataFilter,omitempty"`
+	VectorDistanceThreshold   *float64 `json:"vectorDistanceThreshold,omitempty"`
+	VectorSimilarityThreshold *float64 `json:"vectorSimilarityThreshold,omitempty"`
+}
+
+type safeRAGRankingDefinition struct {
+	LlmRanker   *safeRAGRankerDefinition `json:"llmRanker,omitempty"`
+	RankService *safeRAGRankerDefinition `json:"rankService,omitempty"`
+}
+
+type safeRAGRankerDefinition struct {
+	ModelName string `json:"modelName,omitempty"`
+}
+
+type safeRAGHybridSearchDefinition struct {
+	Alpha *float32 `json:"alpha,omitempty"`
+}
+
+type safeRAGRetrievalConfigDefinition struct {
+	Filter       *safeRAGFilterDefinition       `json:"filter,omitempty"`
+	HybridSearch *safeRAGHybridSearchDefinition `json:"hybridSearch,omitempty"`
+	Ranking      *safeRAGRankingDefinition      `json:"ranking,omitempty"`
+	TopK         *int32                         `json:"topK,omitempty"`
+}
+
+type safeVertexRAGStoreDefinition struct {
+	RAGCorpora              []string                          `json:"ragCorpora,omitempty"`
+	RAGResources            []safeRAGResourceDefinition       `json:"ragResources,omitempty"`
+	RAGRetrievalConfig      *safeRAGRetrievalConfigDefinition `json:"ragRetrievalConfig,omitempty"`
+	SimilarityTopK          *int32                            `json:"similarityTopK,omitempty"`
+	StoreContext            *bool                             `json:"storeContext,omitempty"`
+	VectorDistanceThreshold *float64                          `json:"vectorDistanceThreshold,omitempty"`
+}
+
+type safeRetrievalDefinition struct {
+	DisableAttribution bool                          `json:"disableAttribution,omitempty"`
+	ExternalAPI        *safeExternalAPIDefinition    `json:"externalApi,omitempty"`
+	VertexAISearch     *safeVertexAISearchDefinition `json:"vertexAiSearch,omitempty"`
+	VertexRAGStore     *safeVertexRAGStoreDefinition `json:"vertexRagStore,omitempty"`
+}
+
+type safeComputerUseDefinition struct {
+	Environment                    genai.Environment `json:"environment,omitempty"`
+	ExcludedPredefinedFunctions    []string          `json:"excludedPredefinedFunctions,omitempty"`
+	EnablePromptInjectionDetection *bool             `json:"enablePromptInjectionDetection,omitempty"`
+}
+
+type safeFileSearchDefinition struct {
+	FileSearchStoreNames []string `json:"fileSearchStoreNames,omitempty"`
+	TopK                 *int32   `json:"topK,omitempty"`
+	MetadataFilter       string   `json:"metadataFilter,omitempty"`
+}
+
+type safeSearchTypesDefinition struct {
+	WebSearch   *struct{} `json:"webSearch,omitempty"`
+	ImageSearch *struct{} `json:"imageSearch,omitempty"`
+}
+
+type safeIntervalDefinition struct {
+	StartTime string `json:"startTime,omitempty"`
+	EndTime   string `json:"endTime,omitempty"`
+}
+
+type safeGoogleSearchDefinition struct {
+	SearchTypes        *safeSearchTypesDefinition `json:"searchTypes,omitempty"`
+	BlockingConfidence genai.PhishBlockThreshold  `json:"blockingConfidence,omitempty"`
+	ExcludeDomains     []string                   `json:"excludeDomains,omitempty"`
+	TimeRangeFilter    *safeIntervalDefinition    `json:"timeRangeFilter,omitempty"`
+}
+
+type safeGoogleMapsDefinition struct {
+	EnableWidget *bool `json:"enableWidget,omitempty"`
+}
+
+type safeEnterpriseWebSearchDefinition struct {
+	BlockingConfidence genai.PhishBlockThreshold `json:"blockingConfidence,omitempty"`
+	ExcludeDomains     []string                  `json:"excludeDomains,omitempty"`
+}
+
+type safeGoogleSearchRetrievalDefinition struct {
+	DynamicThreshold *float32                         `json:"dynamicThreshold,omitempty"`
+	Mode             genai.DynamicRetrievalConfigMode `json:"mode,omitempty"`
+}
+
+type safeMCPServerDefinition struct {
+	Name                    string                                 `json:"name,omitempty"`
+	StreamableHTTPTransport *safeStreamableHTTPTransportDefinition `json:"streamableHttpTransport,omitempty"`
+}
+
+type safeStreamableHTTPTransportDefinition struct {
+	URL              string `json:"url,omitempty"`
+	SSEReadTimeout   string `json:"sseReadTimeout,omitempty"`
+	Timeout          string `json:"timeout,omitempty"`
+	TerminateOnClose *bool  `json:"terminateOnClose,omitempty"`
+}
+
 func setToolDefinitions(span trace.Span, config *genai.GenerateContentConfig) {
+	definitions, truncated := collectToolDefinitions(config)
+	setCapturedToolDefinitions(span, definitions, truncated)
+}
+
+func collectToolDefinitions(config *genai.GenerateContentConfig) ([]capturedToolDefinition, int) {
 	if config == nil {
-		return
+		return nil, 0
 	}
-	t := 0
-	emit := func(toolType, name, description string, schema, definition any) {
-		prefix := fmt.Sprintf("%s%d.", attrs.LLMToolPrefix, t)
-		span.SetAttributes(
-			attribute.String(prefix+"type", toolType),
-			attribute.String(prefix+"definition", mustJSON(definition)),
-		)
-		if name != "" {
-			span.SetAttributes(attribute.String(prefix+"name", name))
+	definitions := make([]capturedToolDefinition, 0, maxCapturedToolDefinitions)
+	truncated := 0
+	capture := func(toolType, name, description string, schema, definition any) {
+		if len(definitions) >= maxCapturedToolDefinitions {
+			truncated++
+			return
 		}
-		if description != "" {
-			span.SetAttributes(attribute.String(prefix+"description", description))
+		captured := capturedToolDefinition{
+			toolType: toolType, name: name, description: description,
+			definitionJSON: mustJSON(definition),
 		}
 		if schema != nil {
-			span.SetAttributes(attribute.String(prefix+"input_schema", mustJSON(schema)))
+			captured.inputSchema = mustJSON(schema)
 		}
-		t++
+		definitions = append(definitions, captured)
 	}
 	for _, tool := range config.Tools {
 		if tool == nil {
@@ -311,55 +486,221 @@ func setToolDefinitions(span trace.Span, config *genai.GenerateContentConfig) {
 			if fn == nil {
 				continue
 			}
-			emit("function", fn.Name, fn.Description, fn.Parameters, fn)
-		}
-		variants := make([]struct {
-			kind  string
-			value any
-		}, 0, 10)
-		appendVariant := func(kind string, value any) {
-			variants = append(variants, struct {
-				kind  string
-				value any
-			}{kind, value})
+			schema := any(fn.Parameters)
+			if schema == nil {
+				schema = fn.ParametersJsonSchema
+			}
+			capture("function", fn.Name, fn.Description, schema, safeFunctionDefinition{
+				Name: fn.Name, Description: fn.Description, Parameters: fn.Parameters,
+				ParametersJSONSchema: fn.ParametersJsonSchema, Response: fn.Response,
+				ResponseJSONSchema: fn.ResponseJsonSchema, Behavior: fn.Behavior,
+			})
 		}
 		if tool.Retrieval != nil {
-			appendVariant("retrieval", tool.Retrieval)
+			capture("retrieval", "", "", nil, safeRetrieval(tool.Retrieval))
 		}
 		if tool.ComputerUse != nil {
-			appendVariant("computer_use", tool.ComputerUse)
+			capture("computer_use", "", "", nil, safeComputerUseDefinition{
+				Environment:                    tool.ComputerUse.Environment,
+				ExcludedPredefinedFunctions:    append([]string(nil), tool.ComputerUse.ExcludedPredefinedFunctions...),
+				EnablePromptInjectionDetection: tool.ComputerUse.EnablePromptInjectionDetection,
+			})
 		}
 		if tool.FileSearch != nil {
-			appendVariant("file_search", tool.FileSearch)
+			capture("file_search", "", "", nil, safeFileSearchDefinition{
+				FileSearchStoreNames: append([]string(nil), tool.FileSearch.FileSearchStoreNames...),
+				TopK:                 tool.FileSearch.TopK, MetadataFilter: tool.FileSearch.MetadataFilter,
+			})
 		}
 		if tool.GoogleSearch != nil {
-			appendVariant("google_search", tool.GoogleSearch)
+			capture("google_search", "", "", nil, safeGoogleSearch(tool.GoogleSearch))
 		}
 		if tool.GoogleMaps != nil {
-			appendVariant("google_maps", tool.GoogleMaps)
+			capture("google_maps", "", "", nil, safeGoogleMapsDefinition{EnableWidget: tool.GoogleMaps.EnableWidget})
 		}
 		if tool.CodeExecution != nil {
-			appendVariant("code_execution", tool.CodeExecution)
+			capture("code_execution", "", "", nil, struct{}{})
 		}
 		if tool.EnterpriseWebSearch != nil {
-			appendVariant("enterprise_web_search", tool.EnterpriseWebSearch)
+			capture("enterprise_web_search", "", "", nil, safeEnterpriseWebSearchDefinition{
+				BlockingConfidence: tool.EnterpriseWebSearch.BlockingConfidence,
+				ExcludeDomains:     append([]string(nil), tool.EnterpriseWebSearch.ExcludeDomains...),
+			})
 		}
 		if tool.GoogleSearchRetrieval != nil {
-			appendVariant("google_search_retrieval", tool.GoogleSearchRetrieval)
+			definition := safeGoogleSearchRetrievalDefinition{}
+			if dynamic := tool.GoogleSearchRetrieval.DynamicRetrievalConfig; dynamic != nil {
+				definition.DynamicThreshold = dynamic.DynamicThreshold
+				definition.Mode = dynamic.Mode
+			}
+			capture("google_search_retrieval", "", "", nil, definition)
 		}
 		if tool.ParallelAISearch != nil {
-			appendVariant("parallel_ai_search", tool.ParallelAISearch)
+			// APIKey and arbitrary CustomConfigs are intentionally omitted. The
+			// latter is an untyped escape hatch that cannot be safely allowlisted.
+			capture("parallel_ai_search", "", "", nil, struct{}{})
 		}
 		if tool.URLContext != nil {
-			appendVariant("url_context", tool.URLContext)
-		}
-		for _, variant := range variants {
-			emit(variant.kind, "", "", nil, variant.value)
+			capture("url_context", "", "", nil, struct{}{})
 		}
 		if len(tool.MCPServers) > 0 {
-			emit("mcp_servers", "", "", nil, tool.MCPServers)
+			capture("mcp_servers", "", "", nil, safeMCPServers(tool.MCPServers))
 		}
 	}
+	return definitions, truncated
+}
+
+func setCapturedToolDefinitions(span trace.Span, definitions []capturedToolDefinition, truncated int) {
+	for index, definition := range definitions {
+		prefix := fmt.Sprintf("%s%d.", attrs.LLMToolPrefix, index)
+		span.SetAttributes(
+			attribute.String(prefix+"type", definition.toolType),
+			attribute.String(prefix+"definition", definition.definitionJSON),
+		)
+		if definition.name != "" {
+			span.SetAttributes(attribute.String(prefix+"name", definition.name))
+		}
+		if definition.description != "" {
+			span.SetAttributes(attribute.String(prefix+"description", definition.description))
+		}
+		if definition.inputSchema != "" {
+			span.SetAttributes(attribute.String(prefix+"input_schema", definition.inputSchema))
+		}
+	}
+	if truncated > 0 {
+		span.SetAttributes(attribute.Int(attrs.LLMToolsTruncated, truncated))
+	}
+}
+
+func safeRetrieval(value *genai.Retrieval) safeRetrievalDefinition {
+	definition := safeRetrievalDefinition{DisableAttribution: value.DisableAttribution}
+	if external := value.ExternalAPI; external != nil {
+		definition.ExternalAPI = &safeExternalAPIDefinition{
+			APISpec: external.APISpec, Endpoint: safeEndpoint(external.Endpoint),
+		}
+		if external.SimpleSearchParams != nil {
+			definition.ExternalAPI.SimpleSearchParams = &struct{}{}
+		}
+		if search := external.ElasticSearchParams; search != nil {
+			definition.ExternalAPI.ElasticSearchParams = &safeExternalAPISearchDefinition{
+				Index: search.Index, NumHits: search.NumHits, SearchTemplate: search.SearchTemplate,
+			}
+		}
+	}
+	if search := value.VertexAISearch; search != nil {
+		definition.VertexAISearch = &safeVertexAISearchDefinition{
+			Datastore: search.Datastore, Engine: search.Engine, Filter: search.Filter, MaxResults: search.MaxResults,
+		}
+		for _, spec := range search.DataStoreSpecs {
+			if spec != nil {
+				definition.VertexAISearch.DataStoreSpecs = append(definition.VertexAISearch.DataStoreSpecs,
+					safeVertexAISearchDataStoreDefinition{DataStore: spec.DataStore, Filter: spec.Filter})
+			}
+		}
+	}
+	if store := value.VertexRAGStore; store != nil {
+		definition.VertexRAGStore = safeVertexRAGStore(store)
+	}
+	return definition
+}
+
+func safeVertexRAGStore(store *genai.VertexRAGStore) *safeVertexRAGStoreDefinition {
+	definition := &safeVertexRAGStoreDefinition{
+		RAGCorpora: append([]string(nil), store.RAGCorpora...), SimilarityTopK: store.SimilarityTopK,
+		StoreContext: store.StoreContext, VectorDistanceThreshold: store.VectorDistanceThreshold,
+	}
+	for _, resource := range store.RAGResources {
+		if resource != nil {
+			definition.RAGResources = append(definition.RAGResources, safeRAGResourceDefinition{
+				RAGCorpus: resource.RAGCorpus, RAGFileIDs: append([]string(nil), resource.RAGFileIDs...),
+			})
+		}
+	}
+	if config := store.RAGRetrievalConfig; config != nil {
+		definition.RAGRetrievalConfig = &safeRAGRetrievalConfigDefinition{TopK: config.TopK}
+		if config.Filter != nil {
+			definition.RAGRetrievalConfig.Filter = &safeRAGFilterDefinition{
+				MetadataFilter:            config.Filter.MetadataFilter,
+				VectorDistanceThreshold:   config.Filter.VectorDistanceThreshold,
+				VectorSimilarityThreshold: config.Filter.VectorSimilarityThreshold,
+			}
+		}
+		if config.HybridSearch != nil {
+			definition.RAGRetrievalConfig.HybridSearch = &safeRAGHybridSearchDefinition{Alpha: config.HybridSearch.Alpha}
+		}
+		if config.Ranking != nil {
+			ranking := &safeRAGRankingDefinition{}
+			if config.Ranking.LlmRanker != nil {
+				ranking.LlmRanker = &safeRAGRankerDefinition{ModelName: config.Ranking.LlmRanker.ModelName}
+			}
+			if config.Ranking.RankService != nil {
+				ranking.RankService = &safeRAGRankerDefinition{ModelName: config.Ranking.RankService.ModelName}
+			}
+			definition.RAGRetrievalConfig.Ranking = ranking
+		}
+	}
+	return definition
+}
+
+func safeGoogleSearch(value *genai.GoogleSearch) safeGoogleSearchDefinition {
+	definition := safeGoogleSearchDefinition{
+		BlockingConfidence: value.BlockingConfidence,
+		ExcludeDomains:     append([]string(nil), value.ExcludeDomains...),
+	}
+	if value.SearchTypes != nil {
+		definition.SearchTypes = &safeSearchTypesDefinition{}
+		if value.SearchTypes.WebSearch != nil {
+			definition.SearchTypes.WebSearch = &struct{}{}
+		}
+		if value.SearchTypes.ImageSearch != nil {
+			definition.SearchTypes.ImageSearch = &struct{}{}
+		}
+	}
+	if interval := value.TimeRangeFilter; interval != nil {
+		definition.TimeRangeFilter = &safeIntervalDefinition{}
+		if !interval.StartTime.IsZero() {
+			definition.TimeRangeFilter.StartTime = interval.StartTime.UTC().Format(time.RFC3339Nano)
+		}
+		if !interval.EndTime.IsZero() {
+			definition.TimeRangeFilter.EndTime = interval.EndTime.UTC().Format(time.RFC3339Nano)
+		}
+	}
+	return definition
+}
+
+func safeMCPServers(servers []*genai.MCPServer) []safeMCPServerDefinition {
+	definitions := make([]safeMCPServerDefinition, 0, len(servers))
+	for _, server := range servers {
+		if server == nil {
+			continue
+		}
+		definition := safeMCPServerDefinition{Name: server.Name}
+		if transport := server.StreamableHTTPTransport; transport != nil {
+			definition.StreamableHTTPTransport = &safeStreamableHTTPTransportDefinition{
+				URL: safeEndpoint(transport.URL), TerminateOnClose: transport.TerminateOnClose,
+			}
+			if transport.SseReadTimeout != 0 {
+				definition.StreamableHTTPTransport.SSEReadTimeout = transport.SseReadTimeout.String()
+			}
+			if transport.Timeout != 0 {
+				definition.StreamableHTTPTransport.Timeout = transport.Timeout.String()
+			}
+		}
+		definitions = append(definitions, definition)
+	}
+	return definitions
+}
+
+func safeEndpoint(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	parsed.User = nil
+	parsed.RawQuery = ""
+	parsed.ForceQuery = false
+	parsed.Fragment = ""
+	return parsed.String()
 }
 
 func finalizeResponse(span trace.Span, resp *genai.GenerateContentResponse) {
@@ -374,10 +715,11 @@ func finalizeResponse(span trace.Span, resp *genai.GenerateContentResponse) {
 }
 
 type accumulatedToolCall struct {
-	choiceIndex int
-	name        string
-	id          string
-	arguments   map[string]any
+	choiceIndex          int
+	name                 string
+	id                   string
+	arguments            map[string]any
+	partialContinuations map[string]bool
 }
 
 type accumulatedChoice struct {
@@ -387,6 +729,7 @@ type accumulatedChoice struct {
 	finish            genai.FinishReason
 	toolCalls         map[int]*accumulatedToolCall
 	toolPositionsByID map[string]int
+	activeIDlessCalls map[int]int
 	nextToolPosition  int
 	media             map[string]capturedMedia
 }
@@ -420,6 +763,7 @@ func (a *responseAccumulator) add(resp *genai.GenerateContentResponse) {
 				role:              "assistant",
 				toolCalls:         make(map[int]*accumulatedToolCall),
 				toolPositionsByID: make(map[string]int),
+				activeIDlessCalls: make(map[int]int),
 				media:             make(map[string]capturedMedia),
 			}
 			a.choices[index] = choice
@@ -428,6 +772,7 @@ func (a *responseAccumulator) add(resp *genai.GenerateContentResponse) {
 			if cand.Content.Role != "" && cand.Content.Role != "model" {
 				choice.role = cand.Content.Role
 			}
+			functionPosition := 0
 			for _, part := range cand.Content.Parts {
 				if part == nil {
 					continue
@@ -441,31 +786,49 @@ func (a *responseAccumulator) add(resp *genai.GenerateContentResponse) {
 				case part.Text != "":
 					choice.text += part.Text
 				case part.FunctionCall != nil:
-					toolPosition, linked := choice.toolPositionsByID[part.FunctionCall.ID]
-					if part.FunctionCall.ID == "" || !linked {
+					functionCall := part.FunctionCall
+					toolPosition, linked := choice.toolPositionsByID[functionCall.ID]
+					if functionCall.ID == "" {
+						toolPosition, linked = choice.activeIDlessCalls[functionPosition]
+					} else if !linked {
+						// Vertex may introduce an ID after an ID-less partial. Link it
+						// to the continued call at the same choice-local position.
+						toolPosition, linked = choice.activeIDlessCalls[functionPosition]
+					}
+					if !linked {
 						toolPosition = choice.nextToolPosition
 						choice.nextToolPosition++
-						if part.FunctionCall.ID != "" {
-							choice.toolPositionsByID[part.FunctionCall.ID] = toolPosition
-						}
+					}
+					if functionCall.ID != "" {
+						choice.toolPositionsByID[functionCall.ID] = toolPosition
 					}
 					call := choice.toolCalls[toolPosition]
 					if call == nil {
 						call = &accumulatedToolCall{
-							choiceIndex: index,
-							arguments:   make(map[string]any),
+							choiceIndex:          index,
+							arguments:            make(map[string]any),
+							partialContinuations: make(map[string]bool),
 						}
 						choice.toolCalls[toolPosition] = call
 					}
-					if part.FunctionCall.Name != "" {
-						call.name = part.FunctionCall.Name
+					if functionCall.Name != "" {
+						call.name = functionCall.Name
 					}
-					if part.FunctionCall.ID != "" {
-						call.id = part.FunctionCall.ID
+					if functionCall.ID != "" {
+						call.id = functionCall.ID
 					}
-					for key, value := range part.FunctionCall.Args {
+					for key, value := range functionCall.Args {
 						call.arguments[key] = value
 					}
+					for _, partial := range functionCall.PartialArgs {
+						call.applyPartialArg(partial)
+					}
+					if functionCall.WillContinue != nil && *functionCall.WillContinue {
+						choice.activeIDlessCalls[functionPosition] = toolPosition
+					} else {
+						delete(choice.activeIDlessCalls, functionPosition)
+					}
+					functionPosition++
 				}
 			}
 		}
@@ -480,6 +843,153 @@ func (a *responseAccumulator) add(resp *genai.GenerateContentResponse) {
 		a.responseID = resp.ResponseID
 	}
 	a.chunkCount++
+}
+
+type jsonPathSegment struct {
+	key   string
+	index int
+	isKey bool
+}
+
+func (c *accumulatedToolCall) applyPartialArg(partial *genai.PartialArg) {
+	if partial == nil {
+		return
+	}
+	segments, ok := parseJSONPath(partial.JsonPath)
+	if !ok || len(segments) == 0 || !segments[0].isKey {
+		return
+	}
+	value, isString := partialArgValue(partial)
+	if isString && c.partialContinuations[partial.JsonPath] {
+		if existing, found := jsonPathValue(c.arguments, segments); found {
+			if text, textOK := existing.(string); textOK {
+				value = text + value.(string)
+			}
+		}
+	}
+	assignJSONPath(c.arguments, segments, value)
+	if partial.WillContinue != nil && *partial.WillContinue {
+		c.partialContinuations[partial.JsonPath] = true
+	} else {
+		delete(c.partialContinuations, partial.JsonPath)
+	}
+}
+
+func partialArgValue(partial *genai.PartialArg) (any, bool) {
+	switch {
+	case partial.BoolValue != nil:
+		return *partial.BoolValue, false
+	case partial.NumberValue != nil:
+		return *partial.NumberValue, false
+	case partial.NULLValue != "":
+		return nil, false
+	default:
+		return partial.StringValue, true
+	}
+}
+
+func parseJSONPath(path string) ([]jsonPathSegment, bool) {
+	if path == "" || path[0] != '$' {
+		return nil, false
+	}
+	segments := make([]jsonPathSegment, 0, 4)
+	for index := 1; index < len(path); {
+		switch path[index] {
+		case '.':
+			index++
+			start := index
+			for index < len(path) && path[index] != '.' && path[index] != '[' {
+				index++
+			}
+			if start == index {
+				return nil, false
+			}
+			segments = append(segments, jsonPathSegment{key: path[start:index], isKey: true})
+		case '[':
+			end := strings.IndexByte(path[index:], ']')
+			if end < 0 {
+				return nil, false
+			}
+			end += index
+			token := path[index+1 : end]
+			if len(token) >= 2 && ((token[0] == '\'' && token[len(token)-1] == '\'') ||
+				(token[0] == '"' && token[len(token)-1] == '"')) {
+				quoted := token
+				if token[0] == '\'' {
+					quoted = `"` + strings.ReplaceAll(token[1:len(token)-1], `"`, `\"`) + `"`
+				}
+				key, err := strconv.Unquote(quoted)
+				if err != nil {
+					return nil, false
+				}
+				segments = append(segments, jsonPathSegment{key: key, isKey: true})
+			} else {
+				position, err := strconv.Atoi(token)
+				if err != nil || position < 0 {
+					return nil, false
+				}
+				segments = append(segments, jsonPathSegment{index: position})
+			}
+			index = end + 1
+		default:
+			return nil, false
+		}
+	}
+	return segments, true
+}
+
+func assignJSONPath(root map[string]any, segments []jsonPathSegment, value any) {
+	if len(segments) == 0 || !segments[0].isKey {
+		return
+	}
+	root[segments[0].key] = assignJSONPathValue(root[segments[0].key], segments[1:], value)
+}
+
+func assignJSONPathValue(current any, segments []jsonPathSegment, value any) any {
+	if len(segments) == 0 {
+		return value
+	}
+	segment := segments[0]
+	if segment.isKey {
+		object, ok := current.(map[string]any)
+		if !ok {
+			object = make(map[string]any)
+		}
+		object[segment.key] = assignJSONPathValue(object[segment.key], segments[1:], value)
+		return object
+	}
+	array, ok := current.([]any)
+	if !ok {
+		array = nil
+	}
+	for len(array) <= segment.index {
+		array = append(array, nil)
+	}
+	array[segment.index] = assignJSONPathValue(array[segment.index], segments[1:], value)
+	return array
+}
+
+func jsonPathValue(root map[string]any, segments []jsonPathSegment) (any, bool) {
+	var current any = root
+	for _, segment := range segments {
+		if segment.isKey {
+			object, ok := current.(map[string]any)
+			if !ok {
+				return nil, false
+			}
+			current, ok = object[segment.key]
+			if !ok {
+				return nil, false
+			}
+			continue
+		}
+		array, ok := current.([]any)
+		if !ok || segment.index >= len(array) {
+			return nil, false
+		}
+		current = array[segment.index]
+	}
+	return current, true
 }
 
 func (a *responseAccumulator) apply(span trace.Span) {

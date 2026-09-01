@@ -16,27 +16,31 @@ const defaultMaxExportBytes = 4 * 1024 * 1024
 type byteLimitedExporter struct {
 	next     sdktrace.SpanExporter
 	maxBytes int
+	delivery *deliveryDiagnostics
 }
 
-func newByteLimitedExporter(next sdktrace.SpanExporter, maxBytes int) (*byteLimitedExporter, error) {
+func newByteLimitedExporter(next sdktrace.SpanExporter, maxBytes int, delivery *deliveryDiagnostics) (*byteLimitedExporter, error) {
 	if next == nil {
 		return nil, fmt.Errorf("neatlogs: byte-limited exporter requires a delegate")
 	}
 	if maxBytes <= 0 {
 		return nil, fmt.Errorf("neatlogs: max export bytes must be greater than zero")
 	}
-	return &byteLimitedExporter{next: next, maxBytes: maxBytes}, nil
+	return &byteLimitedExporter{next: next, maxBytes: maxBytes, delivery: delivery}, nil
 }
 
 func (e *byteLimitedExporter) ExportSpans(ctx context.Context, spans []sdktrace.ReadOnlySpan) error {
 	batch := make([]sdktrace.ReadOnlySpan, 0, len(spans))
 	batchBytes := 0
+	accepted := 0
 	for _, span := range spans {
 		spanBytes := encodedSpanUpperBound(span)
 		if len(batch) > 0 && batchBytes+spanBytes > e.maxBytes {
 			if err := e.next.ExportSpans(ctx, batch); err != nil {
+				e.recordFailure(len(spans) - accepted)
 				return err
 			}
+			accepted += len(batch)
 			batch = batch[:0]
 			batchBytes = 0
 		}
@@ -48,7 +52,17 @@ func (e *byteLimitedExporter) ExportSpans(ctx context.Context, spans []sdktrace.
 	if len(batch) == 0 {
 		return nil
 	}
-	return e.next.ExportSpans(ctx, batch)
+	if err := e.next.ExportSpans(ctx, batch); err != nil {
+		e.recordFailure(len(spans) - accepted)
+		return err
+	}
+	return nil
+}
+
+func (e *byteLimitedExporter) recordFailure(count int) {
+	if e.delivery != nil && count > 0 {
+		e.delivery.spanExportFailures.Add(uint64(count))
+	}
 }
 
 func (e *byteLimitedExporter) Shutdown(ctx context.Context) error {

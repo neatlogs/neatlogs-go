@@ -3,13 +3,16 @@ package genai
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"iter"
 	"strings"
 	"testing"
+	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	google "google.golang.org/genai"
 
@@ -204,6 +207,69 @@ func TestMissingToolCallIDsNeverMergeByPositionAlone(t *testing.T) {
 	t.Fatal("tool separation span not exported")
 }
 
+func TestIDLessStreamedToolCallsMergePartialArgsByChoiceAndPosition(t *testing.T) {
+	ctx := context.Background()
+	sink := tracetest.NewInMemoryExporter()
+	shutdown, err := neatlogs.Init(ctx, neatlogs.Config{WorkflowName: "partial-tool-test"}, neatlogs.WithExporter(sink))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdown(ctx)
+
+	continued, complete := true, false
+	_, span, end := neatlogs.StartProviderSpan(ctx, "partial-tools", attrs.KindLLM)
+	acc := newResponseAccumulator()
+	acc.add(&google.GenerateContentResponse{Candidates: []*google.Candidate{
+		{Index: 0, Content: &google.Content{Parts: []*google.Part{{FunctionCall: &google.FunctionCall{
+			Name: "weather", WillContinue: &continued, PartialArgs: []*google.PartialArg{
+				{JsonPath: "$.location.city", StringValue: "San", WillContinue: &continued},
+				{JsonPath: "$.items[0].value", StringValue: "A", WillContinue: &continued},
+			},
+		}}}}},
+		{Index: 1, Content: &google.Content{Parts: []*google.Part{{FunctionCall: &google.FunctionCall{
+			Name: "search", WillContinue: &continued, PartialArgs: []*google.PartialArg{
+				{JsonPath: "$['query']", StringValue: "Par", WillContinue: &continued},
+			},
+		}}}}},
+	}})
+	acc.add(&google.GenerateContentResponse{Candidates: []*google.Candidate{
+		{Index: 0, Content: &google.Content{Parts: []*google.Part{{FunctionCall: &google.FunctionCall{
+			WillContinue: &complete, PartialArgs: []*google.PartialArg{
+				{JsonPath: "$.location.city", StringValue: " Francisco", WillContinue: &complete},
+				{JsonPath: "$.items[0].value", StringValue: "B", WillContinue: &complete},
+			},
+		}}}}},
+		{Index: 1, Content: &google.Content{Parts: []*google.Part{{FunctionCall: &google.FunctionCall{
+			WillContinue: &complete, PartialArgs: []*google.PartialArg{
+				{JsonPath: "$['query']", StringValue: "is", WillContinue: &complete},
+			},
+		}}}}},
+	}})
+	acc.apply(span)
+	end()
+	if err := neatlogs.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, candidate := range sink.GetSpans() {
+		if candidate.Name != "partial-tools" {
+			continue
+		}
+		assertStringAttribute(t, candidate.Attributes, attrs.LLMToolCallPrefix+"0.name", "weather")
+		assertIntAttribute(t, candidate.Attributes, attrs.LLMToolCallPrefix+"0.choice_index", 0)
+		assertStringAttribute(t, candidate.Attributes, attrs.LLMToolCallPrefix+"0.arguments",
+			`{"items":[{"value":"AB"}],"location":{"city":"San Francisco"}}`)
+		assertStringAttribute(t, candidate.Attributes, attrs.LLMToolCallPrefix+"1.name", "search")
+		assertIntAttribute(t, candidate.Attributes, attrs.LLMToolCallPrefix+"1.choice_index", 1)
+		assertStringAttribute(t, candidate.Attributes, attrs.LLMToolCallPrefix+"1.arguments", `{"query":"Paris"}`)
+		if _, ok := findAttribute(candidate.Attributes, attrs.LLMToolCallPrefix+"2.name"); ok {
+			t.Fatal("continued ID-less calls were emitted as duplicate tool calls")
+		}
+		return
+	}
+	t.Fatal("partial tool span not exported")
+}
+
 func TestToolDefinitionsPreserveTypeAndCompleteConfiguration(t *testing.T) {
 	ctx := context.Background()
 	sink := tracetest.NewInMemoryExporter()
@@ -236,6 +302,188 @@ func TestToolDefinitionsPreserveTypeAndCompleteConfiguration(t *testing.T) {
 		return
 	}
 	t.Fatal("tool definition span not exported")
+}
+
+func TestToolDefinitionsExcludeAllProviderAuthenticationShapes(t *testing.T) {
+	ctx := context.Background()
+	sink := tracetest.NewInMemoryExporter()
+	shutdown, err := neatlogs.Init(ctx, neatlogs.Config{WorkflowName: "safe-tool-test"}, neatlogs.WithExporter(sink))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdown(ctx)
+
+	config := &google.GenerateContentConfig{Tools: []*google.Tool{{
+		Retrieval: &google.Retrieval{ExternalAPI: &google.ExternalAPI{
+			Endpoint: "https://url-user:url-password@example.com/search?access_token=url-token#fragment",
+			APIAuth: &google.APIAuth{APIKeyConfig: &google.APIAuthAPIKeyConfig{
+				APIKeySecretVersion: "deprecated-secret-ref", APIKeyString: "deprecated-api-key",
+			}},
+			AuthConfig: &google.AuthConfig{
+				APIKey:              "direct-api-key",
+				APIKeyConfig:        &google.APIKeyConfig{APIKeySecret: "api-key-secret-ref", APIKeyString: "nested-api-key"},
+				HTTPBasicAuthConfig: &google.AuthConfigHTTPBasicAuthConfig{CredentialSecret: "basic-secret-ref"},
+				OauthConfig:         &google.AuthConfigOauthConfig{AccessToken: "oauth-access-token", ServiceAccount: "oauth-service-account"},
+				OidcConfig:          &google.AuthConfigOidcConfig{IDToken: "oidc-id-token", ServiceAccount: "oidc-service-account"},
+			},
+		}},
+		GoogleMaps: &google.GoogleMaps{AuthConfig: &google.AuthConfig{
+			APIKey:      "maps-api-key",
+			OauthConfig: &google.AuthConfigOauthConfig{AccessToken: "maps-oauth-token"},
+		}},
+		ParallelAISearch: &google.ToolParallelAISearch{
+			APIKey: "parallel-api-key", CustomConfigs: map[string]any{"authorization": "custom-bearer-token"},
+		},
+		MCPServers: []*google.MCPServer{{Name: "safe-server", StreamableHTTPTransport: &google.StreamableHTTPTransport{
+			URL:     "https://mcp-user:mcp-password@example.com/mcp?token=mcp-query-token",
+			Headers: map[string]string{"Authorization": "Bearer mcp-header-token", "Cookie": "session=mcp-cookie"},
+			Timeout: 2 * time.Second,
+		}}},
+	}}}
+
+	_, span, end := neatlogs.StartProviderSpan(ctx, "safe-tools", attrs.KindLLM)
+	setToolDefinitions(span, config)
+	end()
+	if err := neatlogs.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, candidate := range sink.GetSpans() {
+		if candidate.Name != "safe-tools" {
+			continue
+		}
+		var telemetry strings.Builder
+		for _, value := range candidate.Attributes {
+			telemetry.WriteString(value.Value.Emit())
+		}
+		captured := telemetry.String()
+		for _, secret := range []string{
+			"url-user", "url-password", "url-token", "deprecated-secret-ref", "deprecated-api-key",
+			"direct-api-key", "api-key-secret-ref", "nested-api-key", "basic-secret-ref",
+			"oauth-access-token", "oauth-service-account", "oidc-id-token", "oidc-service-account",
+			"maps-api-key", "maps-oauth-token", "parallel-api-key", "custom-bearer-token",
+			"mcp-user", "mcp-password", "mcp-query-token", "mcp-header-token", "mcp-cookie",
+		} {
+			if strings.Contains(captured, secret) {
+				t.Fatalf("tool telemetry leaked %q: %s", secret, captured)
+			}
+		}
+		if !strings.Contains(captured, "https://example.com/search") ||
+			!strings.Contains(captured, "https://example.com/mcp") || !strings.Contains(captured, "safe-server") {
+			t.Fatalf("safe tool configuration was not retained: %s", captured)
+		}
+		return
+	}
+	t.Fatal("safe tool span not exported")
+}
+
+func TestToolDefinitionCapPreservesResponseAndUsageUnderDefaultAttributeLimit(t *testing.T) {
+	limits := sdktrace.NewSpanLimits()
+	limits.AttributeCountLimit = 128
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(
+		sdktrace.WithRawSpanLimits(limits),
+		sdktrace.WithSpanProcessor(recorder),
+	)
+	_, span := provider.Tracer("tool-budget-test").Start(context.Background(), "tool-budget")
+
+	declarations := make([]*google.FunctionDeclaration, 0, 32)
+	for index := range 32 {
+		declarations = append(declarations, &google.FunctionDeclaration{
+			Name: fmt.Sprintf("tool_%d", index), Description: "described tool",
+			ParametersJsonSchema: map[string]any{"type": "object"},
+		})
+	}
+	config := &google.GenerateContentConfig{Tools: []*google.Tool{{FunctionDeclarations: declarations}}}
+	finalizeResponse(span, &google.GenerateContentResponse{
+		ResponseID: "response-kept",
+		Candidates: []*google.Candidate{{Index: 0, FinishReason: google.FinishReasonStop,
+			Content: &google.Content{Parts: []*google.Part{{Text: "authoritative output"}}}}},
+		UsageMetadata: &google.GenerateContentResponseUsageMetadata{
+			PromptTokenCount: 11, CandidatesTokenCount: 7, TotalTokenCount: 18,
+		},
+	})
+	setToolDefinitions(span, config)
+	span.End()
+
+	ended := recorder.Ended()
+	if len(ended) != 1 {
+		t.Fatalf("ended spans = %d, want 1", len(ended))
+	}
+	got := ended[0]
+	assertStringAttribute(t, got.Attributes(), attrs.LLMOutputMessagePrefix+"0.content", "authoritative output")
+	assertStringAttribute(t, got.Attributes(), attrs.LLMResponseID, "response-kept")
+	assertIntAttribute(t, got.Attributes(), attrs.LLMTokenPrompt, 11)
+	assertIntAttribute(t, got.Attributes(), attrs.LLMTokenCompletion, 7)
+	assertIntAttribute(t, got.Attributes(), attrs.LLMTokenTotal, 18)
+	assertIntAttribute(t, got.Attributes(), attrs.LLMToolsTruncated, len(declarations)-maxCapturedToolDefinitions)
+	if _, ok := findAttribute(got.Attributes(), attrs.LLMToolPrefix+fmt.Sprintf("%d.type", maxCapturedToolDefinitions)); ok {
+		t.Fatal("tool definition capture exceeded its configured cap")
+	}
+}
+
+func TestStreamContextCancellationIsUnsetBeforeFirstResponseAndMidStream(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		beforeFirst bool
+	}{
+		{name: "before_first_response", beforeFirst: true},
+		{name: "mid_stream", beforeFirst: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			baseCtx := context.Background()
+			ctx, cancel := context.WithCancel(baseCtx)
+			sink := tracetest.NewInMemoryExporter()
+			shutdown, err := neatlogs.Init(baseCtx, neatlogs.Config{WorkflowName: test.name}, neatlogs.WithExporter(sink))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer shutdown(baseCtx)
+
+			models := &GenAIModels{
+				provider: geminiProvider,
+				system:   geminiSystem,
+				stream: func(streamCtx context.Context, _ string, _ []*google.Content, _ *google.GenerateContentConfig) iter.Seq2[*google.GenerateContentResponse, error] {
+					return func(yield func(*google.GenerateContentResponse, error) bool) {
+						if test.beforeFirst {
+							cancel()
+							yield(nil, streamCtx.Err())
+							return
+						}
+						if !yield(&google.GenerateContentResponse{Candidates: []*google.Candidate{{
+							Content: &google.Content{Parts: []*google.Part{{Text: "partial"}}},
+						}}}, nil) {
+							return
+						}
+						cancel()
+						yield(nil, streamCtx.Err())
+					}
+				},
+			}
+
+			var streamErr error
+			for _, err := range models.GenerateContentStream(ctx, "gemini", nil, nil) {
+				streamErr = err
+			}
+			if !errors.Is(streamErr, context.Canceled) {
+				t.Fatalf("stream error = %v, want context.Canceled", streamErr)
+			}
+			if err := neatlogs.Flush(baseCtx); err != nil {
+				t.Fatal(err)
+			}
+			for _, got := range sink.GetSpans() {
+				if got.Name != "google_genai.models.generate_content" {
+					continue
+				}
+				assertBoolAttribute(t, got.Attributes, attrs.StreamCancelled, true)
+				if got.Status.Code != codes.Unset {
+					t.Fatalf("cancelled stream status = %v, want UNSET", got.Status.Code)
+				}
+				return
+			}
+			t.Fatal("cancelled stream span not exported")
+		})
+	}
 }
 
 func TestGenerateContentStreamIsLazyUntilFirstConsumption(t *testing.T) {
