@@ -792,8 +792,14 @@ func (a *responseAccumulator) add(resp *genai.GenerateContentResponse) {
 						toolPosition, linked = choice.activeIDlessCalls[functionPosition]
 					} else if !linked {
 						// Vertex may introduce an ID after an ID-less partial. Link it
-						// to the continued call at the same choice-local position.
-						toolPosition, linked = choice.activeIDlessCalls[functionPosition]
+						// to the continued call at the same choice-local position, but
+						// never merge two different provider-identified calls.
+						if activePosition, active := choice.activeIDlessCalls[functionPosition]; active {
+							activeCall := choice.toolCalls[activePosition]
+							if activeCall != nil && activeCall.id == "" {
+								toolPosition, linked = activePosition, true
+							}
+						}
 					}
 					if !linked {
 						toolPosition = choice.nextToolPosition
@@ -823,10 +829,11 @@ func (a *responseAccumulator) add(resp *genai.GenerateContentResponse) {
 					for _, partial := range functionCall.PartialArgs {
 						call.applyPartialArg(partial)
 					}
-					if functionCall.WillContinue != nil && *functionCall.WillContinue {
+					if functionCall.WillContinue != nil && *functionCall.WillContinue && call.id == "" {
 						// Provider positions are relative to the calls present in each
 						// chunk. Compact the surviving calls so a later B-only chunk
 						// still links to B after A completed in the preceding chunk.
+						// Calls with provider IDs must only be linked by those IDs.
 						nextActiveIDlessCalls[len(nextActiveIDlessCalls)] = toolPosition
 					}
 					functionPosition++
@@ -1046,11 +1053,63 @@ func parseJSONPathQuotedName(path string, start int) (string, int, bool) {
 		if escaped == '\'' || escaped == '"' {
 			return "", 0, false
 		}
+		if escaped == 'u' {
+			next, ok := parseJSONPathUnicodeEscape(path, index)
+			if !ok {
+				return "", 0, false
+			}
+			encoded.WriteString(path[index:next])
+			index = next - 1
+			continue
+		}
 		encoded.WriteByte('\\')
 		encoded.WriteByte(escaped)
 		index++
 	}
 	return "", 0, false
+}
+
+// parseJSONPathUnicodeEscape validates RFC 9535's hexchar production. Go's
+// encoding/json accepts lone or mismatched UTF-16 surrogates by replacing them
+// with U+FFFD, while JSONPath requires a high surrogate to be immediately
+// followed by a low surrogate and forbids a low surrogate on its own.
+func parseJSONPathUnicodeEscape(path string, start int) (int, bool) {
+	value, next, ok := parseJSONPathCodeUnit(path, start)
+	if !ok {
+		return 0, false
+	}
+	if value >= 0xDC00 && value <= 0xDFFF {
+		return 0, false
+	}
+	if value < 0xD800 || value > 0xDBFF {
+		return next, true
+	}
+	low, end, ok := parseJSONPathCodeUnit(path, next)
+	if !ok || low < 0xDC00 || low > 0xDFFF {
+		return 0, false
+	}
+	return end, true
+}
+
+func parseJSONPathCodeUnit(path string, start int) (uint16, int, bool) {
+	if start+6 > len(path) || path[start] != '\\' || path[start+1] != 'u' {
+		return 0, 0, false
+	}
+	var value uint16
+	for _, char := range []byte(path[start+2 : start+6]) {
+		value *= 16
+		switch {
+		case char >= '0' && char <= '9':
+			value += uint16(char - '0')
+		case char >= 'a' && char <= 'f':
+			value += uint16(char-'a') + 10
+		case char >= 'A' && char <= 'F':
+			value += uint16(char-'A') + 10
+		default:
+			return 0, 0, false
+		}
+	}
+	return value, start + 6, true
 }
 
 func assignJSONPath(root map[string]any, segments []jsonPathSegment, value any) {

@@ -317,6 +317,47 @@ func TestIDLessMultiCallContinuationCompactsAfterEarlierCallCompletes(t *testing
 	}
 }
 
+func TestInterleavedIDBearingCallsNeverMergeByActivePosition(t *testing.T) {
+	continued, complete := true, false
+	acc := newResponseAccumulator()
+	acc.add(&google.GenerateContentResponse{Candidates: []*google.Candidate{{
+		Content: &google.Content{Parts: []*google.Part{{FunctionCall: &google.FunctionCall{
+			ID: "call-a", Name: "first", Args: map[string]any{"first": "A1"}, WillContinue: &continued,
+		}}}},
+	}}})
+	choice := acc.choices[0]
+	if choice == nil || len(choice.activeIDlessCalls) != 0 {
+		t.Fatalf("active ID-less calls = %#v after identified call", choice)
+	}
+	acc.add(&google.GenerateContentResponse{Candidates: []*google.Candidate{{
+		Content: &google.Content{Parts: []*google.Part{{FunctionCall: &google.FunctionCall{
+			ID: "call-b", Name: "second", Args: map[string]any{"second": "B1"}, WillContinue: &complete,
+		}}}},
+	}}})
+	acc.add(&google.GenerateContentResponse{Candidates: []*google.Candidate{{
+		Content: &google.Content{Parts: []*google.Part{{FunctionCall: &google.FunctionCall{
+			ID: "call-a", Args: map[string]any{"first_tail": "A2"}, WillContinue: &complete,
+		}}}},
+	}}})
+
+	if choice == nil || len(choice.toolCalls) != 2 {
+		t.Fatalf("tool calls = %#v, want two calls with distinct provider IDs", choice)
+	}
+	first := choice.toolCalls[choice.toolPositionsByID["call-a"]]
+	second := choice.toolCalls[choice.toolPositionsByID["call-b"]]
+	if first == nil || first.id != "call-a" || first.name != "first" ||
+		mustJSON(first.arguments) != `{"first":"A1","first_tail":"A2"}` {
+		t.Fatalf("first call = %#v", first)
+	}
+	if second == nil || second.id != "call-b" || second.name != "second" ||
+		mustJSON(second.arguments) != `{"second":"B1"}` {
+		t.Fatalf("second call = %#v", second)
+	}
+	if first == second {
+		t.Fatal("different provider IDs resolved to the same accumulated call")
+	}
+}
+
 func TestPartialArgJSONPathSupportsQuotedEscapesAndEmbeddedBrackets(t *testing.T) {
 	call := &accumulatedToolCall{
 		arguments:            make(map[string]any),
@@ -333,6 +374,25 @@ func TestPartialArgJSONPathSupportsQuotedEscapesAndEmbeddedBrackets(t *testing.T
 
 	if got := mustJSON(call.arguments); got != `{"array]key":[{"single'quote":"nested"}],"double\"quote]":"double"}` {
 		t.Fatalf("partial arguments = %s", got)
+	}
+}
+
+func TestPartialArgJSONPathValidatesUTF16SurrogateEscapes(t *testing.T) {
+	segments, ok := parseJSONPath(`$["emoji-\uD83D\uDE00"]`)
+	if !ok || len(segments) != 1 || !segments[0].isKey || segments[0].key != "emoji-\U0001F600" {
+		t.Fatalf("valid surrogate pair parsed as %#v, %v", segments, ok)
+	}
+
+	invalid := []string{
+		`$["\uD800"]`,
+		`$["\uDC00"]`,
+		`$["\uD800\u0041"]`,
+		`$["\uDC00\uD800"]`,
+	}
+	for _, path := range invalid {
+		if segments, ok := parseJSONPath(path); ok {
+			t.Fatalf("parseJSONPath(%q) = %#v, true; want invalid UTF-16 rejected", path, segments)
+		}
 	}
 }
 
