@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/sdk/instrumentation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
@@ -164,5 +166,51 @@ func TestByteLimitedExporterCountsOnlyFailedAndUnattemptedSpans(t *testing.T) {
 	}
 	if len(batchSizes) != 2 || batchSizes[0] != 2 || batchSizes[1] != 2 {
 		t.Fatalf("attempted batches = %v, want [2 2]", batchSizes)
+	}
+}
+
+type planningProbeSpan struct {
+	sdktrace.ReadOnlySpan
+	cancel   context.CancelFunc
+	accessed *atomic.Bool
+}
+
+func (s planningProbeSpan) InstrumentationScope() instrumentation.Scope {
+	if s.accessed != nil {
+		s.accessed.Store(true)
+	}
+	if s.cancel != nil {
+		s.cancel()
+	}
+	return s.ReadOnlySpan.InstrumentationScope()
+}
+
+func TestByteLimitedExporterStopsPlanningWhenContextExpires(t *testing.T) {
+	spans := sizedTestSpans(2, 2048)
+	ctx, cancel := context.WithCancel(context.Background())
+	var secondAccessed atomic.Bool
+	probes := []sdktrace.ReadOnlySpan{
+		planningProbeSpan{ReadOnlySpan: spans[0], cancel: cancel},
+		planningProbeSpan{ReadOnlySpan: spans[1], accessed: &secondAccessed},
+	}
+	diagnostics := &deliveryDiagnostics{}
+	sink := &batchRecordingExporter{}
+	exporter, err := newByteLimitedExporter(sink, defaultMaxExportBytes, diagnostics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = exporter.ExportSpans(ctx, probes)
+	var failure *uploadFailure
+	if !errors.As(err, &failure) || failure.reasonCode != "cancelled" || failure.retryable {
+		t.Fatalf("planning cancellation = %#v, want non-retryable cancelled failure", err)
+	}
+	if secondAccessed.Load() {
+		t.Fatal("planner accessed a later span after cancellation")
+	}
+	if len(sink.batches) != 0 {
+		t.Fatal("cancelled planning reached the ordinary exporter")
+	}
+	if got := diagnostics.snapshot().SpanExportFailures; got != 2 {
+		t.Fatalf("export failures = %d, want all 2 unsent spans", got)
 	}
 }

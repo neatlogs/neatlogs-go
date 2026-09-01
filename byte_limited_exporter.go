@@ -40,7 +40,17 @@ func (e *byteLimitedExporter) ExportSpans(ctx context.Context, spans []sdktrace.
 	batch := make([]sdktrace.ReadOnlySpan, 0, len(spans))
 	batchBytes := 0
 	for _, span := range spans {
+		if err := ctx.Err(); err != nil {
+			e.recordFailure(len(spans))
+			return newUploadFailure("prepare", contextReason(ctx), contextRetryable(ctx))
+		}
 		spanBytes := encodedSpanUpperBound(span)
+		// Encoding a single span is indivisible, but a deadline that expires
+		// during it must prevent us from walking or allocating for later spans.
+		if err := ctx.Err(); err != nil {
+			e.recordFailure(len(spans))
+			return newUploadFailure("prepare", contextReason(ctx), contextRetryable(ctx))
+		}
 		if spanBytes > e.maxBytes {
 			if len(batch) > 0 {
 				actions = append(actions, spanExportAction{batch: batch})
