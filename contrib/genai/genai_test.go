@@ -143,10 +143,47 @@ func TestTypedMediaPreservesInlineDigestAndFileReference(t *testing.T) {
 	assertStringAttribute(t, got.Attributes, attrs.LLMInputMessagePrefix+"0.media.2.reference", "https://bucket.example/private.png")
 }
 
-func TestLargeTypedMediaUploadsMaskedBytesAndExportsCanonicalReference(t *testing.T) {
+func TestDisabledUploadsNeverPlaceLargeMediaBytesOrTokensOnSpan(t *testing.T) {
+	t.Setenv("NEATLOGS_UPLOADS_ENABLED", "false")
+	ctx := context.Background()
+	sink := tracetest.NewInMemoryExporter()
+	shutdown, err := neatlogs.Init(ctx, neatlogs.Config{WorkflowName: "media-disabled"}, neatlogs.WithExporter(sink))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdown(ctx)
+
+	raw := []byte(strings.Repeat("disabled-private-image", 6_000))
+	content := &google.Content{Role: "user", Parts: []*google.Part{{InlineData: &google.Blob{Data: raw, MIMEType: "image/png"}}}}
+	_, span, end := neatlogs.StartProviderSpan(ctx, "disabled-media", attrs.KindLLM)
+	setInputMessages(span, []*google.Content{content}, nil)
+	end()
+	if err := neatlogs.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range sink.GetSpans() {
+		if candidate.Name != "disabled-media" {
+			continue
+		}
+		prefix := attrs.LLMInputMessagePrefix + "0.media.0."
+		assertStringAttribute(t, candidate.Attributes, prefix+"state", "failed")
+		for _, value := range candidate.Attributes {
+			if value.Value.Type() == attribute.BYTESLICE || strings.HasSuffix(string(value.Key), ".upload_token") ||
+				strings.Contains(value.Value.Emit(), "disabled-private-image") {
+				t.Fatalf("disabled upload retained private media: %s", value.Key)
+			}
+		}
+		if snapshot := neatlogs.GetDeliveryDiagnostics(ctx); snapshot.TypedMediaUploadFailures != 1 {
+			t.Fatalf("disabled media diagnostics = %#v", snapshot)
+		}
+		return
+	}
+	t.Fatal("disabled media span not exported")
+}
+
+func TestLargeTypedMediaUploadsOutOfBandAfterMaskedCanonicalReference(t *testing.T) {
 	original := []byte(strings.Repeat("private-image", 8_000))
-	masked := []byte(strings.Repeat("masked-image", 8_000))
-	maskedDigest := sha256.Sum256(masked)
+	originalDigest := sha256.Sum256(original)
 	uploadID := "0198f1ea-70ce-7c6d-8bbc-b08a19c58280"
 	referenceID := uploadID
 	var uploaded []byte
@@ -175,8 +212,8 @@ func TestLargeTypedMediaUploadsMaskedBytesAndExportsCanonicalReference(t *testin
 					"headers": map[string]string{"x-upload-secret": "must-not-export"},
 				},
 				"reference": map[string]any{
-					"id": referenceID, "purpose": "typed_media", "sha256": fmt.Sprintf("%x", maskedDigest),
-					"byte_length": len(masked), "mime_type": "image/png", "content_encoding": "identity", "state": "prepared",
+					"id": referenceID, "purpose": "typed_media", "sha256": fmt.Sprintf("%x", originalDigest),
+					"byte_length": len(original), "mime_type": "image/png", "content_encoding": "identity", "state": "prepared",
 				},
 			})
 		case "/object":
@@ -195,8 +232,8 @@ func TestLargeTypedMediaUploadsMaskedBytesAndExportsCanonicalReference(t *testin
 			_ = json.NewEncoder(response).Encode(map[string]any{
 				"upload_id": uploadID, "state": "ready",
 				"reference": map[string]any{
-					"id": referenceID, "purpose": "typed_media", "sha256": fmt.Sprintf("%x", maskedDigest),
-					"byte_length": len(masked), "mime_type": "image/png", "content_encoding": "identity", "state": "ready",
+					"id": referenceID, "purpose": "typed_media", "sha256": fmt.Sprintf("%x", originalDigest),
+					"byte_length": len(original), "mime_type": "image/png", "content_encoding": "identity", "state": "ready",
 				},
 			})
 		default:
@@ -213,9 +250,9 @@ func TestLargeTypedMediaUploadsMaskedBytesAndExportsCanonicalReference(t *testin
 	shutdown, err := neatlogs.Init(ctx, neatlogs.Config{
 		APIKey: "project-key", Endpoint: server.URL, WorkflowName: "media-upload-test", EnableUploads: true,
 		Mask: func(_ context.Context, data neatlogs.SpanData) (*neatlogs.SpanData, error) {
-			for index := range data.Attributes {
-				if strings.HasPrefix(string(data.Attributes[index].Key), "neatlogs.internal.media_payload.") {
-					data.Attributes[index] = attribute.ByteSlice(string(data.Attributes[index].Key), masked)
+			for _, value := range data.Attributes {
+				if value.Value.Type() == attribute.BYTESLICE || strings.Contains(value.Value.Emit(), "private-image") {
+					return nil, errors.New("raw media crossed mask boundary")
 				}
 			}
 			return &data, nil
@@ -240,10 +277,10 @@ func TestLargeTypedMediaUploadsMaskedBytesAndExportsCanonicalReference(t *testin
 		gotPrepare[key] = value
 	}
 	mu.Unlock()
-	if string(gotUploaded) != string(masked) {
-		t.Fatalf("uploaded bytes were not the masked bytes: got=%d want=%d", len(gotUploaded), len(masked))
+	if string(gotUploaded) != string(original) {
+		t.Fatalf("uploaded bytes changed: got=%d want=%d", len(gotUploaded), len(original))
 	}
-	if gotPrepare["purpose"] != "typed_media" || gotPrepare["sha256"] != fmt.Sprintf("%x", maskedDigest) || gotPrepare["payload_schema"] != "neatlogs.media.v1" {
+	if gotPrepare["purpose"] != "typed_media" || gotPrepare["sha256"] != fmt.Sprintf("%x", originalDigest) || gotPrepare["payload_schema"] != "neatlogs.media.v1" {
 		t.Fatalf("prepare metadata = %#v", gotPrepare)
 	}
 	var got *tracetest.SpanStub
@@ -262,8 +299,9 @@ func TestLargeTypedMediaUploadsMaskedBytesAndExportsCanonicalReference(t *testin
 	assertStringAttribute(t, got.Attributes, prefix+"state", "available")
 	for _, value := range got.Attributes {
 		rendered := value.Value.Emit()
-		if strings.HasPrefix(string(value.Key), "neatlogs.internal.media_payload.") ||
-			strings.Contains(rendered, "must-not-export") || strings.Contains(rendered, "private-image") {
+		if strings.HasSuffix(string(value.Key), ".upload_token") ||
+			strings.Contains(rendered, "must-not-export") || strings.Contains(rendered, "private-image") ||
+			strings.Contains(rendered, "nl_pending_media_") {
 			t.Fatalf("telemetry leaked private upload material: %s=%s", value.Key, rendered)
 		}
 	}

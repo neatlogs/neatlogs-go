@@ -10,6 +10,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/neatlogs/neatlogs-go/internal/attributes"
+	internalmedia "github.com/neatlogs/neatlogs-go/internal/media"
 )
 
 // normalizingExporter wraps a SpanExporter and rewrites every span's attributes
@@ -67,6 +68,7 @@ func (e *normalizingExporter) ExportSpans(ctx context.Context, spans []trace.Rea
 		for index, result := range masked {
 			if result == nil {
 				keep[index] = false
+				internalmedia.DiscardSpan(stubs[index].SpanContext)
 				if e.delivery != nil {
 					e.delivery.maskedSpanDrops.Add(1)
 				}
@@ -76,13 +78,16 @@ func (e *normalizingExporter) ExportSpans(ctx context.Context, spans []trace.Rea
 		}
 	}
 
-	// Typed media bytes are deliberately held in private attributes until the
-	// normalized clone has passed through the caller's mask. This is the first
-	// point at which an upload authority may see content.
+	// Raw typed media is retained out of band. The accepted masked clone carries
+	// only opaque tokens, and this is the first point at which upload authority
+	// may see the corresponding bytes.
 	uploadCtx, cancelUploads := context.WithTimeout(ctx, defaultUploadTimeout)
+	mediaFailureSpans := 0
 	for index := range stubs {
 		if keep[index] {
-			uploadTypedMedia(uploadCtx, &stubs[index], e.uploads, e.delivery)
+			if !uploadTypedMedia(uploadCtx, &stubs[index], e.uploads, e.delivery) {
+				mediaFailureSpans++
+			}
 		}
 	}
 	cancelUploads()
@@ -96,7 +101,16 @@ func (e *normalizingExporter) ExportSpans(ctx context.Context, spans []trace.Rea
 	if len(rewritten) == 0 {
 		return nil
 	}
-	return e.next.ExportSpans(ctx, rewritten)
+	if err := e.next.ExportSpans(ctx, rewritten); err != nil {
+		return err
+	}
+	if mediaFailureSpans > 0 {
+		if e.delivery != nil {
+			e.delivery.spanExportFailures.Add(uint64(mediaFailureSpans))
+		}
+		return newUploadFailure("typed_media", "one_or_more_uploads_failed", false)
+	}
+	return nil
 }
 
 type maskBatchResult struct {

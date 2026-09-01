@@ -9,6 +9,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	attrs "github.com/neatlogs/neatlogs-go/internal/attributes"
+	internalmedia "github.com/neatlogs/neatlogs-go/internal/media"
 )
 
 // sdkState is shared by the process-wide Init lifecycle and each independent
@@ -35,13 +36,14 @@ type sdkRuntime struct {
 	lifecycle    *activeSpanRegistry
 	workflowName string
 	delivery     *deliveryDiagnostics
+	media        *internalmedia.Store
 
 	done        chan struct{}
 	shutdownErr error
 	signals     *shutdownSignalController
 }
 
-func newSDKRuntime(tp *sdktrace.TracerProvider, lifecycle *activeSpanRegistry, workflowName string, delivery *deliveryDiagnostics) *sdkRuntime {
+func newSDKRuntime(tp *sdktrace.TracerProvider, lifecycle *activeSpanRegistry, workflowName string, delivery *deliveryDiagnostics, media *internalmedia.Store) *sdkRuntime {
 	return &sdkRuntime{
 		state:        stateRunning,
 		provider:     tp,
@@ -49,6 +51,7 @@ func newSDKRuntime(tp *sdktrace.TracerProvider, lifecycle *activeSpanRegistry, w
 		lifecycle:    lifecycle,
 		workflowName: workflowName,
 		delivery:     delivery,
+		media:        media,
 		done:         make(chan struct{}),
 	}
 }
@@ -181,6 +184,9 @@ func (r *sdkRuntime) shutdown(ctx context.Context, reason string) error {
 	}
 	r.lifecycle.endActiveSpans(reason)
 	err := r.provider.Shutdown(ctx)
+	if r.media != nil {
+		r.media.Close()
+	}
 
 	r.mu.Lock()
 	r.shutdownErr = err

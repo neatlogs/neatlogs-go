@@ -2,8 +2,6 @@ package neatlogs
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -95,6 +93,11 @@ func actionCount(actions []spanExportAction) int {
 }
 
 func (e *byteLimitedExporter) exportOverflow(ctx context.Context, span sdktrace.ReadOnlySpan) error {
+	if err := ctx.Err(); err != nil {
+		uploadErr := newUploadFailure("prepare", contextReason(ctx), contextRetryable(ctx))
+		e.recordOverflowFailure(uploadErr)
+		return uploadErr
+	}
 	if e.uploads == nil {
 		err := newUploadFailure("prepare", uploadUnavailableReason, false)
 		if e.delivery != nil {
@@ -116,8 +119,12 @@ func (e *byteLimitedExporter) exportOverflow(ctx context.Context, span sdktrace.
 		e.recordOverflowFailure(uploadErr)
 		return uploadErr
 	}
-	digest := sha256.Sum256(content)
-	digestHex := hex.EncodeToString(digest[:])
+	digestHex, err := uploadDigest(ctx, content)
+	if err != nil {
+		uploadErr := newUploadFailure("prepare", contextReason(ctx), contextRetryable(ctx))
+		e.recordOverflowFailure(uploadErr)
+		return uploadErr
+	}
 	payload := uploadPayload{
 		Content: content, Purpose: uploadPurposeOTLPOverflow,
 		MIMEType: "application/x-protobuf", ContentEncoding: uploadEncodingIdentity,

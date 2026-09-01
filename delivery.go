@@ -7,6 +7,8 @@ import (
 
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
+
+	internalmedia "github.com/neatlogs/neatlogs-go/internal/media"
 )
 
 // DeliveryDiagnosticsSnapshot reports bounded-queue, privacy, and final-export
@@ -116,20 +118,29 @@ func (q *deliveryQueue) release(count int) {
 type boundedSpanProcessor struct {
 	next    sdktrace.SpanProcessor
 	queue   *deliveryQueue
+	media   *internalmedia.Store
 	stopped atomic.Bool
 }
 
 func (p *boundedSpanProcessor) OnStart(ctx context.Context, span sdktrace.ReadWriteSpan) {
+	if !p.stopped.Load() && p.media != nil && span != nil && span.SpanContext().IsSampled() {
+		internalmedia.RegisterSpan(span.SpanContext(), p.media)
+	}
 	p.next.OnStart(ctx, span)
 }
 
 func (p *boundedSpanProcessor) OnEnd(span sdktrace.ReadOnlySpan) {
 	if p.stopped.Load() || span == nil || span.SpanContext().TraceFlags()&trace.FlagsSampled == 0 {
+		if span != nil {
+			internalmedia.DiscardSpan(span.SpanContext())
+		}
 		return
 	}
 	if p.queue.acquire() {
 		p.next.OnEnd(span)
+		return
 	}
+	internalmedia.DiscardSpan(span.SpanContext())
 }
 
 func (p *boundedSpanProcessor) ForceFlush(ctx context.Context) error {

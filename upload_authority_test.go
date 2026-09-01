@@ -218,41 +218,55 @@ func TestHTTPUploadAuthorityShortCircuitsAlreadyReadyIdempotentPrepare(t *testin
 	}
 }
 
-func TestHTTPUploadAuthorityTreatsValidatingPrepareAsRetryableNonSuccess(t *testing.T) {
-	content := []byte("validation pending")
-	digest := sha256.Sum256(content)
-	digestHex := hex.EncodeToString(digest[:])
-	uploadID := "0198f1ea-70ce-7c6d-8bbc-b08a19c58280"
-	referenceID := uploadID
-	var requests atomic.Int32
-	server := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		requests.Add(1)
-		if request.URL.Path != "/v1/telemetry/uploads" {
-			t.Errorf("validating replay made unexpected request: %s", request.URL.Path)
-		}
-		response.WriteHeader(http.StatusAccepted)
-		_ = json.NewEncoder(response).Encode(map[string]any{
-			"upload_id": uploadID, "state": "validating",
-			"reference": map[string]any{
-				"id": referenceID, "purpose": "otlp_overflow", "sha256": digestHex,
-				"byte_length": len(content), "mime_type": "application/x-protobuf", "content_encoding": "identity", "state": "validating",
-			},
-			"diagnostic": map[string]any{"stage": "validation", "reason_code": "scan_pending", "retryable": false},
+func TestHTTPUploadAuthorityResumesUploadedAndValidatingPrepareStates(t *testing.T) {
+	for _, replay := range []struct {
+		state  string
+		status int
+	}{{state: "uploaded", status: http.StatusOK}, {state: "validating", status: http.StatusAccepted}} {
+		t.Run(replay.state, func(t *testing.T) {
+			content := []byte("validation pending")
+			digest := sha256.Sum256(content)
+			digestHex := hex.EncodeToString(digest[:])
+			uploadID := "0198f1ea-70ce-7c6d-8bbc-b08a19c58280"
+			var prepares atomic.Int32
+			var completes atomic.Int32
+			var puts atomic.Int32
+			server := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				switch request.URL.Path {
+				case "/v1/telemetry/uploads":
+					prepares.Add(1)
+					response.WriteHeader(replay.status)
+					_ = json.NewEncoder(response).Encode(map[string]any{
+						"upload_id": uploadID, "state": replay.state,
+						"reference": map[string]any{
+							"id": uploadID, "purpose": "otlp_overflow", "sha256": digestHex,
+							"byte_length": len(content), "mime_type": "application/x-protobuf", "content_encoding": "identity", "state": replay.state,
+						},
+						"diagnostic": map[string]any{"stage": "validation", "reason_code": "scan_pending", "retryable": true},
+					})
+				case "/v1/telemetry/uploads/" + uploadID + "/complete":
+					completes.Add(1)
+					writeUploadResponse(t, response, "", uploadID, uploadID, "ready", digestHex, len(content))
+				case "/object":
+					puts.Add(1)
+				default:
+					http.NotFound(response, request)
+				}
+			}))
+			defer server.Close()
+			authority := testHTTPUploadAuthority(t, server, "key")
+			receipt, err := authority.Upload(context.Background(), uploadPayload{
+				Content: content, Purpose: uploadPurposeOTLPOverflow, MIMEType: "application/x-protobuf",
+				ContentEncoding: uploadEncodingIdentity, PayloadSchema: uploadSchemaTracesV1,
+				IdempotencyKey: "stable-key",
+			})
+			if err != nil || !uploadReceiptReady(receipt) {
+				t.Fatalf("resumed upload = %#v, %v", receipt, err)
+			}
+			if prepares.Load() != 1 || completes.Load() != 1 || puts.Load() != 0 {
+				t.Fatalf("prepare/complete/put = %d/%d/%d", prepares.Load(), completes.Load(), puts.Load())
+			}
 		})
-	}))
-	defer server.Close()
-	authority := testHTTPUploadAuthority(t, server, "key")
-	_, err := authority.Upload(context.Background(), uploadPayload{
-		Content: content, Purpose: uploadPurposeOTLPOverflow, MIMEType: "application/x-protobuf",
-		ContentEncoding: uploadEncodingIdentity, PayloadSchema: uploadSchemaTracesV1,
-		IdempotencyKey: "stable-key",
-	})
-	var failure *uploadFailure
-	if !errors.As(err, &failure) || !failure.retryable || failure.reasonCode != "scan_pending" {
-		t.Fatalf("validating prepare error = %#v", err)
-	}
-	if got := requests.Load(); got != 1 {
-		t.Fatalf("requests = %d, want prepare only", got)
 	}
 }
 
@@ -368,6 +382,29 @@ func TestHTTPUploadAuthorityHonorsCallerDeadline(t *testing.T) {
 	})
 	if err == nil || time.Since(started) > time.Second {
 		t.Fatalf("deadline result = %v after %v", err, time.Since(started))
+	}
+}
+
+func TestHTTPUploadAuthorityDoesNotStartAfterCancellation(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests.Add(1)
+	}))
+	defer server.Close()
+	authority := testHTTPUploadAuthority(t, server, "key")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := authority.Upload(ctx, uploadPayload{
+		Content: make([]byte, maxTypedMediaBytes), Purpose: uploadPurposeTypedMedia, MIMEType: "image/png",
+		ContentEncoding: uploadEncodingIdentity, PayloadSchema: uploadSchemaMediaV1,
+		IdempotencyKey: "cancelled-before-hash",
+	})
+	var failure *uploadFailure
+	if !errors.As(err, &failure) || failure.reasonCode != "cancelled" || failure.retryable {
+		t.Fatalf("cancelled upload error = %#v", err)
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("cancelled upload made %d HTTP requests", requests.Load())
 	}
 }
 

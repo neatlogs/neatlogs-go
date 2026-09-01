@@ -51,6 +51,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/neatlogs/neatlogs-go/internal/attributes"
+	internalmedia "github.com/neatlogs/neatlogs-go/internal/media"
 )
 
 // defaultEndpoint is the Neatlogs ingestion base URL. Override via
@@ -430,6 +431,7 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(sampleRate))),
 	)
 
+	var mediaStore *internalmedia.Store
 	if !disable {
 		exp := io.exporter
 		if exp == nil {
@@ -445,6 +447,7 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 		var uploads uploadAuthority
 		if uploadsEnabled {
 			uploads = newHTTPUploadAuthority(base, apiKey)
+			mediaStore = internalmedia.NewStore(internalmedia.UploadLimit, internalmedia.MaxPendingItems)
 			delivery.uploadAuthorityAvailable.Store(true)
 		}
 		byteLimited, byteErr := newByteLimitedExporter(exp, defaultMaxExportBytes, delivery)
@@ -463,7 +466,7 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 		)
 		byteLimited.uploads = uploads
 		tpOpts = append(tpOpts, sdktrace.WithSpanProcessor(&boundedSpanProcessor{
-			next: batchProcessor, queue: queue,
+			next: batchProcessor, queue: queue, media: mediaStore,
 		}))
 		io.delivery = delivery
 	}
@@ -475,7 +478,7 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 	if !disable {
 		tp.RegisterSpanProcessor(&completionProcessor{tracer: tp.Tracer(tracerName, trace.WithInstrumentationVersion(Version))})
 	}
-	return newSDKRuntime(tp, lifecycle, resolvedWorkflowNameFrom(cfg), io.delivery), base, !disable, nil
+	return newSDKRuntime(tp, lifecycle, resolvedWorkflowNameFrom(cfg), io.delivery, mediaStore), base, !disable, nil
 }
 
 func resolveUploadsEnabled(cfg Config) (bool, error) {

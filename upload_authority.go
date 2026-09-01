@@ -178,8 +178,10 @@ func (a *httpUploadAuthority) Upload(ctx context.Context, payload uploadPayload)
 	uploadCtx, cancel := context.WithTimeout(ctx, a.timeout)
 	defer cancel()
 
-	digest := sha256.Sum256(payload.Content)
-	digestHex := hex.EncodeToString(digest[:])
+	digestHex, err := uploadDigest(uploadCtx, payload.Content)
+	if err != nil {
+		return uploadReceipt{}, newUploadFailure("prepare", contextReason(uploadCtx), contextRetryable(uploadCtx))
+	}
 	request := prepareUploadRequest{
 		Version: 1, Purpose: payload.Purpose, SHA256: digestHex,
 		ByteLength: int64(len(payload.Content)), MIMEType: payload.MIMEType,
@@ -196,10 +198,31 @@ func (a *httpUploadAuthority) Upload(ctx context.Context, payload uploadPayload)
 			Reference: prepared.Reference, Diagnostic: prepared.Diagnostic,
 		}, nil
 	}
-	if err := a.put(uploadCtx, prepared, payload.Content); err != nil {
-		return uploadReceipt{}, err
+	if prepared.State == "prepared" {
+		if err := a.put(uploadCtx, prepared, payload.Content); err != nil {
+			return uploadReceipt{}, err
+		}
 	}
 	return a.complete(uploadCtx, prepared.UploadID, request)
+}
+
+func uploadDigest(ctx context.Context, content []byte) (string, error) {
+	hash := sha256.New()
+	const chunkSize = 256 * 1024
+	for offset := 0; offset < len(content); offset += chunkSize {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		end := offset + chunkSize
+		if end > len(content) {
+			end = len(content)
+		}
+		_, _ = hash.Write(content[offset:end])
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func validateUploadPayload(payload uploadPayload) error {
@@ -286,9 +309,7 @@ func (a *httpUploadAuthority) validatePrepared(prepared preparedUpload, request 
 		if prepared.Diagnostic == nil {
 			return newUploadFailure("prepare", "invalid_response", false)
 		}
-		reason := "validation_pending"
-		reason = prepared.Diagnostic.ReasonCode
-		return newUploadFailure("prepare", reason, true)
+		return nil
 	case "rejected":
 		if prepared.httpStatus != http.StatusOK {
 			return newUploadFailure("prepare", "invalid_response", false)

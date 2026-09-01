@@ -115,7 +115,7 @@ func (g *GenAIModels) GenerateContentStream(ctx context.Context, model string, c
 		}
 		seq := stream(ctx, model, contents, config)
 		var (
-			acc       = newResponseAccumulator()
+			acc       = newResponseAccumulator(span)
 			sawError  bool
 			cancelled bool
 			ended     bool
@@ -711,7 +711,7 @@ func finalizeResponse(span trace.Span, resp *genai.GenerateContentResponse) {
 		span.SetStatus(codes.Ok, "")
 		return
 	}
-	acc := newResponseAccumulator()
+	acc := newResponseAccumulator(span)
 	acc.add(resp)
 	acc.apply(span)
 	span.SetStatus(codes.Ok, "")
@@ -738,16 +738,20 @@ type accumulatedChoice struct {
 }
 
 type responseAccumulator struct {
-	choices           map[int]*accumulatedChoice
-	usage             *genai.GenerateContentResponseUsageMetadata
-	responseID        string
-	chunkCount        int
-	mediaCount        int
-	mediaPayloadBytes int
+	choices    map[int]*accumulatedChoice
+	span       trace.Span
+	usage      *genai.GenerateContentResponseUsageMetadata
+	responseID string
+	chunkCount int
+	mediaCount int
 }
 
-func newResponseAccumulator() *responseAccumulator {
-	return &responseAccumulator{choices: make(map[int]*accumulatedChoice)}
+func newResponseAccumulator(spans ...trace.Span) *responseAccumulator {
+	var span trace.Span
+	if len(spans) > 0 {
+		span = spans[0]
+	}
+	return &responseAccumulator{choices: make(map[int]*accumulatedChoice), span: span}
 }
 
 func (a *responseAccumulator) add(resp *genai.GenerateContentResponse) {
@@ -788,12 +792,7 @@ func (a *responseAccumulator) add(resp *genai.GenerateContentResponse) {
 					if _, exists := choice.media[key]; exists || a.mediaCount >= maxCapturedMediaReferences {
 						continue
 					}
-					if len(media.payload) > 0 && a.mediaPayloadBytes+len(media.payload) > internalmedia.UploadLimit {
-						media.payload = nil
-						media.state = "failed"
-						media.safePreview = "upload failed: memory_limit"
-					}
-					a.mediaPayloadBytes += len(media.payload)
+					stageCapturedMedia(a.span, &media)
 					a.mediaCount++
 					choice.media[key] = media
 				}
@@ -1406,6 +1405,7 @@ type capturedMedia struct {
 	state       string
 	safePreview string
 	payload     []byte
+	uploadToken string
 }
 
 func (m capturedMedia) key() string { return m.sha256 + ":" + m.reference + ":" + m.kind }
@@ -1488,7 +1488,6 @@ func setContentMedia(span trace.Span, prefix string, content *genai.Content, pur
 		return
 	}
 	index := 0
-	payloadBytes := 0
 	seen := make(map[string]struct{})
 	for _, part := range content.Parts {
 		for _, media := range partMedia(part, purpose) {
@@ -1498,17 +1497,30 @@ func setContentMedia(span trace.Span, prefix string, content *genai.Content, pur
 			if _, exists := seen[media.key()]; exists {
 				continue
 			}
-			if len(media.payload) > 0 && payloadBytes+len(media.payload) > internalmedia.UploadLimit {
-				media.payload = nil
-				media.state = "failed"
-				media.safePreview = "upload failed: memory_limit"
-			}
-			payloadBytes += len(media.payload)
 			seen[media.key()] = struct{}{}
+			stageCapturedMedia(span, &media)
 			setMediaAttributes(span, fmt.Sprintf("%s.media.%d.", prefix, index), media)
 			index++
 		}
 	}
+}
+
+func stageCapturedMedia(span trace.Span, media *capturedMedia) {
+	if span == nil || media == nil || media.state != "pending-upload" || len(media.payload) == 0 {
+		return
+	}
+	pending, reason := internalmedia.Stage(span.SpanContext(), media.payload, media.mimeType)
+	media.payload = nil
+	if reason != "" {
+		media.state = "failed"
+		media.safePreview = "upload failed: " + reason
+		return
+	}
+	media.uploadToken = pending.Token
+	media.sha256 = pending.SHA256
+	media.byteLength = pending.ByteLength
+	media.mimeType = pending.MIMEType
+	media.safePreview = "awaiting authenticated upload"
 }
 
 func setMediaAttributes(span trace.Span, prefix string, media capturedMedia) {
@@ -1530,10 +1542,10 @@ func setMediaAttributes(span trace.Span, prefix string, media capturedMedia) {
 	if media.safePreview != "" {
 		values = append(values, attribute.String(prefix+"safe_preview", media.safePreview))
 	}
-	if len(media.payload) > 0 {
-		// Append private content last. If the OTel attribute limit drops it, the
+	if media.uploadToken != "" {
+		// Append the opaque token last. If the OTel attribute limit drops it, the
 		// retained pending reference is turned into explicit failure metadata.
-		values = append(values, internalmedia.PayloadAttribute(prefix, media.payload))
+		values = append(values, attribute.String(prefix+"upload_token", media.uploadToken))
 	}
 	span.SetAttributes(values...)
 }

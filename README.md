@@ -168,6 +168,9 @@ object-scoped headers. Signed URLs and headers are discarded before telemetry
 export. Only a validated `ready` response counts as delivery. Disabled,
 pending, rejected, and failed uploads are reported through canonical failure
 references and delivery diagnostics rather than silently retaining a digest.
+Large media bytes are staged outside span data in a per-pipeline store capped at
+25 MiB and 32 unique items; masks see only canonical metadata plus an opaque
+token, and shutdown or any dropped span releases its staged bytes.
 
 ## Status
 
