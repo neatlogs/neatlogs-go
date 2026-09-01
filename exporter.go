@@ -52,19 +52,39 @@ func (e *normalizingExporter) ExportSpans(ctx context.Context, spans []trace.Rea
 	if e.release != nil {
 		defer e.release(len(spans))
 	}
+	if err := ctx.Err(); err != nil {
+		e.discardAndRecord(spans, nil)
+		return newUploadFailure("prepare", contextReason(ctx), contextRetryable(ctx))
+	}
 	stubs := make([]spanStub, len(spans))
 	for index, s := range spans {
+		if err := ctx.Err(); err != nil {
+			e.discardAndRecord(spans, nil)
+			return newUploadFailure("prepare", contextReason(ctx), contextRetryable(ctx))
+		}
 		stub := tracetest.SpanStubFromReadOnlySpan(s)
 		stub.Attributes = e.mapper.Normalize(stub.Attributes)
 		stubs[index] = stub
+		if err := ctx.Err(); err != nil {
+			e.discardAndRecord(spans, nil)
+			return newUploadFailure("prepare", contextReason(ctx), contextRetryable(ctx))
+		}
 	}
 
 	keep := make([]bool, len(stubs))
 	for index := range keep {
 		keep[index] = true
 	}
+	if err := ctx.Err(); err != nil {
+		e.discardKeptAndRecord(stubs, keep)
+		return newUploadFailure("prepare", contextReason(ctx), contextRetryable(ctx))
+	}
 	if e.mask != nil {
 		masked := e.maskBatch(ctx, stubs)
+		if err := ctx.Err(); err != nil {
+			e.discardKeptAndRecord(stubs, keep)
+			return newUploadFailure("prepare", contextReason(ctx), contextRetryable(ctx))
+		}
 		for index, result := range masked {
 			if result == nil {
 				keep[index] = false
@@ -77,6 +97,10 @@ func (e *normalizingExporter) ExportSpans(ctx context.Context, spans []trace.Rea
 			applySpanData(&stubs[index], result)
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		e.discardKeptAndRecord(stubs, keep)
+		return newUploadFailure("prepare", contextReason(ctx), contextRetryable(ctx))
+	}
 
 	// Raw typed media is retained out of band. The accepted masked clone carries
 	// only opaque tokens, and this is the first point at which upload authority
@@ -88,6 +112,11 @@ func (e *normalizingExporter) ExportSpans(ctx context.Context, spans []trace.Rea
 			if !uploadTypedMedia(uploadCtx, &stubs[index], e.uploads, e.delivery) {
 				mediaFailureSpans++
 			}
+			if err := ctx.Err(); err != nil {
+				cancelUploads()
+				e.discardKeptAndRecord(stubs, keep)
+				return newUploadFailure("prepare", contextReason(ctx), contextRetryable(ctx))
+			}
 		}
 	}
 	cancelUploads()
@@ -95,11 +124,23 @@ func (e *normalizingExporter) ExportSpans(ctx context.Context, spans []trace.Rea
 	rewritten := make([]trace.ReadOnlySpan, 0, len(stubs))
 	for index := range stubs {
 		if keep[index] {
+			if err := ctx.Err(); err != nil {
+				e.recordFailure(countKept(keep))
+				return newUploadFailure("prepare", contextReason(ctx), contextRetryable(ctx))
+			}
 			rewritten = append(rewritten, stubs[index].Snapshot())
+			if err := ctx.Err(); err != nil {
+				e.recordFailure(countKept(keep))
+				return newUploadFailure("prepare", contextReason(ctx), contextRetryable(ctx))
+			}
 		}
 	}
 	if len(rewritten) == 0 {
 		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		e.recordFailure(len(rewritten))
+		return newUploadFailure("prepare", contextReason(ctx), contextRetryable(ctx))
 	}
 	if err := e.next.ExportSpans(ctx, rewritten); err != nil {
 		return err
@@ -111,6 +152,45 @@ func (e *normalizingExporter) ExportSpans(ctx context.Context, spans []trace.Rea
 		return newUploadFailure("typed_media", "one_or_more_uploads_failed", false)
 	}
 	return nil
+}
+
+func countKept(keep []bool) int {
+	count := 0
+	for _, kept := range keep {
+		if kept {
+			count++
+		}
+	}
+	return count
+}
+
+func (e *normalizingExporter) discardAndRecord(spans []trace.ReadOnlySpan, stubs []spanStub) {
+	for _, span := range spans {
+		if span != nil {
+			internalmedia.DiscardSpan(span.SpanContext())
+		}
+	}
+	for index := range stubs {
+		internalmedia.DiscardSpan(stubs[index].SpanContext)
+	}
+	e.recordFailure(len(spans) + len(stubs))
+}
+
+func (e *normalizingExporter) discardKeptAndRecord(stubs []spanStub, keep []bool) {
+	count := 0
+	for index := range stubs {
+		if keep[index] {
+			internalmedia.DiscardSpan(stubs[index].SpanContext)
+			count++
+		}
+	}
+	e.recordFailure(count)
+}
+
+func (e *normalizingExporter) recordFailure(count int) {
+	if e.delivery != nil && count > 0 {
+		e.delivery.spanExportFailures.Add(uint64(count))
+	}
 }
 
 type maskBatchResult struct {

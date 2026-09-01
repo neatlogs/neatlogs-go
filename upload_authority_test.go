@@ -326,6 +326,63 @@ func TestHTTPUploadAuthorityRetriesValidatingCompletionWithoutAnotherPut(t *test
 	}
 }
 
+func TestHTTPUploadAuthorityRetriesUploadedCompletionWithoutAnotherPut(t *testing.T) {
+	content := []byte("object uploaded before validation")
+	digest := sha256.Sum256(content)
+	digestHex := hex.EncodeToString(digest[:])
+	uploadID := "0198f1ea-70ce-7c6d-8bbc-b08a19c58280"
+	var puts atomic.Int32
+	var completes atomic.Int32
+	var server *httptest.Server
+	server = httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/v1/telemetry/uploads":
+			response.WriteHeader(http.StatusCreated)
+			writeUploadResponse(t, response, server.URL+"/object", uploadID, uploadID, "prepared", digestHex, len(content))
+		case "/object":
+			puts.Add(1)
+			response.WriteHeader(http.StatusNoContent)
+		case "/v1/telemetry/uploads/" + uploadID + "/complete":
+			state := "ready"
+			value := map[string]any{
+				"upload_id": uploadID, "state": state,
+				"reference": map[string]any{
+					"id": uploadID, "purpose": "otlp_overflow", "sha256": digestHex,
+					"byte_length": len(content), "mime_type": "application/x-protobuf", "content_encoding": "identity", "state": state,
+				},
+			}
+			if completes.Add(1) == 1 {
+				state = "uploaded"
+				value["state"] = state
+				value["reference"].(map[string]any)["state"] = state
+				value["diagnostic"] = map[string]any{
+					"stage": "upload", "reason_code": "UPLOAD_OBJECT_PRESENT", "retryable": true,
+				}
+			}
+			_ = json.NewEncoder(response).Encode(value)
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer server.Close()
+	authority := testHTTPUploadAuthority(t, server, "key")
+	authority.attempts = 2
+	receipt, err := authority.Upload(context.Background(), uploadPayload{
+		Content: content, Purpose: uploadPurposeOTLPOverflow, MIMEType: "application/x-protobuf",
+		ContentEncoding: uploadEncodingIdentity, PayloadSchema: uploadSchemaTracesV1,
+		IdempotencyKey: "stable-key",
+	})
+	if err != nil || !uploadReceiptReady(receipt) {
+		t.Fatalf("uploaded completion retry = %#v, %v", receipt, err)
+	}
+	if got := puts.Load(); got != 1 {
+		t.Fatalf("object PUTs = %d, want 1", got)
+	}
+	if got := completes.Load(); got != 2 {
+		t.Fatalf("completion requests = %d, want 2", got)
+	}
+}
+
 func TestHTTPUploadAuthorityRejectsAmbientCredentialPutHeaders(t *testing.T) {
 	content := []byte("credential header")
 	digest := sha256.Sum256(content)

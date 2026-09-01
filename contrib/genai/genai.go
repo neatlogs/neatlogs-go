@@ -1553,22 +1553,20 @@ func setMediaAttributes(span trace.Span, prefix string, media capturedMedia) {
 func sanitizedMediaReference(reference string) string {
 	parsed, err := url.Parse(reference)
 	if err != nil {
-		safe := strings.SplitN(strings.SplitN(reference, "#", 2)[0], "?", 2)[0]
-		if scheme := strings.Index(safe, "://"); scheme >= 0 {
-			remainder := safe[scheme+3:]
-			if at := strings.LastIndex(remainder, "@"); at >= 0 {
-				safe = safe[:scheme+3] + remainder[at+1:]
-			}
-		}
-		return safe
+		return ""
 	}
-	if parsed.IsAbs() && (parsed.Host != "" || strings.HasPrefix(reference, "//")) {
+	parsed.RawQuery = ""
+	parsed.ForceQuery = false
+	parsed.Fragment = ""
+	parsed.RawFragment = ""
+	if parsed.Host != "" {
 		parsed.User = nil
-		parsed.RawQuery = ""
-		parsed.Fragment = ""
 		return parsed.String()
 	}
-	return strings.SplitN(strings.SplitN(reference, "#", 2)[0], "?", 2)[0]
+	if parsed.IsAbs() && parsed.Opaque != "" {
+		return parsed.Scheme + ":"
+	}
+	return parsed.String()
 }
 
 // recordError marks the span as failed. It does NOT end the span; callers end

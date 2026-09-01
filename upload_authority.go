@@ -424,7 +424,8 @@ func (a *httpUploadAuthority) completeAttempt(ctx context.Context, uploadID stri
 		!referenceMatches(completed.Reference, request, completed.State) {
 		return uploadReceipt{}, false, newUploadFailure("complete", "invalid_reference", false)
 	}
-	if completed.State != "ready" && completed.State != "validating" && completed.State != "rejected" {
+	if completed.State != "ready" && completed.State != "uploaded" &&
+		completed.State != "validating" && completed.State != "rejected" {
 		return uploadReceipt{}, false, newUploadFailure("complete", "invalid_state", false)
 	}
 	if (completed.State == "validating" && completed.httpStatus != http.StatusAccepted) ||
@@ -439,16 +440,17 @@ func (a *httpUploadAuthority) completeAttempt(ctx context.Context, uploadID stri
 		Reference: completed.Reference, Diagnostic: completed.Diagnostic,
 	}
 	if completed.State != "ready" {
-		reason, retryable := "not_ready", completed.State == "validating"
+		pending := completed.State == "uploaded" || completed.State == "validating"
+		reason, retryable := "not_ready", pending
 		if completed.Diagnostic != nil {
 			if completed.Diagnostic.ReasonCode != "" {
 				reason = completed.Diagnostic.ReasonCode
 			}
-			if completed.State != "validating" {
+			if !pending {
 				retryable = *completed.Diagnostic.Retryable
 			}
 		}
-		return receipt, completed.State == "validating", newUploadFailure("complete", reason, retryable)
+		return receipt, pending, newUploadFailure("complete", reason, retryable)
 	}
 	return receipt, false, nil
 }

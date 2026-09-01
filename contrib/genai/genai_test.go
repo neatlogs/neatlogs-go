@@ -143,6 +143,19 @@ func TestTypedMediaPreservesInlineDigestAndFileReference(t *testing.T) {
 	assertStringAttribute(t, got.Attributes, attrs.LLMInputMessagePrefix+"0.media.2.reference", "https://bucket.example/private.png")
 }
 
+func TestSanitizedMediaReferenceStripsAuthorityCredentialsAndOpaquePayloads(t *testing.T) {
+	tests := map[string]string{
+		"//user:password@bucket.example/private.png?signature=secret#fragment": "//bucket.example/private.png",
+		"data:image/png;base64,private-image-bytes":                            "data:",
+		"https://bucket.example/private%zz":                                    "",
+	}
+	for reference, want := range tests {
+		if got := sanitizedMediaReference(reference); got != want {
+			t.Errorf("sanitized reference %q = %q, want %q", reference, got, want)
+		}
+	}
+}
+
 func TestDisabledUploadsNeverPlaceLargeMediaBytesOrTokensOnSpan(t *testing.T) {
 	t.Setenv("NEATLOGS_UPLOADS_ENABLED", "false")
 	ctx := context.Background()

@@ -74,11 +74,19 @@ func (e *byteLimitedExporter) ExportSpans(ctx context.Context, spans []sdktrace.
 
 	var overflowErr error
 	for index, action := range actions {
+		if err := ctx.Err(); err != nil {
+			e.recordFailure(actionCount(actions[index:]))
+			return newUploadFailure("prepare", contextReason(ctx), contextRetryable(ctx))
+		}
 		if action.overflow != nil {
 			if err := e.exportOverflow(ctx, action.overflow); err != nil {
 				if overflowErr == nil {
 					overflowErr = err
 				}
+			}
+			if err := ctx.Err(); err != nil {
+				e.recordFailure(actionCount(actions[index+1:]))
+				return newUploadFailure("prepare", contextReason(ctx), contextRetryable(ctx))
 			}
 			continue
 		}

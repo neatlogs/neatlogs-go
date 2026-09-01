@@ -12,6 +12,9 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
+
+	attrs "github.com/neatlogs/neatlogs-go/internal/attributes"
+	internalmedia "github.com/neatlogs/neatlogs-go/internal/media"
 )
 
 type batchRecordingExporter struct {
@@ -212,5 +215,79 @@ func TestByteLimitedExporterStopsPlanningWhenContextExpires(t *testing.T) {
 	}
 	if got := diagnostics.snapshot().SpanExportFailures; got != 2 {
 		t.Fatalf("export failures = %d, want all 2 unsent spans", got)
+	}
+}
+
+type cancellingUploadAuthority struct {
+	cancel context.CancelFunc
+}
+
+func (a cancellingUploadAuthority) Upload(context.Context, uploadPayload) (uploadReceipt, error) {
+	a.cancel()
+	return uploadReceipt{}, errors.New("upload cancelled")
+}
+
+func TestByteLimitedExporterStopsActionsWhenOverflowCancelsContext(t *testing.T) {
+	small := sizedTestSpans(1, 16)[0]
+	overflow := sizedTestSpans(1, 4096)[0]
+	spans := []sdktrace.ReadOnlySpan{small, overflow, small}
+	ctx, cancel := context.WithCancel(context.Background())
+	diagnostics := &deliveryDiagnostics{}
+	sink := &batchRecordingExporter{}
+	exporter, err := newByteLimitedExporter(sink, encodedSpanUpperBound(small), diagnostics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exporter.uploads = cancellingUploadAuthority{cancel: cancel}
+	err = exporter.ExportSpans(ctx, spans)
+	var failure *uploadFailure
+	if !errors.As(err, &failure) || failure.reasonCode != "cancelled" || failure.retryable {
+		t.Fatalf("action cancellation = %#v, want non-retryable cancelled failure", err)
+	}
+	if len(sink.batches) != 1 || len(sink.batches[0]) != 1 {
+		t.Fatalf("ordinary batches = %d, want only the pre-cancellation batch", len(sink.batches))
+	}
+	if got := diagnostics.snapshot().SpanExportFailures; got != 2 {
+		t.Fatalf("export failures = %d, want overflow plus unattempted span (2)", got)
+	}
+}
+
+func TestNormalizingExporterStopsCloningWhenContextExpires(t *testing.T) {
+	spans := sizedTestSpans(2, 2048)
+	ctx, cancel := context.WithCancel(context.Background())
+	var secondAccessed atomic.Bool
+	probes := []sdktrace.ReadOnlySpan{
+		planningProbeSpan{ReadOnlySpan: spans[0], cancel: cancel},
+		planningProbeSpan{ReadOnlySpan: spans[1], accessed: &secondAccessed},
+	}
+	store := internalmedia.NewStore(internalmedia.UploadLimit, internalmedia.MaxPendingItems)
+	defer store.Close()
+	internalmedia.RegisterSpan(spans[1].SpanContext(), store)
+	if _, reason := internalmedia.Stage(spans[1].SpanContext(), []byte("pending media"), "image/png"); reason != "" {
+		t.Fatal(reason)
+	}
+	diagnostics := &deliveryDiagnostics{}
+	sink := &batchRecordingExporter{}
+	byteLimited, err := newByteLimitedExporter(sink, defaultMaxExportBytes, diagnostics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exporter := &normalizingExporter{next: byteLimited, mapper: attrs.Default(), delivery: diagnostics}
+	err = exporter.ExportSpans(ctx, probes)
+	var failure *uploadFailure
+	if !errors.As(err, &failure) || failure.reasonCode != "cancelled" || failure.retryable {
+		t.Fatalf("normalization cancellation = %#v, want non-retryable cancelled failure", err)
+	}
+	if secondAccessed.Load() {
+		t.Fatal("normalizer accessed a later span after cancellation")
+	}
+	if len(sink.batches) != 0 {
+		t.Fatal("cancelled normalization reached the ordinary exporter")
+	}
+	if got := diagnostics.snapshot().SpanExportFailures; got != 2 {
+		t.Fatalf("export failures = %d, want all 2 unsent spans", got)
+	}
+	if items, retained := store.Snapshot(); items != 0 || retained != 0 {
+		t.Fatalf("cancelled normalization retained media = %d items/%d bytes", items, retained)
 	}
 }
