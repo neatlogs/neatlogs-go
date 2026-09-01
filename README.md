@@ -136,6 +136,7 @@ delays your agent code.
 | `Tags`         | —                  | Attached to every span (optional). |
 | `SampleRate`   | —                  | Optional pointer to a trace sampling rate in `[0, 1]`; nil keeps every trace. The root decision is inherited by all descendants. |
 | `Mask`         | —                  | Context-aware local transform applied to a cloned, normalized span on the export worker. An error or nil result drops that span; unmasked content is never sent. |
+| `EnableUploads` | `NEATLOGS_UPLOADS_ENABLED` | Opt in to the draft authenticated upload authority for large typed media and individually oversized OTLP spans. Defaults to `false` and requires the normal API key. |
 | `EnableSignalHandlers` | —           | Opt in to SDK-owned SIGINT/SIGTERM shutdown. Defaults to `false`; Neatlogs does not call `signal.Notify` unless enabled. Applies to `Init`, not `NewClient`. |
 
 `DisableSignalHandlers` remains as a deprecated source-compatibility field.
@@ -158,6 +159,15 @@ Standard OTLP/HTTP via
 the `neatlogs.*` namespace happens at the exporter boundary, so spans created
 through Neatlogs wrappers or an injected private tracer are translated before
 they leave the process.
+
+When uploads are explicitly enabled, large typed media and a complete masked
+span that exceeds the ordinary OTLP request limit use the authenticated
+`/v1/telemetry/uploads` prepare/PUT/complete flow. Only prepare and completion
+receive the project API key; the object PUT receives only its short-lived,
+object-scoped headers. Signed URLs and headers are discarded before telemetry
+export. Only a validated `ready` response counts as delivery. Disabled,
+pending, rejected, and failed uploads are reported through canonical failure
+references and delivery diagnostics rather than silently retaining a digest.
 
 ## Status
 

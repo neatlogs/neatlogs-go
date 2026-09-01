@@ -59,19 +59,73 @@ func TestByteLimitedExporterSplitsOnEncodedProtobufUpperBound(t *testing.T) {
 	}
 }
 
-func TestByteLimitedExporterForwardsOneOversizedSpanIntact(t *testing.T) {
+func TestByteLimitedExporterRejectsOversizedSpanWhenUploadsAreDisabled(t *testing.T) {
 	spans := sizedTestSpans(1, 16_384)
 	sink := &batchRecordingExporter{}
-	exporter, err := newByteLimitedExporter(sink, 128, nil)
+	diagnostics := &deliveryDiagnostics{}
+	exporter, err := newByteLimitedExporter(sink, 128, diagnostics)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := exporter.ExportSpans(context.Background(), spans); err == nil {
+		t.Fatal("oversized export unexpectedly succeeded without upload authority")
+	}
+	if len(sink.batches) != 0 {
+		t.Fatal("oversized span reached ordinary OTLP delegate")
+	}
+	snapshot := diagnostics.snapshot()
+	if snapshot.OTLPOverflowUnavailable != 1 || snapshot.OTLPOverflowFailures != 1 || snapshot.SpanExportFailures != 1 {
+		t.Fatalf("overflow diagnostics = %#v", snapshot)
+	}
+}
+
+type recordingUploadAuthority struct {
+	payloads []uploadPayload
+	receipt  uploadReceipt
+	err      error
+}
+
+func (a *recordingUploadAuthority) Upload(_ context.Context, payload uploadPayload) (uploadReceipt, error) {
+	a.payloads = append(a.payloads, payload)
+	return a.receipt, a.err
+}
+
+func readyUploadReceipt() uploadReceipt {
+	return uploadReceipt{
+		UploadID: "0198f1ea-70ce-7c6d-8bbc-b08a19c58280", State: "ready",
+		Reference: uploadReference{ID: "0198f1ea-70ce-7c6d-8bbc-b08a19c58280", State: "ready"},
+	}
+}
+
+func TestByteLimitedExporterUploadsCompleteOversizedSpanWithoutDuplicateSend(t *testing.T) {
+	spans := sizedTestSpans(1, 16_384)
+	sink := &batchRecordingExporter{}
+	diagnostics := &deliveryDiagnostics{}
+	authority := &recordingUploadAuthority{receipt: readyUploadReceipt()}
+	exporter, err := newByteLimitedExporter(sink, 128, diagnostics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exporter.uploads = authority
 	if err := exporter.ExportSpans(context.Background(), spans); err != nil {
 		t.Fatal(err)
 	}
-	if len(sink.batches) != 1 || len(sink.batches[0]) != 1 ||
-		sink.batches[0][0].SpanContext().SpanID() != spans[0].SpanContext().SpanID() {
-		t.Fatal("oversized span was not forwarded intact")
+	if len(sink.batches) != 0 {
+		t.Fatal("uploaded overflow was also sent through ordinary OTLP")
+	}
+	if len(authority.payloads) != 1 {
+		t.Fatalf("upload calls = %d, want 1", len(authority.payloads))
+	}
+	payload := authority.payloads[0]
+	if payload.Purpose != uploadPurposeOTLPOverflow || payload.PayloadSchema != uploadSchemaTracesV1 ||
+		payload.MIMEType != "application/x-protobuf" || payload.ContentEncoding != uploadEncodingIdentity {
+		t.Fatalf("overflow payload metadata = %#v", payload)
+	}
+	if len(payload.Content) != encodedSpanUpperBound(spans[0]) {
+		t.Fatalf("complete envelope bytes = %d, want %d", len(payload.Content), encodedSpanUpperBound(spans[0]))
+	}
+	if diagnostics.snapshot().OTLPOverflowUploads != 1 {
+		t.Fatalf("overflow diagnostics = %#v", diagnostics.snapshot())
 	}
 }
 
