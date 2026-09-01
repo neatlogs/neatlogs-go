@@ -251,11 +251,46 @@ func TestConcurrentInitHasSingleRunningOwner(t *testing.T) {
 			shutdown = result.shutdown
 		}
 	}
-	if successes != 1 {
-		t.Fatalf("successful concurrent Init calls = %d, want 1", successes)
+	if successes != callers {
+		t.Fatalf("successful identical concurrent Init calls = %d, want %d", successes, callers)
 	}
 	if err := shutdown(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestConflictingInitRequiresShutdown(t *testing.T) {
+	ctx := context.Background()
+	shutdown, err := Init(ctx, Config{DisableExport: true, WorkflowName: "first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Init(ctx, Config{DisableExport: true, WorkflowName: "second"}); err == nil ||
+		!strings.Contains(err.Error(), "different configuration") {
+		t.Fatalf("conflicting Init error = %v", err)
+	}
+	if err := shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRepeatedInitWithCapturedMaskAlwaysConflicts(t *testing.T) {
+	ctx := context.Background()
+	makeMask := func(replacement string) MaskFunc {
+		return func(_ context.Context, data SpanData) (*SpanData, error) {
+			data.Name = replacement
+			return &data, nil
+		}
+	}
+	shutdown, err := Init(ctx, Config{DisableExport: true, Mask: makeMask("tenant-a")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdown(ctx)
+
+	if _, err := Init(ctx, Config{DisableExport: true, Mask: makeMask("tenant-b")}); err == nil ||
+		!strings.Contains(err.Error(), "different configuration") {
+		t.Fatalf("repeated Init with captured mask error = %v", err)
 	}
 }
 

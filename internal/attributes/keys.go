@@ -54,9 +54,9 @@ const (
 
 	StreamChunkEvent    = "neatlogs.stream.chunk"
 	StreamChunkIndex    = "neatlogs.stream.chunk.index"
-	StreamChunkValue    = "neatlogs.stream.chunk.value"
-	StreamChunkMIMEType = "neatlogs.stream.chunk.mime_type"
+	StreamChunkSummary  = "neatlogs.stream.chunk.summary"
 	StreamChunkCount    = "neatlogs.stream.chunk_count"
+	StreamEventsDropped = "neatlogs.stream.events_dropped"
 	StreamCancelled     = "neatlogs.stream.cancelled"
 )
 
@@ -114,6 +114,7 @@ const (
 	LLMOutputMessagePrefix = "neatlogs.llm.output_messages."
 	LLMToolCallPrefix      = "neatlogs.llm.tool_calls."
 	LLMToolPrefix          = "neatlogs.llm.tools."
+	LLMToolsTruncated      = "neatlogs.llm.tools_truncated_count"
 )
 
 // Span-kind values (lowercase normalized forms; full vocabulary in the JSON).

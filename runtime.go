@@ -34,19 +34,21 @@ type sdkRuntime struct {
 	tracer       trace.Tracer
 	lifecycle    *activeSpanRegistry
 	workflowName string
+	delivery     *deliveryDiagnostics
 
 	done        chan struct{}
 	shutdownErr error
 	signals     *shutdownSignalController
 }
 
-func newSDKRuntime(tp *sdktrace.TracerProvider, lifecycle *activeSpanRegistry, workflowName string) *sdkRuntime {
+func newSDKRuntime(tp *sdktrace.TracerProvider, lifecycle *activeSpanRegistry, workflowName string, delivery *deliveryDiagnostics) *sdkRuntime {
 	return &sdkRuntime{
 		state:        stateRunning,
 		provider:     tp,
 		tracer:       tp.Tracer(tracerName, trace.WithInstrumentationVersion(Version)),
 		lifecycle:    lifecycle,
 		workflowName: workflowName,
+		delivery:     delivery,
 		done:         make(chan struct{}),
 	}
 }

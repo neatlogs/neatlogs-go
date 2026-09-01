@@ -3,7 +3,10 @@ package neatlogs
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
@@ -90,6 +93,75 @@ func TestMaskFailureAndNilResultFailClosed(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestMaskPanicFailsClosed(t *testing.T) {
+	masked, err := callMaskSafely(func(context.Context, SpanData) (*SpanData, error) {
+		panic("secret")
+	}, context.Background(), SpanData{})
+	if err == nil || masked != nil {
+		t.Fatalf("panic result = %#v, %v; want nil and error", masked, err)
+	}
+}
+
+func TestMaskBatchHonorsCallerDeadlineWhenCallbackDoesNot(t *testing.T) {
+	block := make(chan struct{})
+	exporter := &normalizingExporter{mask: func(context.Context, SpanData) (*SpanData, error) {
+		<-block
+		value := SpanData{}
+		return &value, nil
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	results := exporter.maskBatch(ctx, []spanStub{{}})
+	close(block)
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("mask deadline returned after %v", elapsed)
+	}
+	if results[0] != nil {
+		t.Fatalf("timed-out mask returned %#v, want nil", results[0])
+	}
+}
+
+func TestMaskBatchRemainsSerialAcrossConcurrentExports(t *testing.T) {
+	var active atomic.Int32
+	var maximum atomic.Int32
+	release := make(chan struct{})
+	started := make(chan struct{}, 2)
+	exporter := &normalizingExporter{mask: func(_ context.Context, data SpanData) (*SpanData, error) {
+		current := active.Add(1)
+		defer active.Add(-1)
+		for {
+			observed := maximum.Load()
+			if current <= observed || maximum.CompareAndSwap(observed, current) {
+				break
+			}
+		}
+		started <- struct{}{}
+		<-release
+		return &data, nil
+	}}
+
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			exporter.maskBatch(context.Background(), []spanStub{{}})
+		}()
+	}
+	<-started
+	select {
+	case <-started:
+		t.Fatal("second mask callback started before the first completed")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(release)
+	wg.Wait()
+	if got := maximum.Load(); got != 1 {
+		t.Fatalf("maximum concurrent mask callbacks = %d, want 1", got)
 	}
 }
 

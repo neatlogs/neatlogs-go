@@ -74,6 +74,14 @@ func (c *Client) Flush(ctx context.Context) error {
 	return c.runtime.forceFlush(ctx)
 }
 
+// DeliveryDiagnostics snapshots loss counters for this Client only.
+func (c *Client) DeliveryDiagnostics() DeliveryDiagnosticsSnapshot {
+	if c == nil || c.runtime == nil {
+		return DeliveryDiagnosticsSnapshot{}
+	}
+	return c.runtime.delivery.snapshot()
+}
+
 // Shutdown closes this Client's active spans child-first and shuts down only
 // its provider/exporter. It is safe to call concurrently and repeatedly.
 func (c *Client) Shutdown(ctx context.Context) error {
