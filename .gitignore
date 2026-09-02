@@ -32,3 +32,6 @@ spans_optimized.log
 .DS_Store
 .idea/
 .vscode/
+
+# Local agent / knowledge tooling — never committed.
+.claude/
