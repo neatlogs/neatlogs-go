@@ -29,6 +29,7 @@ import (
 
 	neatlogs "github.com/neatlogs/neatlogs-go"
 	attrs "github.com/neatlogs/neatlogs-go/internal/attributes"
+	internalmedia "github.com/neatlogs/neatlogs-go/internal/media"
 )
 
 // Provider/system identifiers, matching the TS SDK: the Vertex AI backend is
@@ -114,7 +115,7 @@ func (g *GenAIModels) GenerateContentStream(ctx context.Context, model string, c
 		}
 		seq := stream(ctx, model, contents, config)
 		var (
-			acc       = newResponseAccumulator()
+			acc       = newResponseAccumulator(span)
 			sawError  bool
 			cancelled bool
 			ended     bool
@@ -302,7 +303,10 @@ func setInvocationParams(span trace.Span, config *genai.GenerateContentConfig) {
 	}
 }
 
-const maxCapturedToolDefinitions = 8
+const (
+	maxCapturedToolDefinitions = 8
+	maxCapturedMediaReferences = 8
+)
 
 type capturedToolDefinition struct {
 	toolType          string
@@ -707,7 +711,7 @@ func finalizeResponse(span trace.Span, resp *genai.GenerateContentResponse) {
 		span.SetStatus(codes.Ok, "")
 		return
 	}
-	acc := newResponseAccumulator()
+	acc := newResponseAccumulator(span)
 	acc.add(resp)
 	acc.apply(span)
 	span.SetStatus(codes.Ok, "")
@@ -735,13 +739,19 @@ type accumulatedChoice struct {
 
 type responseAccumulator struct {
 	choices    map[int]*accumulatedChoice
+	span       trace.Span
 	usage      *genai.GenerateContentResponseUsageMetadata
 	responseID string
 	chunkCount int
+	mediaCount int
 }
 
-func newResponseAccumulator() *responseAccumulator {
-	return &responseAccumulator{choices: make(map[int]*accumulatedChoice)}
+func newResponseAccumulator(spans ...trace.Span) *responseAccumulator {
+	var span trace.Span
+	if len(spans) > 0 {
+		span = spans[0]
+	}
+	return &responseAccumulator{choices: make(map[int]*accumulatedChoice), span: span}
 }
 
 func (a *responseAccumulator) add(resp *genai.GenerateContentResponse) {
@@ -778,7 +788,13 @@ func (a *responseAccumulator) add(resp *genai.GenerateContentResponse) {
 					continue
 				}
 				for _, media := range partMedia(part, "output") {
-					choice.media[media.key()] = media
+					key := media.key()
+					if _, exists := choice.media[key]; exists || a.mediaCount >= maxCapturedMediaReferences {
+						continue
+					}
+					stageCapturedMedia(a.span, &media)
+					a.mediaCount++
+					choice.media[key] = media
 				}
 				switch {
 				case part.Thought && part.Text != "":
@@ -1355,19 +1371,41 @@ func contentText(c *genai.Content) string {
 	if hasText {
 		return text
 	}
-	return mustJSON(c.Parts)
+	// Provider parts can contain raw inline bytes or signed remote locators.
+	// Canonical media attributes carry those values; the generic content field
+	// receives only a sanitized structural clone so it cannot duplicate them.
+	safeParts := make([]*genai.Part, 0, len(c.Parts))
+	for _, part := range c.Parts {
+		if part == nil {
+			continue
+		}
+		clone := *part
+		if part.InlineData != nil && len(part.InlineData.Data) > internalmedia.InlineLimit {
+			clone.InlineData = nil
+		}
+		if part.FileData != nil {
+			file := *part.FileData
+			file.FileURI = sanitizedMediaReference(file.FileURI)
+			clone.FileData = &file
+		}
+		safeParts = append(safeParts, &clone)
+	}
+	return mustJSON(safeParts)
 }
 
 type capturedMedia struct {
-	id         string
-	kind       string
-	source     string
-	mimeType   string
-	byteLength int
-	sha256     string
-	reference  string
-	purpose    string
-	state      string
+	id          string
+	kind        string
+	source      string
+	mimeType    string
+	byteLength  int
+	sha256      string
+	reference   string
+	purpose     string
+	state       string
+	safePreview string
+	payload     []byte
+	uploadToken string
 }
 
 func (m capturedMedia) key() string { return m.sha256 + ":" + m.reference + ":" + m.kind }
@@ -1387,6 +1425,18 @@ func mediaKind(mimeType string) string {
 	}
 }
 
+func canonicalMediaMIME(mimeType string) string {
+	mimeType = strings.ToLower(strings.TrimSpace(strings.SplitN(mimeType, ";", 2)[0]))
+	switch mimeType {
+	case "image/jpg":
+		return "image/jpeg"
+	case "audio/mp3":
+		return "audio/mpeg"
+	default:
+		return mimeType
+	}
+}
+
 func partMedia(part *genai.Part, purpose string) []capturedMedia {
 	if part == nil {
 		return nil
@@ -1394,21 +1444,39 @@ func partMedia(part *genai.Part, purpose string) []capturedMedia {
 	media := make([]capturedMedia, 0, 2)
 	if part.InlineData != nil {
 		digest := sha256.Sum256(part.InlineData.Data)
-		media = append(media, capturedMedia{
-			id: fmt.Sprintf("nl_media_%x", digest[:12]), kind: mediaKind(part.InlineData.MIMEType),
-			source: "inline", mimeType: part.InlineData.MIMEType, byteLength: len(part.InlineData.Data),
+		mimeType := canonicalMediaMIME(part.InlineData.MIMEType)
+		captured := capturedMedia{
+			id: fmt.Sprintf("nl_media_%x", digest[:12]), kind: mediaKind(mimeType),
+			source: "inline", mimeType: mimeType, byteLength: len(part.InlineData.Data),
 			sha256: fmt.Sprintf("%x", digest), purpose: purpose, state: "inline",
-		})
+		}
+		if captured.mimeType == "" {
+			captured.mimeType = "application/octet-stream"
+		}
+		switch {
+		case len(part.InlineData.Data) > internalmedia.UploadLimit:
+			captured.state = "failed"
+			captured.safePreview = "upload failed: payload_too_large"
+		case len(part.InlineData.Data) > internalmedia.InlineLimit:
+			captured.state = "pending-upload"
+			captured.payload = part.InlineData.Data
+		}
+		media = append(media, captured)
 	}
 	if part.FileData != nil && part.FileData.FileURI != "" {
-		digest := sha256.Sum256([]byte(part.FileData.FileURI))
+		reference := sanitizedMediaReference(part.FileData.FileURI)
+		digest := sha256.Sum256([]byte(reference))
 		source := "provider"
+		mimeType := canonicalMediaMIME(part.FileData.MIMEType)
+		if mimeType == "" {
+			mimeType = "application/octet-stream"
+		}
 		if strings.HasPrefix(part.FileData.FileURI, "http://") || strings.HasPrefix(part.FileData.FileURI, "https://") {
 			source = "url"
 		}
 		media = append(media, capturedMedia{
-			id: fmt.Sprintf("nl_media_%x", digest[:12]), kind: mediaKind(part.FileData.MIMEType),
-			source: source, mimeType: part.FileData.MIMEType, reference: part.FileData.FileURI,
+			id: fmt.Sprintf("nl_media_%x", digest[:12]), kind: mediaKind(mimeType),
+			source: source, mimeType: mimeType, reference: reference,
 			purpose: purpose, state: "available",
 		})
 	}
@@ -1423,22 +1491,45 @@ func setContentMedia(span trace.Span, prefix string, content *genai.Content, pur
 	seen := make(map[string]struct{})
 	for _, part := range content.Parts {
 		for _, media := range partMedia(part, purpose) {
+			if index >= maxCapturedMediaReferences {
+				return
+			}
 			if _, exists := seen[media.key()]; exists {
 				continue
 			}
 			seen[media.key()] = struct{}{}
+			stageCapturedMedia(span, &media)
 			setMediaAttributes(span, fmt.Sprintf("%s.media.%d.", prefix, index), media)
 			index++
 		}
 	}
 }
 
+func stageCapturedMedia(span trace.Span, media *capturedMedia) {
+	if span == nil || media == nil || media.state != "pending-upload" || len(media.payload) == 0 {
+		return
+	}
+	pending, reason := internalmedia.Stage(span.SpanContext(), media.payload, media.mimeType)
+	media.payload = nil
+	if reason != "" {
+		media.state = "failed"
+		media.safePreview = "upload failed: " + reason
+		return
+	}
+	media.uploadToken = pending.Token
+	media.sha256 = pending.SHA256
+	media.byteLength = pending.ByteLength
+	media.mimeType = pending.MIMEType
+	media.safePreview = "awaiting authenticated upload"
+}
+
 func setMediaAttributes(span trace.Span, prefix string, media capturedMedia) {
-	values := []attribute.KeyValue{
+	values := make([]attribute.KeyValue, 0, 10)
+	values = append(values,
 		attribute.String(prefix+"id", media.id), attribute.String(prefix+"type", media.kind),
 		attribute.String(prefix+"source", media.source), attribute.String(prefix+"mime_type", media.mimeType),
 		attribute.String(prefix+"purpose", media.purpose), attribute.String(prefix+"state", media.state),
-	}
+	)
 	if media.byteLength > 0 {
 		values = append(values, attribute.Int(prefix+"byte_length", media.byteLength))
 	}
@@ -1448,7 +1539,34 @@ func setMediaAttributes(span trace.Span, prefix string, media capturedMedia) {
 	if media.reference != "" {
 		values = append(values, attribute.String(prefix+"reference", media.reference))
 	}
+	if media.safePreview != "" {
+		values = append(values, attribute.String(prefix+"safe_preview", media.safePreview))
+	}
+	if media.uploadToken != "" {
+		// Append the opaque token last. If the OTel attribute limit drops it, the
+		// retained pending reference is turned into explicit failure metadata.
+		values = append(values, attribute.String(prefix+"upload_token", media.uploadToken))
+	}
 	span.SetAttributes(values...)
+}
+
+func sanitizedMediaReference(reference string) string {
+	parsed, err := url.Parse(reference)
+	if err != nil {
+		return ""
+	}
+	parsed.RawQuery = ""
+	parsed.ForceQuery = false
+	parsed.Fragment = ""
+	parsed.RawFragment = ""
+	if parsed.Host != "" {
+		parsed.User = nil
+		return parsed.String()
+	}
+	if parsed.IsAbs() && parsed.Opaque != "" {
+		return parsed.Scheme + ":"
+	}
+	return parsed.String()
 }
 
 // recordError marks the span as failed. It does NOT end the span; callers end

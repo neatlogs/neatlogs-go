@@ -6,8 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"iter"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -108,6 +112,10 @@ func TestTypedMediaPreservesInlineDigestAndFileReference(t *testing.T) {
 		{Text: "inspect both"},
 		{InlineData: &google.Blob{Data: raw, MIMEType: "image/png"}},
 		{FileData: &google.FileData{FileURI: "gs://bucket/report.pdf", MIMEType: "application/pdf"}},
+		{FileData: &google.FileData{
+			FileURI:  "https://user:password@bucket.example/private.png?X-Amz-Signature=secret#fragment",
+			MIMEType: "image/png",
+		}},
 	}}
 	_, span, end := neatlogs.StartProviderSpan(ctx, "media", attrs.KindLLM)
 	setInputMessages(span, []*google.Content{content}, nil)
@@ -132,6 +140,184 @@ func TestTypedMediaPreservesInlineDigestAndFileReference(t *testing.T) {
 	assertIntAttribute(t, got.Attributes, attrs.LLMInputMessagePrefix+"0.media.0.byte_length", len(raw))
 	assertStringAttribute(t, got.Attributes, attrs.LLMInputMessagePrefix+"0.media.1.type", "document")
 	assertStringAttribute(t, got.Attributes, attrs.LLMInputMessagePrefix+"0.media.1.reference", "gs://bucket/report.pdf")
+	assertStringAttribute(t, got.Attributes, attrs.LLMInputMessagePrefix+"0.media.2.reference", "https://bucket.example/private.png")
+}
+
+func TestSanitizedMediaReferenceStripsAuthorityCredentialsAndOpaquePayloads(t *testing.T) {
+	tests := map[string]string{
+		"//user:password@bucket.example/private.png?signature=secret#fragment": "//bucket.example/private.png",
+		"data:image/png;base64,private-image-bytes":                            "data:",
+		"https://bucket.example/private%zz":                                    "",
+	}
+	for reference, want := range tests {
+		if got := sanitizedMediaReference(reference); got != want {
+			t.Errorf("sanitized reference %q = %q, want %q", reference, got, want)
+		}
+	}
+}
+
+func TestDisabledUploadsNeverPlaceLargeMediaBytesOrTokensOnSpan(t *testing.T) {
+	t.Setenv("NEATLOGS_UPLOADS_ENABLED", "false")
+	ctx := context.Background()
+	sink := tracetest.NewInMemoryExporter()
+	shutdown, err := neatlogs.Init(ctx, neatlogs.Config{WorkflowName: "media-disabled"}, neatlogs.WithExporter(sink))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdown(ctx)
+
+	raw := []byte(strings.Repeat("disabled-private-image", 6_000))
+	content := &google.Content{Role: "user", Parts: []*google.Part{{InlineData: &google.Blob{Data: raw, MIMEType: "image/png"}}}}
+	_, span, end := neatlogs.StartProviderSpan(ctx, "disabled-media", attrs.KindLLM)
+	setInputMessages(span, []*google.Content{content}, nil)
+	end()
+	if err := neatlogs.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range sink.GetSpans() {
+		if candidate.Name != "disabled-media" {
+			continue
+		}
+		prefix := attrs.LLMInputMessagePrefix + "0.media.0."
+		assertStringAttribute(t, candidate.Attributes, prefix+"state", "failed")
+		for _, value := range candidate.Attributes {
+			if value.Value.Type() == attribute.BYTESLICE || strings.HasSuffix(string(value.Key), ".upload_token") ||
+				strings.Contains(value.Value.Emit(), "disabled-private-image") {
+				t.Fatalf("disabled upload retained private media: %s", value.Key)
+			}
+		}
+		if snapshot := neatlogs.GetDeliveryDiagnostics(ctx); snapshot.TypedMediaUploadFailures != 1 {
+			t.Fatalf("disabled media diagnostics = %#v", snapshot)
+		}
+		return
+	}
+	t.Fatal("disabled media span not exported")
+}
+
+func TestLargeTypedMediaUploadsOutOfBandAfterMaskedCanonicalReference(t *testing.T) {
+	original := []byte(strings.Repeat("private-image", 8_000))
+	originalDigest := sha256.Sum256(original)
+	uploadID := "0198f1ea-70ce-7c6d-8bbc-b08a19c58280"
+	referenceID := uploadID
+	var uploaded []byte
+	var prepare map[string]any
+	var mu sync.Mutex
+	var server *httptest.Server
+	server = httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/v1/telemetry/uploads":
+			if request.Header.Get("x-api-key") != "project-key" {
+				t.Errorf("prepare auth = %q", request.Header.Get("x-api-key"))
+			}
+			var decoded map[string]any
+			if err := json.NewDecoder(request.Body).Decode(&decoded); err != nil {
+				t.Errorf("decode prepare: %v", err)
+			}
+			mu.Lock()
+			prepare = decoded
+			mu.Unlock()
+			response.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(response).Encode(map[string]any{
+				"upload_id": uploadID, "state": "prepared",
+				"expires_at": time.Now().Add(time.Minute).UTC().Format(time.RFC3339),
+				"upload": map[string]any{
+					"method": "PUT", "url": server.URL + "/object?signature=must-not-export",
+					"headers": map[string]string{"x-upload-secret": "must-not-export"},
+				},
+				"reference": map[string]any{
+					"id": referenceID, "purpose": "typed_media", "sha256": fmt.Sprintf("%x", originalDigest),
+					"byte_length": len(original), "mime_type": "image/png", "content_encoding": "identity", "state": "prepared",
+				},
+			})
+		case "/object":
+			if request.Header.Get("x-api-key") != "" {
+				t.Error("project API key leaked to object PUT")
+			}
+			body, err := io.ReadAll(request.Body)
+			if err != nil {
+				t.Errorf("read upload: %v", err)
+			}
+			mu.Lock()
+			uploaded = body
+			mu.Unlock()
+			response.WriteHeader(http.StatusNoContent)
+		case "/v1/telemetry/uploads/" + uploadID + "/complete":
+			_ = json.NewEncoder(response).Encode(map[string]any{
+				"upload_id": uploadID, "state": "ready",
+				"reference": map[string]any{
+					"id": referenceID, "purpose": "typed_media", "sha256": fmt.Sprintf("%x", originalDigest),
+					"byte_length": len(original), "mime_type": "image/png", "content_encoding": "identity", "state": "ready",
+				},
+			})
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer server.Close()
+	previousTransport := http.DefaultTransport
+	http.DefaultTransport = server.Client().Transport
+	defer func() { http.DefaultTransport = previousTransport }()
+
+	ctx := context.Background()
+	sink := tracetest.NewInMemoryExporter()
+	shutdown, err := neatlogs.Init(ctx, neatlogs.Config{
+		APIKey: "project-key", Endpoint: server.URL, WorkflowName: "media-upload-test", EnableUploads: true,
+		Mask: func(_ context.Context, data neatlogs.SpanData) (*neatlogs.SpanData, error) {
+			for _, value := range data.Attributes {
+				if value.Value.Type() == attribute.BYTESLICE || strings.Contains(value.Value.Emit(), "private-image") {
+					return nil, errors.New("raw media crossed mask boundary")
+				}
+			}
+			return &data, nil
+		},
+	}, neatlogs.WithExporter(sink))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdown(ctx)
+
+	content := &google.Content{Role: "user", Parts: []*google.Part{{InlineData: &google.Blob{Data: original, MIMEType: "image/png"}}}}
+	_, span, end := neatlogs.StartProviderSpan(ctx, "large-media", attrs.KindLLM)
+	setInputMessages(span, []*google.Content{content}, nil)
+	end()
+	if err := neatlogs.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	gotUploaded := append([]byte(nil), uploaded...)
+	gotPrepare := make(map[string]any, len(prepare))
+	for key, value := range prepare {
+		gotPrepare[key] = value
+	}
+	mu.Unlock()
+	if string(gotUploaded) != string(original) {
+		t.Fatalf("uploaded bytes changed: got=%d want=%d", len(gotUploaded), len(original))
+	}
+	if gotPrepare["purpose"] != "typed_media" || gotPrepare["sha256"] != fmt.Sprintf("%x", originalDigest) || gotPrepare["payload_schema"] != "neatlogs.media.v1" {
+		t.Fatalf("prepare metadata = %#v", gotPrepare)
+	}
+	var got *tracetest.SpanStub
+	for _, candidate := range sink.GetSpans() {
+		if candidate.Name == "large-media" {
+			copy := candidate
+			got = &copy
+		}
+	}
+	if got == nil {
+		t.Fatal("large media span not exported")
+	}
+	prefix := attrs.LLMInputMessagePrefix + "0.media.0."
+	assertStringAttribute(t, got.Attributes, prefix+"id", referenceID)
+	assertStringAttribute(t, got.Attributes, prefix+"source", "uploaded")
+	assertStringAttribute(t, got.Attributes, prefix+"state", "available")
+	for _, value := range got.Attributes {
+		rendered := value.Value.Emit()
+		if strings.HasSuffix(string(value.Key), ".upload_token") ||
+			strings.Contains(rendered, "must-not-export") || strings.Contains(rendered, "private-image") ||
+			strings.Contains(rendered, "nl_pending_media_") {
+			t.Fatalf("telemetry leaked private upload material: %s=%s", value.Key, rendered)
+		}
+	}
 }
 
 func TestMissingToolCallIDGetsStableExplicitlyMarkedIdentity(t *testing.T) {
