@@ -3,9 +3,12 @@ package neatlogs
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +19,12 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
 )
+
+type doctorRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn doctorRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
+}
 
 func TestDoctorV2CapturesFinalEnvelope(t *testing.T) {
 	ctx := context.Background()
@@ -383,10 +392,19 @@ func TestDoctorProbeReadsExactTraceWithoutDiagnosticSession(t *testing.T) {
 		if r.Header.Get("x-api-key") != "local-key" {
 			t.Error("missing auth")
 		}
+		if r.Header.Get("x-neatlogs-doctor") != "v1" {
+			t.Error("missing Doctor marker")
+		}
 		if r.Method != http.MethodGet || r.URL.Path != "/api/traces/v3/11111111111111111111111111111111" {
 			t.Fatalf("unexpected Doctor request: %s %s", r.Method, r.URL.Path)
 		}
-		_ = json.NewEncoder(w).Encode(doctorV3MaterializedTraceFixture())
+		fixture := doctorV3MaterializedTraceFixture()
+		fixture["ingestionDiagnostics"] = map[string]any{
+			"protocolVersion": "v1", "state": "succeeded", "currentStage": "finalized",
+			"lastSuccessfulStage": "finalized", "retryable": false,
+			"stages": []any{map[string]any{"lastObservedAt": "must-not-survive"}},
+		}
+		_ = json.NewEncoder(w).Encode(fixture)
 	}))
 	defer server.Close()
 	root := "2222222222222222"
@@ -399,6 +417,22 @@ func TestDoctorProbeReadsExactTraceWithoutDiagnosticSession(t *testing.T) {
 	}
 	if requests != 1 {
 		t.Fatalf("requests = %d, want one exact trace GET", requests)
+	}
+	var details map[string]any
+	for _, check := range result.Checks {
+		if check.Name == "probe_finalization" {
+			details = check.Details
+		}
+	}
+	if !reflect.DeepEqual(details, map[string]any{
+		"ingestion_state": "succeeded", "current_stage": "finalized",
+		"last_successful_stage": "finalized", "retryable": false,
+	}) {
+		t.Fatalf("safe stage details = %#v", details)
+	}
+	encoded, _ := json.Marshal(result)
+	if strings.Contains(string(encoded), "must-not-survive") {
+		t.Fatalf("raw diagnostics escaped into result: %s", encoded)
 	}
 }
 
@@ -477,17 +511,230 @@ func TestDoctorProbeRejectsWrongEdgesExtrasAndIncompleteMetadata(t *testing.T) {
 }
 
 func TestDoctorProbePendingTraceNeverPasses(t *testing.T) {
+	for _, status := range []int{http.StatusAccepted, http.StatusNotFound} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(status)
+				_, _ = w.Write([]byte(`{"message":"must-not-survive","ingestionDiagnostics":{"protocolVersion":"v1","state":"processing","currentStage":"raw_durable","lastSuccessfulStage":"raw_durable","retryable":false,"stages":[{"firstObservedAt":"must-not-survive"}]}}`))
+			}))
+			defer server.Close()
+			root := "2222222222222222"
+			local := newDoctorV2Result("local")
+			local.Capture = &DoctorV2Capture{TraceID: "11111111111111111111111111111111", RootSpanID: &root, SpanCount: 4, SemanticDigest: "sha256:" + strings.Repeat("a", 64)}
+			local.Checks = []DoctorV2Check{{Name: "local_envelope", Status: DoctorPass, ReasonCode: "LOCAL_ENVELOPE_VALID", Message: "valid", RemediationCode: "NONE"}}
+			result := DoctorProbeV2(context.Background(), local, DoctorProbeOptions{Endpoint: server.URL, APIKey: "local-key", Timeout: 10 * time.Millisecond, PollInterval: time.Millisecond})
+			if result.Status != DoctorFail || result.FirstFailure == nil || *result.FirstFailure != "BACKEND_PROBE_UNAVAILABLE" {
+				t.Fatalf("pending trace falsely passed: %#v", result)
+			}
+			if !reflect.DeepEqual(result.Checks[len(result.Checks)-1].Details, map[string]any{
+				"ingestion_state": "processing", "current_stage": "raw_durable",
+				"last_successful_stage": "raw_durable", "retryable": false,
+			}) {
+				t.Fatalf("pending stage details = %#v", result.Checks[len(result.Checks)-1].Details)
+			}
+		})
+	}
+}
+
+func TestDoctorProbeRefusesCrossOriginRedirectWithoutForwardingCredentials(t *testing.T) {
+	targetRequests := 0
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetRequests++
+		if r.Header.Get("x-api-key") != "" {
+			t.Error("project key crossed origin boundary")
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/collect", http.StatusFound)
+	}))
+	defer origin.Close()
+	root := "2222222222222222"
+	local := newDoctorV2Result("local")
+	local.Capture = &DoctorV2Capture{TraceID: "11111111111111111111111111111111", RootSpanID: &root, SpanCount: 4, SemanticDigest: "sha256:" + strings.Repeat("a", 64)}
+	local.Checks = []DoctorV2Check{{Name: "local_envelope", Status: DoctorPass, ReasonCode: "LOCAL_ENVELOPE_VALID", RemediationCode: "NONE"}}
+	result := DoctorProbeV2(context.Background(), local, DoctorProbeOptions{Endpoint: origin.URL, APIKey: "local-key", Timeout: time.Second})
+	if targetRequests != 0 || result.FirstFailure == nil || *result.FirstFailure != "BACKEND_PROBE_UNAVAILABLE" {
+		t.Fatalf("redirect result = %#v, target requests = %d", result, targetRequests)
+	}
+}
+
+func TestDoctorProbeCapsAllReadbackStatusBodies(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusAccepted, http.StatusConflict} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(status)
+				_, _ = w.Write([]byte(`{"ingestionDiagnostics":{"protocolVersion":"v1","state":"processing","currentStage":"raw_durable","retryable":false},"padding":"` + strings.Repeat("x", maxDoctorReadbackBytes+1) + `"}`))
+			}))
+			defer server.Close()
+			root := "2222222222222222"
+			local := newDoctorV2Result("local")
+			local.Capture = &DoctorV2Capture{TraceID: "11111111111111111111111111111111", RootSpanID: &root, SpanCount: 4, SemanticDigest: "sha256:" + strings.Repeat("a", 64)}
+			local.Checks = []DoctorV2Check{{Name: "local_envelope", Status: DoctorPass, ReasonCode: "LOCAL_ENVELOPE_VALID", RemediationCode: "NONE"}}
+			result := DoctorProbeV2(context.Background(), local, DoctorProbeOptions{Endpoint: server.URL, APIKey: "local-key", Timeout: 10 * time.Millisecond, PollInterval: time.Millisecond})
+			if result.FirstFailure == nil || *result.FirstFailure != "BACKEND_PROBE_UNAVAILABLE" {
+				t.Fatalf("oversized status %d result = %#v", status, result)
+			}
+			for _, check := range result.Checks {
+				if check.Details != nil {
+					t.Fatalf("oversized response exposed details: %#v", check)
+				}
+			}
+		})
+	}
+}
+
+func TestDoctorProbeSuccessUsesOnlyFinalResponseDiagnostics(t *testing.T) {
+	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusAccepted)
+		requests++
+		if requests == 1 {
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{"ingestionDiagnostics": map[string]any{
+				"protocolVersion": "v1", "state": "processing", "currentStage": "raw_durable",
+				"lastSuccessfulStage": "raw_durable", "retryable": false,
+			}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(doctorV3MaterializedTraceFixture())
+	}))
+	defer server.Close()
+	root := "2222222222222222"
+	local := newDoctorV2Result("local")
+	local.Capture = &DoctorV2Capture{TraceID: "11111111111111111111111111111111", RootSpanID: &root, SpanCount: 4, SemanticDigest: "sha256:" + strings.Repeat("a", 64)}
+	local.Checks = []DoctorV2Check{{Name: "local_envelope", Status: DoctorPass, ReasonCode: "LOCAL_ENVELOPE_VALID", RemediationCode: "NONE"}}
+	result := DoctorProbeV2(context.Background(), local, DoctorProbeOptions{Endpoint: server.URL, APIKey: "local-key", Timeout: time.Second, PollInterval: time.Millisecond})
+	if result.Status != DoctorPass {
+		t.Fatalf("final response failed: %#v", result)
+	}
+	for _, check := range result.Checks {
+		if check.Details != nil {
+			t.Fatalf("stale diagnostics escaped into success: %#v", check)
+		}
+	}
+}
+
+func TestDoctorProbeRetainsDiagnosticsOnlyOnNetworkAndServerFailures(t *testing.T) {
+	for _, terminal := range []string{"network", "server", "auth", "redirect", "client"} {
+		t.Run(terminal, func(t *testing.T) {
+			requests := 0
+			client := &http.Client{Transport: doctorRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+				requests++
+				if requests == 1 {
+					body := `{"ingestionDiagnostics":{"protocolVersion":"v1","state":"processing","currentStage":"pii_dispatch","lastSuccessfulStage":"kafka_published","retryable":false}}`
+					return &http.Response{StatusCode: http.StatusAccepted, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+				}
+				if terminal == "network" {
+					return nil, errors.New("network unavailable")
+				}
+				status := http.StatusServiceUnavailable
+				switch terminal {
+				case "auth":
+					status = http.StatusForbidden
+				case "redirect":
+					status = http.StatusFound
+				case "client":
+					status = http.StatusTeapot
+				}
+				return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+			})}
+			root := "2222222222222222"
+			local := newDoctorV2Result("local")
+			local.Capture = &DoctorV2Capture{TraceID: "11111111111111111111111111111111", RootSpanID: &root, SpanCount: 4, SemanticDigest: "sha256:" + strings.Repeat("a", 64)}
+			local.Checks = []DoctorV2Check{{Name: "local_envelope", Status: DoctorPass, ReasonCode: "LOCAL_ENVELOPE_VALID", RemediationCode: "NONE"}}
+			result := DoctorProbeV2(context.Background(), local, DoctorProbeOptions{Endpoint: "http://localhost:4100", APIKey: "local-key", Timeout: time.Second, PollInterval: time.Millisecond, HTTPClient: client})
+			failure := result.Checks[len(result.Checks)-1]
+			if terminal != "network" && terminal != "server" {
+				if failure.Details != nil {
+					t.Fatalf("%s failure exposed stale diagnostics: %#v", terminal, failure)
+				}
+				return
+			}
+			want := map[string]any{"ingestion_state": "processing", "current_stage": "pii_dispatch", "last_successful_stage": "kafka_published", "retryable": false}
+			if !reflect.DeepEqual(failure.Details, want) {
+				t.Fatalf("%s details = %#v", terminal, failure.Details)
+			}
+		})
+	}
+}
+
+func TestDoctorProbeDoesNotRetainStaleDetailsForMalformedTerminalReceipt(t *testing.T) {
+	requests := 0
+	client := &http.Client{Transport: doctorRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requests++
+		body := `{"ingestionDiagnostics":{"protocolVersion":"v1","state":"processing","currentStage":"raw_durable","retryable":false}}`
+		status := http.StatusAccepted
+		if requests == 2 {
+			body = `{"ingestionDiagnostics":{"protocolVersion":"v2"}}`
+			status = http.StatusConflict
+		}
+		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}
+	root := "2222222222222222"
+	local := newDoctorV2Result("local")
+	local.Capture = &DoctorV2Capture{TraceID: "11111111111111111111111111111111", RootSpanID: &root, SpanCount: 4, SemanticDigest: "sha256:" + strings.Repeat("a", 64)}
+	local.Checks = []DoctorV2Check{{Name: "local_envelope", Status: DoctorPass, ReasonCode: "LOCAL_ENVELOPE_VALID", RemediationCode: "NONE"}}
+	result := DoctorProbeV2(context.Background(), local, DoctorProbeOptions{Endpoint: "http://localhost:4100", APIKey: "local-key", Timeout: time.Second, PollInterval: time.Millisecond, HTTPClient: client})
+	failure := result.Checks[len(result.Checks)-1]
+	if failure.Details != nil {
+		t.Fatalf("malformed terminal receipt exposed stale diagnostics: %#v", failure)
+	}
+}
+
+func TestDoctorProbeStopsOnTerminalStageReceiptWithSafeDetails(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"message":"database leaked a secret","projectId":"must-not-survive","ingestionDiagnostics":{"protocolVersion":"v1","state":"failed","currentStage":"pii_redaction","lastSuccessfulStage":"pii_dispatch","failedStage":"pii_redaction","failureCode":"PII_REDACTION_FAILED","retryable":true,"stages":[{"lastObservedAt":"secret-timestamp"}]}}`))
 	}))
 	defer server.Close()
 	root := "2222222222222222"
 	local := newDoctorV2Result("local")
 	local.Capture = &DoctorV2Capture{TraceID: "11111111111111111111111111111111", RootSpanID: &root, SpanCount: 4, SemanticDigest: "sha256:" + strings.Repeat("a", 64)}
 	local.Checks = []DoctorV2Check{{Name: "local_envelope", Status: DoctorPass, ReasonCode: "LOCAL_ENVELOPE_VALID", Message: "valid", RemediationCode: "NONE"}}
-	result := DoctorProbeV2(context.Background(), local, DoctorProbeOptions{Endpoint: server.URL, APIKey: "local-key", Timeout: 10 * time.Millisecond, PollInterval: time.Millisecond})
-	if result.Status != DoctorFail || result.FirstFailure == nil || *result.FirstFailure != "BACKEND_PROBE_UNAVAILABLE" {
-		t.Fatalf("pending trace falsely passed: %#v", result)
+	result := DoctorProbeV2(context.Background(), local, DoctorProbeOptions{Endpoint: server.URL, APIKey: "local-key", Timeout: time.Second})
+	if requests != 1 || result.Status != DoctorFail || result.FirstFailure == nil || *result.FirstFailure != "BACKEND_PROBE_UNAVAILABLE" {
+		t.Fatalf("terminal stage result = %#v, requests = %d", result, requests)
+	}
+	want := map[string]any{
+		"ingestion_state": "failed", "current_stage": "pii_redaction",
+		"last_successful_stage": "pii_dispatch", "failed_stage": "pii_redaction",
+		"failure_code": "PII_REDACTION_FAILED", "retryable": true,
+	}
+	if !reflect.DeepEqual(result.Checks[len(result.Checks)-1].Details, want) {
+		t.Fatalf("terminal stage details = %#v", result.Checks[len(result.Checks)-1].Details)
+	}
+	encoded, _ := json.Marshal(result)
+	if strings.Contains(string(encoded), "secret") || strings.Contains(string(encoded), "must-not-survive") {
+		t.Fatalf("unsafe diagnostics escaped into result: %s", encoded)
+	}
+}
+
+func TestDoctorProbeIgnoresUnknownOrMalformedStageDiagnostics(t *testing.T) {
+	fixture := doctorV3MaterializedTraceFixture()
+	fixture["promptTokens"] = float64(11)
+	fixture["completionTokens"] = float64(7)
+	fixture["totalTokensUsed"] = float64(18)
+	fixture["ingestionDiagnostics"] = map[string]any{
+		"protocolVersion": "v2", "state": "future_state",
+		"currentStage": "future_stage", "retryable": "yes",
+	}
+	root := "2222222222222222"
+	local := newDoctorV2Result("local")
+	local.Capture = &DoctorV2Capture{TraceID: "11111111111111111111111111111111", RootSpanID: &root, SpanCount: 4, SemanticDigest: "sha256:" + strings.Repeat("a", 64)}
+	local.Checks = []DoctorV2Check{{Name: "local_envelope", Status: DoctorPass, ReasonCode: "LOCAL_ENVELOPE_VALID", RemediationCode: "NONE"}}
+	result := persistedDoctorProbeResultWithDiagnostics(local, fixture, doctorIngestionDiagnosticDetails(fixture))
+	if result.Status != DoctorPass {
+		t.Fatalf("unknown diagnostics changed probe verdict: %#v", result)
+	}
+	for _, check := range result.Checks {
+		if check.Details != nil {
+			t.Fatalf("unknown diagnostics escaped into check: %#v", check)
+		}
 	}
 }
 

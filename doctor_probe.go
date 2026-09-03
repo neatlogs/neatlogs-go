@@ -39,6 +39,57 @@ type DoctorProbeOptions struct {
 }
 
 var persistedDoctorSpanID = regexp.MustCompile(`^[0-9a-f]{16}$`)
+var safeDoctorFailureCode = regexp.MustCompile(`^[A-Z0-9_]{1,64}$`)
+
+const maxDoctorReadbackBytes = 1 << 20
+
+var doctorIngestionStages = map[string]bool{
+	"kafka_published": true, "pii_dispatch": true, "pii_redaction": true,
+	"storage_consumer": true, "raw_durable": true, "root_resolution": true,
+	"simplification": true, "finalized": true,
+}
+
+var doctorIngestionStates = map[string]bool{
+	"processing": true, "failed": true, "succeeded": true,
+}
+
+func doctorIngestionDiagnosticDetails(value map[string]any) map[string]any {
+	diagnostics := doctorObject(value["ingestionDiagnostics"])
+	protocolVersion, _ := diagnostics["protocolVersion"].(string)
+	currentStage, currentOK := diagnostics["currentStage"].(string)
+	state, stateOK := diagnostics["state"].(string)
+	retryable, retryableOK := diagnostics["retryable"].(bool)
+	if protocolVersion != "v1" || !currentOK || !doctorIngestionStages[currentStage] ||
+		!stateOK || !doctorIngestionStates[state] || !retryableOK {
+		return nil
+	}
+	details := map[string]any{
+		"ingestion_state": state,
+		"current_stage":   currentStage,
+		"retryable":       retryable,
+	}
+	optionalStages := []struct{ source, target string }{
+		{"lastSuccessfulStage", "last_successful_stage"},
+		{"failedStage", "failed_stage"},
+	}
+	for _, field := range optionalStages {
+		if raw, exists := diagnostics[field.source]; exists {
+			stage, ok := raw.(string)
+			if !ok || !doctorIngestionStages[stage] {
+				return nil
+			}
+			details[field.target] = stage
+		}
+	}
+	if raw, exists := diagnostics["failureCode"]; exists {
+		failureCode, ok := raw.(string)
+		if !ok || !safeDoctorFailureCode.MatchString(failureCode) {
+			return nil
+		}
+		details["failure_code"] = failureCode
+	}
+	return details
+}
 
 // DoctorProbeV2 reads the exact controlled trace back through the existing
 // authenticated product route. The caller must first export local.Capture via
@@ -69,15 +120,20 @@ func DoctorProbeV2(ctx context.Context, local DoctorV2Result, options DoctorProb
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	client := options.HTTPClient
-	if client == nil {
-		client = &http.Client{}
+	baseClient := options.HTTPClient
+	if baseClient == nil {
+		baseClient = &http.Client{}
+	}
+	client := *baseClient
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
 	}
 
 	readURL := *base
 	readURL.Path = "/api/traces/v3/" + url.PathEscape(local.Capture.TraceID)
 	readURL.RawQuery = ""
 	readURL.Fragment = ""
+	var lastDiagnostics map[string]any
 
 	for {
 		request, requestErr := http.NewRequestWithContext(probeCtx, http.MethodGet, readURL.String(), nil)
@@ -85,12 +141,13 @@ func DoctorProbeV2(ctx context.Context, local DoctorV2Result, options DoctorProb
 			return probeReadFailure(result, "BACKEND_PROBE_UNAVAILABLE", "The exact trace read request could not be created", "CHECK_TRACE_ENDPOINT")
 		}
 		request.Header.Set("x-api-key", options.APIKey)
+		request.Header.Set("x-neatlogs-doctor", "v1")
 		response, requestErr := client.Do(request)
 		if requestErr != nil {
 			if probeCtx.Err() != nil {
-				return probeReadFailure(result, "BACKEND_PROBE_UNAVAILABLE", "Timed out waiting for the exact Doctor trace", "WAIT_FOR_TRACE")
+				return probeReadFailureWithDetails(result, "BACKEND_PROBE_UNAVAILABLE", "Timed out waiting for the exact Doctor trace", "WAIT_FOR_TRACE", lastDiagnostics)
 			}
-			return probeReadFailure(result, "BACKEND_PROBE_UNAVAILABLE", "The existing trace read path is unavailable", "CHECK_TRACE_ENDPOINT")
+			return probeReadFailureWithDetails(result, "BACKEND_PROBE_UNAVAILABLE", "The existing trace read path is unavailable", "CHECK_TRACE_ENDPOINT", lastDiagnostics)
 		}
 		if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
 			response.Body.Close()
@@ -103,16 +160,33 @@ func DoctorProbeV2(ctx context.Context, local DoctorV2Result, options DoctorProb
 			if decodeErr != nil {
 				return probeReadFailure(result, "BACKEND_PROBE_UNAVAILABLE", "Trace read-back returned an invalid response", "CHECK_TRACE_ENDPOINT")
 			}
-			return persistedDoctorProbeResult(result, traceData)
+			lastDiagnostics = doctorIngestionDiagnosticDetails(traceData)
+			return persistedDoctorProbeResultWithDiagnostics(result, traceData, lastDiagnostics)
 		}
 		status := response.StatusCode
+		var currentDiagnostics map[string]any
+		if status == http.StatusAccepted || status == http.StatusNotFound || status == http.StatusConflict {
+			var value map[string]any
+			if decodeLimited(response, &value) == nil {
+				if diagnostics := doctorIngestionDiagnosticDetails(value); diagnostics != nil {
+					currentDiagnostics = diagnostics
+					lastDiagnostics = diagnostics
+				}
+			}
+		}
 		response.Body.Close()
+		if status == http.StatusConflict {
+			return probeReadFailureWithDetails(result, "BACKEND_PROBE_UNAVAILABLE", "Trace ingestion reported a terminal failure", "CHECK_TRACE_ENDPOINT", currentDiagnostics)
+		}
 		if status != http.StatusAccepted && status != http.StatusNotFound {
+			if status >= http.StatusInternalServerError {
+				return probeReadFailureWithDetails(result, "BACKEND_PROBE_UNAVAILABLE", "The existing trace read path returned an unexpected status", "CHECK_TRACE_ENDPOINT", lastDiagnostics)
+			}
 			return probeReadFailure(result, "BACKEND_PROBE_UNAVAILABLE", "The existing trace read path returned an unexpected status", "CHECK_TRACE_ENDPOINT")
 		}
 		select {
 		case <-probeCtx.Done():
-			return probeReadFailure(result, "BACKEND_PROBE_UNAVAILABLE", "Timed out waiting for the exact Doctor trace", "WAIT_FOR_TRACE")
+			return probeReadFailureWithDetails(result, "BACKEND_PROBE_UNAVAILABLE", "Timed out waiting for the exact Doctor trace", "WAIT_FOR_TRACE", lastDiagnostics)
 		case <-time.After(interval):
 		}
 	}
@@ -150,6 +224,10 @@ func safeDoctorEndpoint(value string) (*url.URL, error) {
 }
 
 func persistedDoctorProbeResult(result DoctorV2Result, traceData map[string]any) DoctorV2Result {
+	return persistedDoctorProbeResultWithDiagnostics(result, traceData, nil)
+}
+
+func persistedDoctorProbeResultWithDiagnostics(result DoctorV2Result, traceData map[string]any, diagnosticDetails map[string]any) DoctorV2Result {
 	spans := doctorObjectSlice(traceData["spans"])
 	idSet := make(map[string]bool, len(spans))
 	byName := make(map[string]map[string]any, len(spans))
@@ -283,9 +361,17 @@ func persistedDoctorProbeResult(result DoctorV2Result, traceData map[string]any)
 	}
 	for _, validation := range validations {
 		if validation.passed {
-			result.Checks = append(result.Checks, DoctorV2Check{Name: validation.name, Status: DoctorPass, ReasonCode: validation.passCode, Message: validation.message, RemediationCode: "NONE"})
+			check := DoctorV2Check{Name: validation.name, Status: DoctorPass, ReasonCode: validation.passCode, Message: validation.message, RemediationCode: "NONE"}
+			if validation.name == "probe_finalization" && diagnosticDetails != nil {
+				check.Details = diagnosticDetails
+			}
+			result.Checks = append(result.Checks, check)
 		} else {
-			result.Checks = append(result.Checks, failV2(validation.name, validation.passCode+"_FAILED", validation.message, validation.remediation))
+			check := failV2(validation.name, validation.passCode+"_FAILED", validation.message, validation.remediation)
+			if validation.name == "probe_finalization" && diagnosticDetails != nil {
+				check.Details = diagnosticDetails
+			}
+			result.Checks = append(result.Checks, check)
 		}
 	}
 	return finishDoctorV2(result)
@@ -351,7 +437,14 @@ func doctorInt(value any) (int, bool) {
 }
 
 func probeReadFailure(result DoctorV2Result, code, message, remediation string) DoctorV2Result {
+	return probeReadFailureWithDetails(result, code, message, remediation, nil)
+}
+
+func probeReadFailureWithDetails(result DoctorV2Result, code, message, remediation string, details map[string]any) DoctorV2Result {
 	check := failV2("probe_transport", code, message, remediation)
+	if details != nil {
+		check.Details = details
+	}
 	if code == "AUTH_FAILED" {
 		// Authentication is the actionable root classification even when the
 		// preceding OTLP flush recorded the same rejected credential as a
@@ -367,5 +460,12 @@ func decodeLimited(response *http.Response, destination any) error {
 	if response == nil || response.Body == nil {
 		return errors.New("empty response")
 	}
-	return json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(destination)
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxDoctorReadbackBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(body) > maxDoctorReadbackBytes {
+		return errors.New("trace read-back exceeded the response limit")
+	}
+	return json.Unmarshal(body, destination)
 }

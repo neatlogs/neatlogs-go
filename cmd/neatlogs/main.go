@@ -162,6 +162,18 @@ func output(result neatlogs.DoctorV2Result, jsonOutput bool, exit int) int {
 		for _, check := range result.Checks {
 			fmt.Printf("%s %s: %s\n", check.Status, check.ReasonCode, check.Message)
 		}
+		for _, check := range result.Checks {
+			currentStage, ok := check.Details["current_stage"].(string)
+			if !ok || currentStage == "" {
+				continue
+			}
+			failed := ""
+			if failedStage, ok := check.Details["failed_stage"].(string); ok && failedStage != "" {
+				failed = "; failed: " + failedStage
+			}
+			fmt.Printf("Ingestion: %v at %s%s\n", check.Details["ingestion_state"], currentStage, failed)
+			break
+		}
 	}
 	return exit
 }
