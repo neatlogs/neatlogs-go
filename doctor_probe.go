@@ -18,6 +18,10 @@ type DoctorV2Probe struct {
 	MarkerHeader      string `json:"marker_header"`
 	MarkerVersion     string `json:"marker_version"`
 	Visible           bool   `json:"visible"`
+	ReadbackTraceID   string `json:"readback_trace_id"`
+	Finalized         bool   `json:"finalized"`
+	MeaningfulRoots   int    `json:"meaningful_root_count"`
+	DuplicateSpans    int    `json:"duplicate_span_count"`
 	ReadbackSpanCount int    `json:"readback_span_count"`
 	HierarchyValid    bool   `json:"hierarchy_valid"`
 	AttributesValid   bool   `json:"attributes_valid"`
@@ -130,14 +134,23 @@ func persistedDoctorProbeResult(result DoctorV2Result, traceData map[string]any)
 	spans := doctorObjectSlice(traceData["spans"])
 	idSet := make(map[string]bool, len(spans))
 	byName := make(map[string]map[string]any, len(spans))
+	duplicateSpanCount := 0
+	meaningfulRootCount := 0
 	hierarchyValid := len(spans) == 4
 	for _, span := range spans {
 		id, _ := span["span_id"].(string)
 		if !persistedDoctorSpanID.MatchString(id) || idSet[id] {
 			hierarchyValid = false
 		}
+		if idSet[id] {
+			duplicateSpanCount++
+		}
 		idSet[id] = true
-		byName[doctorString(span["node_name"], span["span_name"])] = span
+		name := doctorString(span["node_name"], span["span_name"])
+		byName[name] = span
+		if doctorString(span["parent_span_id"]) == "" && name != completionMarkerName {
+			meaningfulRootCount++
+		}
 	}
 
 	expected := map[string]string{
@@ -149,11 +162,30 @@ func persistedDoctorProbeResult(result DoctorV2Result, traceData map[string]any)
 	attributesValid := len(byName) == len(expected)
 	inputOutputValid := true
 	metadataValid := true
-	expectedIO := map[string][2]any{
-		"doctor.probe.root":  {map[string]any{"prompt": "generated diagnostic input"}, map[string]any{"result": map[string]any{"value": float64(2)}}},
-		"doctor.probe.agent": {map[string]any{"prompt": "generated diagnostic input"}, map[string]any{"text": "generated diagnostic output"}},
-		"doctor.probe.llm":   {map[string]any{"messages": []any{map[string]any{"role": "user", "content": "generated diagnostic input"}}}, map[string]any{"text": "generated diagnostic output"}},
-		"doctor.probe.tool":  {map[string]any{"value": float64(1)}, map[string]any{"value": float64(2)}},
+	// The v3 read path intentionally returns the UI-facing simplified view.
+	// It may preserve normalized JSON or render the same deterministic semantic
+	// value for display. Keep this allowlist identical across SDKs.
+	type materializedIO struct{ inputs, outputs []any }
+	expectedIO := map[string]materializedIO{
+		"doctor.probe.root": {
+			inputs:  []any{map[string]any{"prompt": "generated diagnostic input"}, "generated diagnostic input"},
+			outputs: []any{map[string]any{"result": map[string]any{"value": float64(2)}}, "Value: 2"},
+		},
+		"doctor.probe.agent": {
+			inputs:  []any{map[string]any{"prompt": "generated diagnostic input"}, "Prompt: generated diagnostic input"},
+			outputs: []any{map[string]any{"text": "generated diagnostic output"}, "Text: generated diagnostic output"},
+		},
+		"doctor.probe.llm": {
+			inputs: []any{
+				map[string]any{"messages": []any{map[string]any{"role": "user", "content": "generated diagnostic input"}}},
+				map[string]any{"prompt": "generated diagnostic input"},
+			},
+			outputs: []any{map[string]any{"text": "generated diagnostic output"}, "Text: generated diagnostic output"},
+		},
+		"doctor.probe.tool": {
+			inputs:  []any{map[string]any{"value": float64(1)}, "Value: 1"},
+			outputs: []any{map[string]any{"value": float64(2)}, "Value: 2"},
+		},
 	}
 	for name, kind := range expected {
 		match := byName[name]
@@ -168,8 +200,8 @@ func persistedDoctorProbeResult(result DoctorV2Result, traceData map[string]any)
 		}
 		data := doctorObject(match["data"])
 		io := expectedIO[name]
-		if !doctorValuesEqual(doctorJSONValue(data["input_value"]), io[0]) ||
-			!doctorValuesEqual(doctorJSONValue(data["output_value"]), io[1]) {
+		if !doctorMatchesMaterializedValue(data["input_value"], io.inputs) ||
+			!doctorMatchesMaterializedValue(data["output_value"], io.outputs) {
 			inputOutputValid = false
 		}
 		metadata := doctorObject(match["span_metadata"])
@@ -181,6 +213,9 @@ func persistedDoctorProbeResult(result DoctorV2Result, traceData map[string]any)
 		}
 	}
 	if len(byName) != 4 {
+		hierarchyValid = false
+	}
+	if duplicateSpanCount != 0 || meaningfulRootCount != 1 {
 		hierarchyValid = false
 	}
 	if hierarchyValid {
@@ -202,10 +237,16 @@ func persistedDoctorProbeResult(result DoctorV2Result, traceData map[string]any)
 	}
 	traceID, _ := traceData["_id"].(string)
 	visible := result.Capture != nil && traceID == result.Capture.TraceID
+	status := strings.ToLower(doctorString(traceData["status"]))
+	// A terminal failure is materialized, but it is not a successful Doctor
+	// probe. Only the product API's documented successful terminal value passes.
+	finalized := status == "success"
 
 	result.Probe = &DoctorV2Probe{
 		IngestRoute: "/v1/traces", MarkerHeader: "x-neatlogs-doctor", MarkerVersion: "v1",
-		Visible: visible, ReadbackSpanCount: readbackSpanCount, HierarchyValid: hierarchyValid,
+		Visible: visible, ReadbackTraceID: traceID, Finalized: finalized,
+		MeaningfulRoots: meaningfulRootCount, DuplicateSpans: duplicateSpanCount,
+		ReadbackSpanCount: readbackSpanCount, HierarchyValid: hierarchyValid,
 		AttributesValid: attributesValid, InputOutputValid: inputOutputValid,
 		MetadataValid: metadataValid, TypedTokensValid: typedTokensValid,
 	}
@@ -214,6 +255,7 @@ func persistedDoctorProbeResult(result DoctorV2Result, traceData map[string]any)
 		passed                               bool
 	}{
 		{"probe_visibility", "TRACE_VISIBLE", "WAIT_FOR_TRACE", "The exact Doctor trace is visible through the authenticated trace API", visible && result.Capture != nil && readbackSpanCount == 4 && len(spans) == 4},
+		{"probe_finalization", "TRACE_FINALIZED", "WAIT_FOR_TRACE", "The exact Doctor trace reached a terminal materialized state", finalized},
 		{"probe_hierarchy", "HIERARCHY_VALID", "CHECK_TRACE_FINALIZER", "The persisted Doctor hierarchy has one root and valid parents", hierarchyValid},
 		{"probe_attributes", "ATTRIBUTES_VALID", "CHECK_ATTRIBUTE_MAPPING", "The persisted Doctor span names and types are complete", attributesValid},
 		{"probe_input_output", "INPUT_OUTPUT_VALID", "CHECK_PAYLOAD_MAPPING", "The persisted Doctor spans retain input and output", inputOutputValid},
@@ -234,6 +276,16 @@ func doctorValuesEqual(left, right any) bool {
 	leftJSON, leftErr := json.Marshal(left)
 	rightJSON, rightErr := json.Marshal(right)
 	return leftErr == nil && rightErr == nil && string(leftJSON) == string(rightJSON)
+}
+
+func doctorMatchesMaterializedValue(value any, candidates []any) bool {
+	actual := doctorJSONValue(value)
+	for _, candidate := range candidates {
+		if doctorValuesEqual(actual, candidate) {
+			return true
+		}
+	}
+	return false
 }
 
 func doctorObject(value any) map[string]any {

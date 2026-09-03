@@ -88,6 +88,73 @@ func TestDoctorRuntimeClearsCaptureOnShutdown(t *testing.T) {
 	}
 }
 
+func TestEmittedSpanCaptureDerivesChoicesStreamToolAndPayloadFields(t *testing.T) {
+	ctx := context.Background()
+	client, err := NewClient(ctx, Config{}, WithExporter(tracetest.NewInMemoryExporter()), WithDoctorProbe())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx = client.Context(ctx)
+	rootCtx, llm, endLLM := StartSpan(ctx, "doctor.llm", "llm",
+		attribute.String("neatlogs.llm.input", `{"prompt":"hello"}`),
+		attribute.String("neatlogs.llm.output", `{"text":"done"}`),
+		attribute.String("neatlogs.llm.output_messages.0.content", "first"),
+		attribute.String("neatlogs.llm.output_messages.1.content", "second"),
+		attribute.String("neatlogs.llm.choices.0.finish_reason", "tool_calls"),
+		attribute.String("neatlogs.llm.choices.1.finish_reason", "stop"),
+		attribute.String("neatlogs.llm.tool_calls.0.id", "doctor_call_1"),
+		attribute.String("neatlogs.llm.tool_calls.0.name", "diagnostic_tool"),
+		attribute.String("neatlogs.llm.tool_calls.0.arguments", `{"value":1}`),
+		attribute.Int("neatlogs.llm.tool_calls.0.choice_index", 0),
+		attribute.Bool("neatlogs.llm.is_streaming", true),
+		attribute.Bool("neatlogs.capture.truncated", true),
+		attribute.String("neatlogs.llm.output.media.0.sha256", strings.Repeat("a", 64)),
+		attribute.Int("neatlogs.llm.output.media.0.byte_length", 1024),
+		attribute.String("neatlogs.llm.output.media.0.mime_type", "application/json"),
+	)
+	traceID := llm.SpanContext().TraceID().String()
+	llm.AddEvent("neatlogs.stream.chunk", trace.WithAttributes(
+		attribute.String("neatlogs.stream.chunk.summary", `{"text":"done"}`),
+	))
+	_, _, endTool := StartSpan(rootCtx, "doctor.tool", "tool",
+		attribute.String("neatlogs.tool_call.id", "doctor_call_1"),
+		attribute.String("neatlogs.tool.name", "diagnostic_tool"),
+		attribute.String("neatlogs.tool.input", `{"value":1}`),
+		attribute.String("neatlogs.tool.output", `{"value":2}`),
+	)
+	endTool()
+	endLLM()
+	if err := client.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	envelope, ok := client.runtime.captures.envelope(traceID)
+	if !ok {
+		t.Fatal("Doctor capture missing")
+	}
+	byName := make(map[string]DoctorSpan)
+	for _, span := range envelope.Spans {
+		byName[span.Name] = span
+	}
+	projected := byName["doctor.llm"]
+	if projected.ExpectedChoiceCount == nil || *projected.ExpectedChoiceCount != 2 || doctorCollectionLength(projected.Choices) != 2 {
+		t.Fatalf("choice projection = %#v", projected)
+	}
+	if !projected.Streaming || doctorCollectionLength(projected.StreamFragments) != 1 || !projected.Oversized || !doctorHasValidPayloadReference(projected.PayloadReferences) {
+		t.Fatalf("stream/payload projection = %#v", projected)
+	}
+	tool, ok := byName["doctor.tool"].ToolCall.(map[string]any)
+	if !ok || tool["id"] != "doctor_call_1" || !doctorValuesEqual(tool["arguments"], map[string]any{"value": float64(1)}) || !doctorValuesEqual(tool["result"], map[string]any{"value": float64(2)}) {
+		t.Fatalf("tool projection = %#v", byName["doctor.tool"].ToolCall)
+	}
+	result := DoctorCapturedLocalV2(ctx, DoctorLocalOptions{TraceID: traceID, RootSampleRate: 1, FlushOutcome: "success", FlushTimeout: time.Second})
+	if result.Status != DoctorPass {
+		t.Fatalf("actual emitted projection failed Doctor validation: %#v", result)
+	}
+	if err := client.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDoctorSemanticDigestMatchesCanonicalFixture(t *testing.T) {
 	fixture := `{"trace_id":"11111111111111111111111111111111","root_span_id":"2222222222222222","spans":[{"span_id":"2222222222222222","parent_span_id":null,"name":"doctor.workflow","kind":"WORKFLOW","status":"OK","input":{"prompt":"generated diagnostic input"},"output":{"result":"generated diagnostic output"},"sampled":true,"ended":true},{"span_id":"3333333333333333","parent_span_id":"2222222222222222","name":"doctor.llm","kind":"LLM","status":"OK","input":{"messages":[{"role":"user","content":"generated diagnostic input"}]},"output":{"text":"generated diagnostic output"},"choices":[{"index":0,"message":{"role":"assistant","content":"choice zero","tool_calls":[{"id":"doctor_call_1","name":"diagnostic_tool","arguments":{"value":1}}]}},{"index":1,"message":{"role":"assistant","content":"choice one","tool_calls":[]}}],"stream_fragments":["generated ","diagnostic ","output"],"sampled":true,"ended":true},{"span_id":"4444444444444444","parent_span_id":"3333333333333333","name":"doctor.tool","kind":"TOOL","status":"OK","tool_call":{"id":"doctor_call_1","name":"diagnostic_tool","arguments":{"value":1},"result":{"value":2}},"sampled":true,"ended":true},{"span_id":"5555555555555555","parent_span_id":"2222222222222222","name":"doctor.payload","kind":"CHAIN","status":"OK","payload_references":[{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":1024,"mime_type":"application/json"}],"sampled":true,"ended":true}]}`
 	var envelope DoctorEnvelope
@@ -228,7 +295,7 @@ func doctorPersistedSpan(id, parent, name, kind string, input, output any) map[s
 
 func doctorPersistedTraceFixture() map[string]any {
 	return map[string]any{
-		"_id": "11111111111111111111111111111111", "spanCount": 4,
+		"_id": "11111111111111111111111111111111", "status": "success", "spanCount": 4,
 		"promptTokens": 11, "completionTokens": 7, "totalTokensUsed": 18,
 		"spans": []any{
 			doctorPersistedSpan("2222222222222222", "", "doctor.probe.root", "workflow", map[string]any{"prompt": "generated diagnostic input"}, map[string]any{"result": map[string]any{"value": 2}}),
@@ -237,6 +304,25 @@ func doctorPersistedTraceFixture() map[string]any {
 			doctorPersistedSpan("5555555555555555", "2222222222222222", "doctor.probe.tool", "tool_call", map[string]any{"value": 1}, map[string]any{"value": 2}),
 		},
 	}
+}
+
+func doctorV3MaterializedTraceFixture() map[string]any {
+	fixture := doctorPersistedTraceFixture()
+	spans := fixture["spans"].([]any)
+	spans[0].(map[string]any)["data"] = map[string]any{
+		"input_value": "generated diagnostic input", "output_value": "Value: 2",
+	}
+	spans[2].(map[string]any)["data"] = map[string]any{
+		"input_value":  map[string]any{"prompt": "generated diagnostic input"},
+		"output_value": "Text: generated diagnostic output",
+	}
+	spans[1].(map[string]any)["data"] = map[string]any{
+		"input_value": "Prompt: generated diagnostic input", "output_value": "Text: generated diagnostic output",
+	}
+	spans[3].(map[string]any)["data"] = map[string]any{
+		"input_value": "Value: 1", "output_value": "Value: 2",
+	}
+	return fixture
 }
 
 func TestDoctorProbeReadsExactTraceWithoutDiagnosticSession(t *testing.T) {
@@ -249,7 +335,7 @@ func TestDoctorProbeReadsExactTraceWithoutDiagnosticSession(t *testing.T) {
 		if r.Method != http.MethodGet || r.URL.Path != "/api/traces/v3/11111111111111111111111111111111" {
 			t.Fatalf("unexpected Doctor request: %s %s", r.Method, r.URL.Path)
 		}
-		_ = json.NewEncoder(w).Encode(doctorPersistedTraceFixture())
+		_ = json.NewEncoder(w).Encode(doctorV3MaterializedTraceFixture())
 	}))
 	defer server.Close()
 	root := "2222222222222222"
@@ -257,11 +343,55 @@ func TestDoctorProbeReadsExactTraceWithoutDiagnosticSession(t *testing.T) {
 	local.Capture = &DoctorV2Capture{TraceID: "11111111111111111111111111111111", RootSpanID: &root, SpanCount: 4, SemanticDigest: "sha256:" + strings.Repeat("a", 64)}
 	local.Checks = []DoctorV2Check{{Name: "local_envelope", Status: DoctorPass, ReasonCode: "LOCAL_ENVELOPE_VALID", Message: "valid", RemediationCode: "NONE"}}
 	result := DoctorProbeV2(context.Background(), local, DoctorProbeOptions{Endpoint: server.URL, APIKey: "local-key", Timeout: time.Second, PollInterval: time.Millisecond})
-	if result.Status != DoctorPass || result.FirstFailure != nil || result.Probe == nil || !result.Probe.Visible || !result.Probe.HierarchyValid || !result.Probe.AttributesValid || !result.Probe.InputOutputValid || !result.Probe.MetadataValid || !result.Probe.TypedTokensValid {
+	if result.Status != DoctorPass || result.FirstFailure != nil || result.Probe == nil || !result.Probe.Visible || !result.Probe.Finalized || result.Probe.ReadbackTraceID != result.Capture.TraceID || result.Probe.MeaningfulRoots != 1 || result.Probe.DuplicateSpans != 0 || !result.Probe.HierarchyValid || !result.Probe.AttributesValid || !result.Probe.InputOutputValid || !result.Probe.MetadataValid || !result.Probe.TypedTokensValid {
 		t.Fatalf("probe did not pass exact trace validation: %#v", result)
 	}
 	if requests != 1 {
 		t.Fatalf("requests = %d, want one exact trace GET", requests)
+	}
+}
+
+func TestDoctorProbeRejectsWrongMaterializedInputOutput(t *testing.T) {
+	root := "2222222222222222"
+	local := newDoctorV2Result("local")
+	local.Capture = &DoctorV2Capture{TraceID: "11111111111111111111111111111111", RootSpanID: &root, SpanCount: 4, SemanticDigest: "sha256:" + strings.Repeat("a", 64)}
+	local.Checks = []DoctorV2Check{{Name: "local_envelope", Status: DoctorPass, ReasonCode: "LOCAL_ENVELOPE_VALID", RemediationCode: "NONE"}}
+	fixture := doctorV3MaterializedTraceFixture()
+	fixture["spans"].([]any)[2].(map[string]any)["data"].(map[string]any)["output_value"] = "Text: wrong output"
+	result := persistedDoctorProbeResult(local, fixture)
+	if result.Status != DoctorFail || result.Probe == nil || result.Probe.InputOutputValid || result.FirstFailure == nil || *result.FirstFailure != "INPUT_OUTPUT_VALID_FAILED" {
+		t.Fatalf("wrong materialized output passed: %#v", result)
+	}
+}
+
+func TestDoctorProbeReportsTerminalCorrelationRootsAndDuplicates(t *testing.T) {
+	root := "2222222222222222"
+	local := newDoctorV2Result("local")
+	local.Capture = &DoctorV2Capture{TraceID: "11111111111111111111111111111111", RootSpanID: &root, SpanCount: 4, SemanticDigest: "sha256:" + strings.Repeat("a", 64)}
+	local.Checks = []DoctorV2Check{{Name: "local_envelope", Status: DoctorPass, ReasonCode: "LOCAL_ENVELOPE_VALID", RemediationCode: "NONE"}}
+	fixture := doctorV3MaterializedTraceFixture()
+	spans := fixture["spans"].([]any)
+	spans[3].(map[string]any)["span_id"] = spans[1].(map[string]any)["span_id"]
+	result := persistedDoctorProbeResult(local, fixture)
+	if result.Status != DoctorFail || result.Probe == nil || result.Probe.ReadbackTraceID != result.Capture.TraceID || !result.Probe.Finalized || result.Probe.MeaningfulRoots != 1 || result.Probe.DuplicateSpans != 1 || result.Probe.HierarchyValid {
+		t.Fatalf("correlation fields did not expose duplicate: %#v", result)
+	}
+}
+
+func TestDoctorProbeRejectsFailedOrErrorTerminalReadback(t *testing.T) {
+	root := "2222222222222222"
+	for _, terminalStatus := range []string{"failed", "error", "completed"} {
+		t.Run(terminalStatus, func(t *testing.T) {
+			local := newDoctorV2Result("local")
+			local.Capture = &DoctorV2Capture{TraceID: "11111111111111111111111111111111", RootSpanID: &root, SpanCount: 4, SemanticDigest: "sha256:" + strings.Repeat("a", 64)}
+			local.Checks = []DoctorV2Check{{Name: "local_envelope", Status: DoctorPass, ReasonCode: "LOCAL_ENVELOPE_VALID", RemediationCode: "NONE"}}
+			fixture := doctorV3MaterializedTraceFixture()
+			fixture["status"] = terminalStatus
+			result := persistedDoctorProbeResult(local, fixture)
+			if result.Status != DoctorFail || result.Probe == nil || result.Probe.Finalized || result.FirstFailure == nil || *result.FirstFailure != "TRACE_FINALIZED_FAILED" {
+				t.Fatalf("failed terminal status passed: %#v", result)
+			}
+		})
 	}
 }
 

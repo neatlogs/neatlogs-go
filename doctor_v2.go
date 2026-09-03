@@ -259,6 +259,9 @@ func validateDoctorEnvelope(envelope DoctorEnvelope) []DoctorV2Check {
 		if span.ExpectedChoiceCount != nil && doctorCollectionLength(span.Choices) < *span.ExpectedChoiceCount {
 			return []DoctorV2Check{failV2("choices", "CHOICE_LOSS", "The normalized response lost model choices", "PRESERVE_ALL_CHOICES")}
 		}
+		if span.Streaming && doctorCollectionLength(span.StreamFragments) == 0 {
+			return []DoctorV2Check{failV2("streaming", "STREAM_FRAGMENT_MISSING", "A streaming span has no captured canonical chunk events", "PRESERVE_STREAM_FRAGMENTS")}
+		}
 		if span.Oversized && !doctorHasValidPayloadReference(span.PayloadReferences) {
 			return []DoctorV2Check{failV2("payload", "PAYLOAD_ATTACHMENT_REQUIRED", "Oversized content requires a valid payload reference", "UPLOAD_PAYLOAD_ATTACHMENT")}
 		}
@@ -304,8 +307,15 @@ func doctorCollectionLength(value any) int {
 }
 
 func doctorHasValidPayloadReference(value any) bool {
-	items, ok := value.([]any)
-	if !ok {
+	items := make([]any, 0)
+	switch typed := value.(type) {
+	case []any:
+		items = typed
+	case []map[string]any:
+		for _, item := range typed {
+			items = append(items, item)
+		}
+	default:
 		return false
 	}
 	digest := regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
@@ -347,6 +357,10 @@ func collectDoctorToolIDs(value any, output map[string]bool) {
 			collectDoctorToolIDs(child, output)
 		}
 	case []any:
+		for _, child := range item {
+			collectDoctorToolIDs(child, output)
+		}
+	case []map[string]any:
 		for _, child := range item {
 			collectDoctorToolIDs(child, output)
 		}

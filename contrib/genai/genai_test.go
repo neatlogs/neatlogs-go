@@ -28,13 +28,15 @@ import (
 func TestResponseAccumulatorPreservesChoicesAndSemanticStreamEvidence(t *testing.T) {
 	ctx := context.Background()
 	sink := tracetest.NewInMemoryExporter()
-	shutdown, err := neatlogs.Init(ctx, neatlogs.Config{WorkflowName: "genai-test"}, neatlogs.WithExporter(sink))
+	shutdown, err := neatlogs.Init(ctx, neatlogs.Config{WorkflowName: "genai-test"}, neatlogs.WithExporter(sink), neatlogs.WithDoctorProbe())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer shutdown(ctx)
 
-	_, span, end := neatlogs.StartProviderSpan(ctx, "stream", attrs.KindLLM)
+	wrapper := &GenAIModels{provider: geminiProvider, system: geminiSystem}
+	spanCtx, span, end := wrapper.startLLMSpan(ctx, "gemini-test", nil, true)
+	traceID := span.SpanContext().TraceID().String()
 	acc := newResponseAccumulator()
 	recordStreamChunk(span, acc, &google.GenerateContentResponse{Candidates: []*google.Candidate{
 		{Index: 0, Content: &google.Content{Role: "model", Parts: []*google.Part{{Text: "A"}}}},
@@ -51,6 +53,15 @@ func TestResponseAccumulatorPreservesChoicesAndSemanticStreamEvidence(t *testing
 		}}},
 	}})
 	finalizeStream(span, acc, true, false)
+	_, tool, endTool := neatlogs.StartProviderSpan(spanCtx, "weather", attrs.KindTool)
+	tool.SetAttributes(
+		attribute.String(attrs.SpanKind, attrs.KindTool),
+		attribute.String("neatlogs.tool_call.id", "call-1"),
+		attribute.String("neatlogs.tool.name", "weather"),
+		attribute.String("neatlogs.tool.input", `{"city":"Paris","unit":"C"}`),
+		attribute.String("neatlogs.tool.output", `{"temperature":21}`),
+	)
+	endTool()
 	end()
 	if err := neatlogs.Flush(ctx); err != nil {
 		t.Fatal(err)
@@ -59,7 +70,7 @@ func TestResponseAccumulatorPreservesChoicesAndSemanticStreamEvidence(t *testing
 	var got *tracetest.SpanStub
 	for i := range sink.GetSpans() {
 		candidate := sink.GetSpans()[i]
-		if candidate.Name == "stream" {
+		if candidate.Name == "google_genai.models.generate_content" {
 			got = &candidate
 			break
 		}
@@ -96,12 +107,37 @@ func TestResponseAccumulatorPreservesChoicesAndSemanticStreamEvidence(t *testing
 			t.Fatalf("event %d contains raw chunk content", index)
 		}
 	}
+	// This is the production GenAI accumulator -> normalizing exporter ->
+	// Doctor-capture path, rather than a hand-authored DoctorEnvelope.
+	doctor := neatlogs.DoctorCapturedLocalV2(ctx, neatlogs.DoctorLocalOptions{
+		TraceID: traceID, RootSampleRate: 1, FlushOutcome: "success", FlushTimeout: time.Second,
+	})
+	if doctor.Status != neatlogs.DoctorPass || doctor.Capture == nil || doctor.Capture.SpanCount != 3 {
+		t.Fatalf("GenAI wrapper output did not survive Doctor capture: %#v spans=%#v", doctor, sink.GetSpans())
+	}
+	rootID, llmID, toolID, expectedChoices := "1111111111111111", "2222222222222222", "3333333333333333", 2
+	expectedDigest, err := neatlogs.DoctorSemanticDigestV2(neatlogs.DoctorEnvelope{
+		TraceID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", RootSpanID: &rootID,
+		Spans: []neatlogs.DoctorSpan{
+			{SpanID: rootID, Name: "genai-test", Kind: "WORKFLOW", Status: "OK", Sampled: true, Ended: true},
+			{SpanID: llmID, ParentSpanID: &rootID, Name: "google_genai.models.generate_content", Kind: "LLM", Status: "OK", Sampled: true, Ended: true,
+				Choices: []map[string]any{
+					{"index": 0, "message": map[string]any{"role": "assistant", "content": "AB"}, "finish_reason": string(google.FinishReasonStop)},
+					{"index": 1, "message": map[string]any{"role": "assistant", "content": "XY", "tool_calls": []map[string]any{{"id": "call-1", "name": "weather", "arguments": map[string]any{"city": "Paris", "unit": "C"}, "choice_index": int64(1), "tool_call_index": int64(0)}}}, "finish_reason": string(google.FinishReasonMaxTokens)},
+				}, ExpectedChoiceCount: &expectedChoices, Streaming: true},
+			{SpanID: toolID, ParentSpanID: &llmID, Name: "weather", Kind: "TOOL", Status: "OK", Sampled: true, Ended: true,
+				ToolCall: map[string]any{"id": "call-1", "name": "weather", "arguments": map[string]any{"city": "Paris", "unit": "C"}, "result": map[string]any{"temperature": float64(21)}}},
+		},
+	})
+	if err != nil || doctor.Capture.SemanticDigest != expectedDigest {
+		t.Fatalf("GenAI semantic capture mismatch: got %s want %s err=%v", doctor.Capture.SemanticDigest, expectedDigest, err)
+	}
 }
 
 func TestTypedMediaPreservesInlineDigestAndFileReference(t *testing.T) {
 	ctx := context.Background()
 	sink := tracetest.NewInMemoryExporter()
-	shutdown, err := neatlogs.Init(ctx, neatlogs.Config{WorkflowName: "media-test"}, neatlogs.WithExporter(sink))
+	shutdown, err := neatlogs.Init(ctx, neatlogs.Config{WorkflowName: "media-test"}, neatlogs.WithExporter(sink), neatlogs.WithDoctorProbe())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +153,9 @@ func TestTypedMediaPreservesInlineDigestAndFileReference(t *testing.T) {
 			MIMEType: "image/png",
 		}},
 	}}
-	_, span, end := neatlogs.StartProviderSpan(ctx, "media", attrs.KindLLM)
+	wrapper := &GenAIModels{provider: geminiProvider, system: geminiSystem}
+	_, span, end := wrapper.startLLMSpan(ctx, "gemini-test", nil, false)
+	traceID := span.SpanContext().TraceID().String()
 	setInputMessages(span, []*google.Content{content}, nil)
 	end()
 	if err := neatlogs.Flush(ctx); err != nil {
@@ -126,7 +164,7 @@ func TestTypedMediaPreservesInlineDigestAndFileReference(t *testing.T) {
 
 	var got *tracetest.SpanStub
 	for _, candidate := range sink.GetSpans() {
-		if candidate.Name == "media" {
+		if candidate.Name == "google_genai.models.generate_content" {
 			copy := candidate
 			got = &copy
 		}
@@ -141,6 +179,24 @@ func TestTypedMediaPreservesInlineDigestAndFileReference(t *testing.T) {
 	assertStringAttribute(t, got.Attributes, attrs.LLMInputMessagePrefix+"0.media.1.type", "document")
 	assertStringAttribute(t, got.Attributes, attrs.LLMInputMessagePrefix+"0.media.1.reference", "gs://bucket/report.pdf")
 	assertStringAttribute(t, got.Attributes, attrs.LLMInputMessagePrefix+"0.media.2.reference", "https://bucket.example/private.png")
+	doctor := neatlogs.DoctorCapturedLocalV2(ctx, neatlogs.DoctorLocalOptions{
+		TraceID: traceID, RootSampleRate: 1, FlushOutcome: "success", FlushTimeout: time.Second,
+	})
+	if doctor.Status != neatlogs.DoctorPass || doctor.Capture == nil || doctor.Capture.SpanCount != 2 {
+		t.Fatalf("GenAI media path did not survive Doctor capture: %#v", doctor)
+	}
+	rootID, llmID := "1111111111111111", "2222222222222222"
+	expectedDigest, err := neatlogs.DoctorSemanticDigestV2(neatlogs.DoctorEnvelope{
+		TraceID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", RootSpanID: &rootID,
+		Spans: []neatlogs.DoctorSpan{
+			{SpanID: rootID, Name: "media-test", Kind: "WORKFLOW", Status: "OK", Sampled: true, Ended: true},
+			{SpanID: llmID, ParentSpanID: &rootID, Name: "google_genai.models.generate_content", Kind: "LLM", Status: "OK", Sampled: true, Ended: true,
+				PayloadReferences: []map[string]any{{"digest": fmt.Sprintf("sha256:%x", digest), "size": len(raw), "mime_type": "image/png"}}},
+		},
+	})
+	if err != nil || doctor.Capture.SemanticDigest != expectedDigest {
+		t.Fatalf("GenAI media semantic capture mismatch: got %s want %s err=%v", doctor.Capture.SemanticDigest, expectedDigest, err)
+	}
 }
 
 func TestSanitizedMediaReferenceStripsAuthorityCredentialsAndOpaquePayloads(t *testing.T) {

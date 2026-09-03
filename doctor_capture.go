@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -52,13 +53,14 @@ type doctorCaptureStore struct {
 	order            []string
 	byTrace          map[string]map[string]DoctorSpan
 	traceBytes       map[string]int
+	spanBytes        map[string]map[string]int
 }
 
 func newDoctorCaptureStore(capacity int) *doctorCaptureStore {
 	return &doctorCaptureStore{
 		capacity: capacity, maxSpansPerTrace: 64, maxBytesPerTrace: 256 * 1024,
 		maxBytesTotal: 1024 * 1024, byTrace: make(map[string]map[string]DoctorSpan),
-		traceBytes: make(map[string]int),
+		traceBytes: make(map[string]int), spanBytes: make(map[string]map[string]int),
 	}
 }
 
@@ -98,21 +100,19 @@ func (s *doctorCaptureStore) capture(spans []sdktrace.ReadOnlySpan) {
 			}
 			s.order = append(s.order, traceID)
 			s.byTrace[traceID] = make(map[string]DoctorSpan)
+			s.spanBytes[traceID] = make(map[string]int)
 		}
-		previous, exists := s.byTrace[traceID][spanID]
+		_, exists := s.byTrace[traceID][spanID]
 		if !exists && len(s.byTrace[traceID]) >= s.maxSpansPerTrace {
 			continue
 		}
-		previousSize := 0
-		if exists {
-			encoded, _ := json.Marshal(previous)
-			previousSize = len(encoded)
-		}
+		previousSize := s.spanBytes[traceID][spanID]
 		nextTraceBytes := s.traceBytes[traceID] - previousSize + item.size
 		if nextTraceBytes > s.maxBytesPerTrace {
 			continue
 		}
 		s.byTrace[traceID][spanID] = item.span
+		s.spanBytes[traceID][spanID] = item.size
 		s.traceBytes[traceID] = nextTraceBytes
 		s.totalBytes += item.size - previousSize
 		for s.totalBytes > s.maxBytesTotal && len(s.order) > 1 {
@@ -126,6 +126,7 @@ func (s *doctorCaptureStore) capture(spans []sdktrace.ReadOnlySpan) {
 func (s *doctorCaptureStore) evictLocked(traceID string) {
 	s.totalBytes -= s.traceBytes[traceID]
 	delete(s.traceBytes, traceID)
+	delete(s.spanBytes, traceID)
 	delete(s.byTrace, traceID)
 }
 
@@ -137,6 +138,7 @@ func (s *doctorCaptureStore) clear() {
 	s.order = nil
 	s.byTrace = make(map[string]map[string]DoctorSpan)
 	s.traceBytes = make(map[string]int)
+	s.spanBytes = make(map[string]map[string]int)
 	s.totalBytes = 0
 	s.mu.Unlock()
 }
@@ -181,6 +183,15 @@ func doctorSpanFrom(span sdktrace.ReadOnlySpan) DoctorSpan {
 	kind, _ := values["neatlogs.span.kind"].(string)
 	input := doctorJSONValue(values["neatlogs.input.value"])
 	output := doctorJSONValue(values["neatlogs.output.value"])
+	choices, expectedChoiceCount := doctorChoices(values)
+	streamFragments := doctorStreamFragments(span)
+	toolCall := doctorToolCall(values, strings.EqualFold(strings.TrimPrefix(kind, "Neatlogs."), "tool"))
+	payloadReferences := doctorPayloadReferences(values)
+	streaming, _ := values["neatlogs.llm.is_streaming"].(bool)
+	if doctorCollectionLength(streamFragments) > 0 {
+		streaming = true
+	}
+	oversized, _ := values["neatlogs.capture.truncated"].(bool)
 	delete(values, "neatlogs.input.value")
 	delete(values, "neatlogs.output.value")
 	delete(values, "neatlogs.span.kind")
@@ -190,7 +201,208 @@ func doctorSpanFrom(span sdktrace.ReadOnlySpan) DoctorSpan {
 	}
 	return DoctorSpan{SpanID: span.SpanContext().SpanID().String(), ParentSpanID: parent,
 		Name: span.Name(), Kind: strings.ToUpper(strings.TrimPrefix(kind, "Neatlogs.")), Status: status,
-		Input: input, Output: output, Sampled: span.SpanContext().IsSampled(), Ended: !span.EndTime().IsZero(), Attributes: values}
+		Input: input, Output: output, Choices: choices, ExpectedChoiceCount: expectedChoiceCount,
+		ToolCall: toolCall, StreamFragments: streamFragments, Streaming: streaming,
+		Oversized: oversized, PayloadReferences: payloadReferences,
+		Sampled: span.SpanContext().IsSampled(), Ended: !span.EndTime().IsZero(), Attributes: values}
+}
+
+func doctorChoices(values map[string]any) (any, *int) {
+	expected, hasExpected := doctorInteger(values["neatlogs.llm.generation_choices"])
+	indexes := make(map[int]bool)
+	messages := make(map[int]map[string]any)
+	finishes := make(map[int]any)
+	toolCalls := make(map[int][]map[string]any)
+	for key, value := range values {
+		if index, field, ok := doctorIndexedField(key, "neatlogs.llm.output_messages."); ok {
+			indexes[index] = true
+			if messages[index] == nil {
+				messages[index] = make(map[string]any)
+			}
+			messages[index][field] = doctorJSONValue(value)
+			continue
+		}
+		if index, field, ok := doctorIndexedField(key, "neatlogs.llm.choices."); ok && field == "finish_reason" {
+			indexes[index] = true
+			finishes[index] = doctorJSONValue(value)
+		}
+	}
+	indexedCalls := make(map[int]map[string]any)
+	for key, value := range values {
+		index, field, ok := doctorIndexedField(key, "neatlogs.llm.tool_calls.")
+		if !ok {
+			continue
+		}
+		if indexedCalls[index] == nil {
+			indexedCalls[index] = make(map[string]any)
+		}
+		indexedCalls[index][field] = doctorJSONValue(value)
+	}
+	callIndexes := make([]int, 0, len(indexedCalls))
+	for index := range indexedCalls {
+		callIndexes = append(callIndexes, index)
+	}
+	sort.Ints(callIndexes)
+	for _, index := range callIndexes {
+		call := indexedCalls[index]
+		if _, ok := call["id"].(string); !ok {
+			continue
+		}
+		choiceIndex, ok := doctorInteger(call["choice_index"])
+		if !ok {
+			choiceIndex = 0
+		}
+		indexes[choiceIndex] = true
+		toolCalls[choiceIndex] = append(toolCalls[choiceIndex], call)
+	}
+	ordered := make([]int, 0, len(indexes))
+	for index := range indexes {
+		ordered = append(ordered, index)
+	}
+	sort.Ints(ordered)
+	choices := make([]map[string]any, 0, len(ordered))
+	for _, index := range ordered {
+		message := messages[index]
+		if message == nil {
+			message = make(map[string]any)
+		}
+		if len(toolCalls[index]) > 0 {
+			message["tool_calls"] = toolCalls[index]
+		}
+		choice := map[string]any{"index": index, "message": message}
+		if finish, ok := finishes[index]; ok {
+			choice["finish_reason"] = finish
+		}
+		choices = append(choices, choice)
+	}
+	if !hasExpected {
+		if len(choices) == 0 {
+			return nil, nil
+		}
+		expected = len(choices)
+	}
+	return choicesOrNil(choices), &expected
+}
+
+func choicesOrNil(choices []map[string]any) any {
+	if len(choices) == 0 {
+		return nil
+	}
+	return choices
+}
+
+func doctorIndexedField(key, prefix string) (int, string, bool) {
+	if !strings.HasPrefix(key, prefix) {
+		return 0, "", false
+	}
+	remainder := strings.TrimPrefix(key, prefix)
+	parts := strings.SplitN(remainder, ".", 2)
+	if len(parts) != 2 {
+		return 0, "", false
+	}
+	index := 0
+	for _, char := range parts[0] {
+		if char < '0' || char > '9' {
+			return 0, "", false
+		}
+		index = index*10 + int(char-'0')
+	}
+	return index, parts[1], parts[0] != ""
+}
+
+func doctorInteger(value any) (int, bool) {
+	switch item := value.(type) {
+	case int:
+		return item, true
+	case int64:
+		return int(item), true
+	case float64:
+		return int(item), item == float64(int(item))
+	default:
+		return 0, false
+	}
+}
+
+func doctorStreamFragments(span sdktrace.ReadOnlySpan) any {
+	fragments := make([]any, 0)
+	for _, event := range span.Events() {
+		if event.Name != "neatlogs.stream.chunk" {
+			continue
+		}
+		for _, item := range event.Attributes {
+			if string(item.Key) == "neatlogs.stream.chunk.summary" {
+				fragments = append(fragments, doctorJSONValue(doctorAttributeValue(item.Value)))
+			}
+		}
+	}
+	if len(fragments) == 0 {
+		return nil
+	}
+	return fragments
+}
+
+func doctorToolCall(values map[string]any, isTool bool) any {
+	if !isTool {
+		return nil
+	}
+	id, _ := values["neatlogs.tool_call.id"].(string)
+	if id == "" {
+		return nil
+	}
+	call := map[string]any{"id": id}
+	if name, ok := values["neatlogs.tool.name"].(string); ok {
+		call["name"] = name
+	}
+	if input, ok := values["neatlogs.tool.input"]; ok {
+		call["arguments"] = doctorJSONValue(input)
+	}
+	if output, ok := values["neatlogs.tool.output"]; ok {
+		call["result"] = doctorJSONValue(output)
+	}
+	return call
+}
+
+func doctorPayloadReferences(values map[string]any) any {
+	records := make(map[string]map[string]any)
+	for key, value := range values {
+		mediaAt := strings.Index(key, ".media.")
+		if !strings.HasPrefix(key, "neatlogs.") || mediaAt < 0 {
+			continue
+		}
+		prefix := key[:mediaAt+len(".media.")]
+		index, field, ok := doctorIndexedField(key, prefix)
+		if !ok || (field != "sha256" && field != "byte_length" && field != "mime_type") {
+			continue
+		}
+		identity := prefix + strconv.Itoa(index)
+		if records[identity] == nil {
+			records[identity] = make(map[string]any)
+		}
+		records[identity][field] = doctorJSONValue(value)
+	}
+	identities := make([]string, 0, len(records))
+	for identity := range records {
+		identities = append(identities, identity)
+	}
+	sort.Strings(identities)
+	references := make([]map[string]any, 0, len(records))
+	for _, identity := range identities {
+		record := records[identity]
+		digest, ok := record["sha256"].(string)
+		if !ok || len(digest) != 64 {
+			continue
+		}
+		size, _ := doctorInteger(record["byte_length"])
+		mimeType, _ := record["mime_type"].(string)
+		if mimeType == "" {
+			mimeType = "application/octet-stream"
+		}
+		references = append(references, map[string]any{"digest": "sha256:" + digest, "size": size, "mime_type": mimeType})
+	}
+	if len(references) == 0 {
+		return nil
+	}
+	return references
 }
 
 func doctorJSONValue(value any) any {
