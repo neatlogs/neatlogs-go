@@ -134,7 +134,7 @@ func doctorSpanAttributes(spanType string) []attribute.KeyValue {
 		attribute.String("service.name", "neatlogs.doctor.v2"),
 		attribute.String("telemetry.sdk.language", "go"),
 		attribute.String("telemetry.sdk.version", neatlogs.Version),
-		attribute.String("neatlogs.span.type", spanType),
+		attribute.String("neatlogs.span.kind", strings.ToLower(spanType)),
 	}
 }
 

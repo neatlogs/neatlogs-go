@@ -335,7 +335,7 @@ func doctorPersistedSpan(id, parent, name, kind string, input, output any) map[s
 		"span_metadata": map[string]any{
 			"neatlogs.doctor": true, "neatlogs.doctor.version": "v1",
 			"service.name": "neatlogs.doctor.v2", "telemetry.sdk.language": "go",
-			"telemetry.sdk.version": Version, "neatlogs.span.type": spanType,
+			"telemetry.sdk.version": Version, "neatlogs.span.kind": spanType,
 		},
 	}
 	if parent != "" {

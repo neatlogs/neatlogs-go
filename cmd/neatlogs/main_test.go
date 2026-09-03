@@ -27,7 +27,7 @@ func TestDoctorSpanAttributesArePersistablePerSpan(t *testing.T) {
 	if values["neatlogs.doctor"] != true ||
 		values["neatlogs.doctor.version"] != "v1" ||
 		values["telemetry.sdk.language"] != "go" ||
-		values["neatlogs.span.type"] != "TOOL" {
+		values["neatlogs.span.kind"] != "tool" {
 		t.Fatalf("Doctor span metadata = %#v", values)
 	}
 }

@@ -196,7 +196,6 @@ func doctorSpanFrom(span sdktrace.ReadOnlySpan) DoctorSpan {
 	oversized, _ := values["neatlogs.capture.truncated"].(bool)
 	delete(values, "neatlogs.input.value")
 	delete(values, "neatlogs.output.value")
-	delete(values, "neatlogs.span.kind")
 	status := strings.ToUpper(span.Status().Code.String())
 	if status == "UNSET" {
 		status = "OK"

@@ -209,7 +209,7 @@ func validateControlledDoctorEnvelope(envelope DoctorEnvelope) *DoctorV2Check {
 		if !ok || span.Kind != want.kind || parent != want.parent || span.Input == nil || span.Output == nil ||
 			span.Attributes["neatlogs.doctor"] != true || span.Attributes["neatlogs.doctor.version"] != "v1" ||
 			span.Attributes["service.name"] != "neatlogs.doctor.v2" || span.Attributes["telemetry.sdk.language"] != "go" ||
-			span.Attributes["telemetry.sdk.version"] != Version || span.Attributes["neatlogs.span.type"] != want.kind {
+			span.Attributes["telemetry.sdk.version"] != Version || !strings.EqualFold(doctorString(span.Attributes["neatlogs.span.kind"]), want.kind) {
 			check := failV2("probe_fixture", "PROBE_FIXTURE_INVALID", "Doctor fixture hierarchy, metadata, or input/output is incomplete", "FIX_DOCTOR_INSTRUMENTATION")
 			return &check
 		}

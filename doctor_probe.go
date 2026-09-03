@@ -227,7 +227,7 @@ func persistedDoctorProbeResult(result DoctorV2Result, traceData map[string]any)
 		spanType := strings.ToUpper(strings.ReplaceAll(strings.ReplaceAll(kind, "agent_action", "agent"), "tool_call", "tool"))
 		if metadata["neatlogs.doctor"] != true || metadata["neatlogs.doctor.version"] != "v1" ||
 			metadata["service.name"] != "neatlogs.doctor.v2" || metadata["telemetry.sdk.language"] != "go" ||
-			metadata["telemetry.sdk.version"] != Version || metadata["neatlogs.span.type"] != spanType {
+			metadata["telemetry.sdk.version"] != Version || !strings.EqualFold(doctorString(metadata["neatlogs.span.kind"]), spanType) {
 			metadataValid = false
 		}
 	}
