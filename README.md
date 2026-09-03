@@ -15,6 +15,16 @@ go get github.com/neatlogs/neatlogs-go
 go get github.com/neatlogs/neatlogs-go/contrib/genai
 ```
 
+The library install does not install the optional Doctor CLI. Install that
+binary separately when you want to run diagnostics:
+
+```bash
+go install github.com/neatlogs/neatlogs-go/cmd/neatlogs@latest
+```
+
+Ensure `$(go env GOPATH)/bin` is on `PATH`. When Wizard cannot discover the
+binary from `PATH`, set `NEATLOGS_DOCTOR_GO` to its absolute path.
+
 ## Quick start
 
 ```go
@@ -179,6 +189,8 @@ LLM/retriever/tool helpers, and an isolated private provider. More providers and
 explicit framework wrappers will follow.
 
 ## Doctor v2
+
+Install the Doctor CLI as shown above before running these commands.
 
 Run the isolated, network-free SDK check:
 
