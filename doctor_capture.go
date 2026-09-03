@@ -60,6 +60,11 @@ func (s *doctorCaptureStore) capture(spans []sdktrace.ReadOnlySpan) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, span := range spans {
+		// The backend folds the completion marker into trace lifecycle state, so
+		// Doctor compares only the four user-visible semantic fixture spans.
+		if span.Name() == completionMarkerName {
+			continue
+		}
 		traceID := span.SpanContext().TraceID().String()
 		spanID := span.SpanContext().SpanID().String()
 		if _, exists := s.byTrace[traceID]; !exists {

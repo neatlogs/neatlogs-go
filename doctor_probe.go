@@ -1,34 +1,31 @@
 package neatlogs
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
 
-type DoctorV2Stage struct {
-	Stage            string   `json:"stage"`
-	Status           string   `json:"status"`
-	ReasonCode       string   `json:"reason_code"`
-	At               string   `json:"at"`
-	SpanCount        *int     `json:"span_count,omitempty"`
-	MissingIDs       []string `json:"missing_ids,omitempty"`
-	MissingFields    []string `json:"missing_fields,omitempty"`
-	ParentMismatches *int     `json:"parent_mismatches,omitempty"`
-	SemanticDigest   string   `json:"semantic_digest,omitempty"`
-}
 type DoctorV2Probe struct {
-	DiagnosticID  string          `json:"diagnostic_id"`
-	ReceiptStatus string          `json:"receipt_status"`
-	ExpiresAt     string          `json:"expires_at"`
-	Stages        []DoctorV2Stage `json:"stages"`
+	IngestRoute       string `json:"ingest_route"`
+	MarkerHeader      string `json:"marker_header"`
+	MarkerVersion     string `json:"marker_version"`
+	Visible           bool   `json:"visible"`
+	ReadbackSpanCount int    `json:"readback_span_count"`
+	HierarchyValid    bool   `json:"hierarchy_valid"`
+	AttributesValid   bool   `json:"attributes_valid"`
+	InputOutputValid  bool   `json:"input_output_valid"`
+	MetadataValid     bool   `json:"metadata_valid"`
+	TypedTokensValid  bool   `json:"typed_tokens_valid"`
 }
+
 type DoctorProbeOptions struct {
 	Endpoint     string
 	APIKey       string
@@ -36,28 +33,12 @@ type DoctorProbeOptions struct {
 	PollInterval time.Duration
 	HTTPClient   *http.Client
 }
-type diagnosticSession struct {
-	FormatVersion  string `json:"format_version"`
-	DiagnosticID   string `json:"diagnostic_id"`
-	ProbeToken     string `json:"probe_token"`
-	CreatedAt      string `json:"created_at"`
-	ExpiresAt      string `json:"expires_at"`
-	FixtureVersion string `json:"fixture_version"`
-}
-type diagnosticReceipt struct {
-	FormatVersion string          `json:"format_version"`
-	DiagnosticID  string          `json:"diagnostic_id"`
-	Status        string          `json:"status"`
-	FirstFailure  *string         `json:"first_failure"`
-	Stages        []DoctorV2Stage `json:"stages"`
-	ExpiresAt     string          `json:"expires_at"`
-	LocalDigest   string          `json:"local_semantic_digest"`
-	BackendDigest string          `json:"backend_semantic_digest"`
-}
 
-// DoctorProbeV2 correlates an already-captured synthetic envelope with the
-// authenticated backend receipt API. Polling is bounded and cancellation-safe;
-// the secret probe token is used only as a request header and is never returned.
+var persistedDoctorSpanID = regexp.MustCompile(`^[0-9a-f]{16}$`)
+
+// DoctorProbeV2 reads the exact controlled trace back through the existing
+// authenticated product route. The caller must first export local.Capture via
+// the normal /v1/traces OTLP pipeline using WithDoctorProbe.
 func DoctorProbeV2(ctx context.Context, local DoctorV2Result, options DoctorProbeOptions) DoctorV2Result {
 	result := local
 	result.Mode = "probe"
@@ -68,21 +49,19 @@ func DoctorProbeV2(ctx context.Context, local DoctorV2Result, options DoctorProb
 		result.Checks = append(result.Checks, failV2("configuration", "CREDENTIAL_MISSING", "A project ingestion credential is required", "SET_CREDENTIAL"))
 		return finishDoctorV2(result)
 	}
-	base, err := url.Parse(options.Endpoint)
-	if err != nil || base.Host == "" || (base.Scheme != "http" && base.Scheme != "https") {
-		result.Checks = append(result.Checks, failV2("configuration", "ENDPOINT_INVALID", "The diagnostic endpoint is invalid", "SET_ENDPOINT"))
+	base, err := safeDoctorEndpoint(options.Endpoint)
+	if err != nil {
+		result.Checks = append(result.Checks, failV2("configuration", "ENDPOINT_INVALID", "The trace endpoint is invalid", "SET_ENDPOINT"))
 		return finishDoctorV2(result)
 	}
-	base.Path = "/api/diagnostics/v2/sessions"
-	base.RawQuery = ""
-	base.Fragment = ""
+
 	timeout := options.Timeout
 	if timeout <= 0 {
-		timeout = 10 * time.Second
+		timeout = 45 * time.Second
 	}
 	interval := options.PollInterval
 	if interval <= 0 {
-		interval = 250 * time.Millisecond
+		interval = time.Second
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -90,99 +69,209 @@ func DoctorProbeV2(ctx context.Context, local DoctorV2Result, options DoctorProb
 	if client == nil {
 		client = &http.Client{}
 	}
-	body, _ := json.Marshal(map[string]string{"envelope_digest": local.Capture.SemanticDigest, "fixture_version": "doctor-v2", "trace_id": local.Capture.TraceID})
-	request, _ := http.NewRequestWithContext(probeCtx, http.MethodPost, base.String(), bytes.NewReader(body))
-	request.Header.Set("content-type", "application/json")
-	request.Header.Set("x-api-key", options.APIKey)
-	response, err := client.Do(request)
-	if err != nil {
-		return probeTransportFailure(result, "BACKEND_PROBE_UNAVAILABLE", "The backend diagnostic session is unavailable", "CHECK_DIAGNOSTIC_ENDPOINT")
-	}
-	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
-		response.Body.Close()
-		return probeTransportFailure(result, "AUTH_FAILED", "The authenticated diagnostic session was rejected", "CHECK_INGEST_CREDENTIAL")
-	}
-	var session diagnosticSession
-	err = decodeLimited(response, &session)
-	response.Body.Close()
-	if err != nil || response.StatusCode < 200 || response.StatusCode >= 300 || !strings.HasPrefix(session.DiagnosticID, "diag_") {
-		return probeTransportFailure(result, "BACKEND_PROBE_UNAVAILABLE", "The backend diagnostic session is unavailable", "CHECK_DIAGNOSTIC_ENDPOINT")
-	}
-	receiptURL := strings.TrimSuffix(base.String(), "/") + "/" + url.PathEscape(session.DiagnosticID)
-	defer func() {
-		cleanupCtx, done := context.WithTimeout(context.Background(), time.Second)
-		defer done()
-		req, _ := http.NewRequestWithContext(cleanupCtx, http.MethodDelete, receiptURL, nil)
-		req.Header.Set("x-api-key", options.APIKey)
-		if resp, e := client.Do(req); e == nil {
-			resp.Body.Close()
-		}
-	}()
-	current := diagnosticReceipt{DiagnosticID: session.DiagnosticID, Status: "pending", ExpiresAt: session.ExpiresAt}
+
+	readURL := *base
+	readURL.Path = "/api/traces/v3/" + url.PathEscape(local.Capture.TraceID)
+	readURL.RawQuery = ""
+	readURL.Fragment = ""
+
 	for {
-		req, _ := http.NewRequestWithContext(probeCtx, http.MethodGet, receiptURL, nil)
-		req.Header.Set("x-api-key", options.APIKey)
-		if session.ProbeToken != "" {
-			req.Header.Set("x-neatlogs-diagnostic-token", session.ProbeToken)
+		request, requestErr := http.NewRequestWithContext(probeCtx, http.MethodGet, readURL.String(), nil)
+		if requestErr != nil {
+			return probeReadFailure(result, "BACKEND_PROBE_UNAVAILABLE", "The exact trace read request could not be created", "CHECK_TRACE_ENDPOINT")
 		}
-		resp, e := client.Do(req)
-		if e != nil {
-			break
+		request.Header.Set("x-api-key", options.APIKey)
+		response, requestErr := client.Do(request)
+		if requestErr != nil {
+			if probeCtx.Err() != nil {
+				return probeReadFailure(result, "BACKEND_PROBE_UNAVAILABLE", "Timed out waiting for the exact Doctor trace", "WAIT_FOR_TRACE")
+			}
+			return probeReadFailure(result, "BACKEND_PROBE_UNAVAILABLE", "The existing trace read path is unavailable", "CHECK_TRACE_ENDPOINT")
 		}
-		var next diagnosticReceipt
-		e = decodeLimited(resp, &next)
-		resp.Body.Close()
-		if e != nil || resp.StatusCode != http.StatusOK {
-			break
+		if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+			response.Body.Close()
+			return probeReadFailure(result, "AUTH_FAILED", "The project key was rejected by the existing trace API", "CHECK_INGEST_CREDENTIAL")
 		}
-		current = next
-		if current.Status == "pass" || current.Status == "fail" || current.Status == "expired" {
-			break
+		if response.StatusCode >= 200 && response.StatusCode < 300 && response.StatusCode != http.StatusAccepted {
+			var traceData map[string]any
+			decodeErr := decodeLimited(response, &traceData)
+			response.Body.Close()
+			if decodeErr != nil {
+				return probeReadFailure(result, "BACKEND_PROBE_UNAVAILABLE", "Trace read-back returned an invalid response", "CHECK_TRACE_ENDPOINT")
+			}
+			return persistedDoctorProbeResult(result, traceData)
+		}
+		status := response.StatusCode
+		response.Body.Close()
+		if status != http.StatusAccepted && status != http.StatusNotFound {
+			return probeReadFailure(result, "BACKEND_PROBE_UNAVAILABLE", "The existing trace read path returned an unexpected status", "CHECK_TRACE_ENDPOINT")
 		}
 		select {
 		case <-probeCtx.Done():
-			goto complete
+			return probeReadFailure(result, "BACKEND_PROBE_UNAVAILABLE", "Timed out waiting for the exact Doctor trace", "WAIT_FOR_TRACE")
 		case <-time.After(interval):
 		}
 	}
-complete:
-	result.Probe = &DoctorV2Probe{DiagnosticID: session.DiagnosticID, ReceiptStatus: current.Status, ExpiresAt: current.ExpiresAt, Stages: current.Stages}
-	if current.Status == "pass" && probeStagesComplete(current.Stages) && (current.BackendDigest == "" || current.BackendDigest == local.Capture.SemanticDigest) {
-		result.Checks = append(result.Checks, DoctorV2Check{Name: "probe_visibility", Status: DoctorPass, ReasonCode: "DIAGNOSTIC_VISIBLE", Message: "The diagnostic trace reached the authenticated read path", RemediationCode: "NONE"})
-		return finishDoctorV2(result)
+}
+
+func safeDoctorEndpoint(value string) (*url.URL, error) {
+	base, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || base.Host == "" || (base.Scheme != "http" && base.Scheme != "https") || base.User != nil {
+		return nil, errors.New("invalid endpoint")
 	}
-	code := "STAGE_PENDING"
-	remediation := "WAIT_FOR_RECEIPT"
-	if current.FirstFailure != nil {
-		code = *current.FirstFailure
-		remediation = "CONTACT_SUPPORT"
-	} else if current.Status == "expired" {
-		code = "DIAGNOSTIC_EXPIRED"
-		remediation = "CREATE_NEW_SESSION"
-	} else if current.BackendDigest != "" && current.BackendDigest != local.Capture.SemanticDigest {
-		code = "DIGEST_MISMATCH"
-		remediation = "CONTACT_SUPPORT"
+	base.Path = ""
+	base.RawPath = ""
+	base.RawQuery = ""
+	base.Fragment = ""
+	return base, nil
+}
+
+func persistedDoctorProbeResult(result DoctorV2Result, traceData map[string]any) DoctorV2Result {
+	spans := doctorObjectSlice(traceData["spans"])
+	idSet := make(map[string]bool, len(spans))
+	rootCount := 0
+	hierarchyValid := true
+	for _, span := range spans {
+		id, _ := span["span_id"].(string)
+		if !persistedDoctorSpanID.MatchString(id) || idSet[id] {
+			hierarchyValid = false
+		}
+		idSet[id] = true
+		if parent, ok := span["parent_span_id"].(string); !ok || parent == "" {
+			rootCount++
+		}
 	}
-	result.Checks = append(result.Checks, failV2("probe_visibility", code, "The backend diagnostic did not reach confirmed visibility", remediation))
+	if rootCount != 1 {
+		hierarchyValid = false
+	}
+	for _, span := range spans {
+		if parent, ok := span["parent_span_id"].(string); ok && parent != "" && !idSet[parent] {
+			hierarchyValid = false
+		}
+	}
+
+	expected := map[string]string{
+		"doctor.probe.root":  "workflow",
+		"doctor.probe.agent": "agent_action",
+		"doctor.probe.llm":   "llm",
+		"doctor.probe.tool":  "tool_call",
+	}
+	attributesValid := true
+	inputOutputValid := true
+	metadataValid := true
+	for name, kind := range expected {
+		var match map[string]any
+		for _, span := range spans {
+			spanName := doctorString(span["node_name"], span["span_name"])
+			spanType := strings.ToLower(doctorString(span["node_type"], span["span_type"]))
+			if spanName == name && spanType == kind {
+				match = span
+				break
+			}
+		}
+		if match == nil {
+			attributesValid = false
+			inputOutputValid = false
+			metadataValid = false
+			continue
+		}
+		data := doctorObject(match["data"])
+		_, hasInput := data["input_value"]
+		_, hasOutput := data["output_value"]
+		if !hasInput || !hasOutput {
+			inputOutputValid = false
+		}
+		metadata := doctorObject(match["span_metadata"])
+		if metadata["neatlogs.doctor"] != true || metadata["neatlogs.doctor.version"] != "v1" || metadata["telemetry.sdk.language"] != "go" {
+			metadataValid = false
+		}
+	}
+
+	typedTokensValid := doctorExactNumber(traceData["promptTokens"], 11) &&
+		doctorExactNumber(traceData["completionTokens"], 7) &&
+		doctorExactNumber(traceData["totalTokensUsed"], 18)
+	readbackSpanCount := len(spans)
+	if value, ok := doctorInt(traceData["spanCount"]); ok {
+		readbackSpanCount = value
+	}
+	traceID, _ := traceData["_id"].(string)
+	visible := result.Capture != nil && traceID == result.Capture.TraceID
+
+	result.Probe = &DoctorV2Probe{
+		IngestRoute: "/v1/traces", MarkerHeader: "x-neatlogs-doctor", MarkerVersion: "v1",
+		Visible: visible, ReadbackSpanCount: readbackSpanCount, HierarchyValid: hierarchyValid,
+		AttributesValid: attributesValid, InputOutputValid: inputOutputValid,
+		MetadataValid: metadataValid, TypedTokensValid: typedTokensValid,
+	}
+	validations := []struct {
+		name, passCode, remediation, message string
+		passed                               bool
+	}{
+		{"probe_visibility", "TRACE_VISIBLE", "WAIT_FOR_TRACE", "The exact Doctor trace is visible through the authenticated trace API", visible && result.Capture != nil && readbackSpanCount >= result.Capture.SpanCount},
+		{"probe_hierarchy", "HIERARCHY_VALID", "CHECK_TRACE_FINALIZER", "The persisted Doctor hierarchy has one root and valid parents", hierarchyValid},
+		{"probe_attributes", "ATTRIBUTES_VALID", "CHECK_ATTRIBUTE_MAPPING", "The persisted Doctor span names and types are complete", attributesValid},
+		{"probe_input_output", "INPUT_OUTPUT_VALID", "CHECK_PAYLOAD_MAPPING", "The persisted Doctor spans retain input and output", inputOutputValid},
+		{"probe_metadata", "METADATA_VALID", "CHECK_METADATA_FINALIZATION", "The versioned Doctor SDK metadata survived finalization", metadataValid},
+		{"probe_typed_tokens", "TYPED_TOKENS_VALID", "CHECK_TOKEN_MAPPING", "Persisted token totals remain numeric", typedTokensValid},
+	}
+	for _, validation := range validations {
+		if validation.passed {
+			result.Checks = append(result.Checks, DoctorV2Check{Name: validation.name, Status: DoctorPass, ReasonCode: validation.passCode, Message: validation.message, RemediationCode: "NONE"})
+		} else {
+			result.Checks = append(result.Checks, failV2(validation.name, validation.passCode+"_FAILED", validation.message, validation.remediation))
+		}
+	}
 	return finishDoctorV2(result)
 }
 
-func probeStagesComplete(stages []DoctorV2Stage) bool {
-	expected := []string{"auth", "schema_decode", "pii", "kafka", "raw_durable", "root_resolution", "simplified_durable", "visibility"}
-	if len(stages) != len(expected) {
-		return false
+func doctorObject(value any) map[string]any {
+	if item, ok := value.(map[string]any); ok {
+		return item
 	}
-	for i, v := range expected {
-		if stages[i].Stage != v || stages[i].Status != "accepted" {
-			return false
+	return map[string]any{}
+}
+
+func doctorObjectSlice(value any) []map[string]any {
+	items, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	result := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		if object, ok := item.(map[string]any); ok {
+			result = append(result, object)
 		}
 	}
-	return true
+	return result
 }
-func probeTransportFailure(result DoctorV2Result, code, message, remediation string) DoctorV2Result {
+
+func doctorString(values ...any) string {
+	for _, value := range values {
+		if text, ok := value.(string); ok && text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func doctorExactNumber(value any, expected float64) bool {
+	number, ok := value.(float64)
+	return ok && !math.IsNaN(number) && !math.IsInf(number, 0) && number == expected
+}
+
+func doctorInt(value any) (int, bool) {
+	number, ok := value.(float64)
+	if !ok || math.Trunc(number) != number || number < 0 || number > float64(^uint(0)>>1) {
+		return 0, false
+	}
+	return int(number), true
+}
+
+func probeReadFailure(result DoctorV2Result, code, message, remediation string) DoctorV2Result {
 	result.Checks = append(result.Checks, failV2("probe_transport", code, message, remediation))
 	return finishDoctorV2(result)
 }
+
 func decodeLimited(response *http.Response, destination any) error {
 	if response == nil || response.Body == nil {
 		return errors.New("empty response")

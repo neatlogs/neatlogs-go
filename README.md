@@ -194,6 +194,9 @@ NEATLOGS_ENDPOINT='https://ingest.neatlogs.com' \
 neatlogs doctor --probe --json
 ```
 
-Local mode validates SDK construction, normalization, masking, hierarchy,
-sampling, capture, and flush. Probe success additionally requires accepted
-receipts through authenticated visibility; HTTP acceptance alone is not a pass.
+Probe uses the normal `/v1/traces` OTLP route with the
+`x-neatlogs-doctor: v1` observability marker, then polls the existing
+`/api/traces/v3/:traceId` product route with the same project key. It passes
+only when the exact trace is visible and its persisted hierarchy, span
+semantics, input/output, versioned metadata, and numeric token totals validate.
+HTTP acceptance or exporter flush alone never reports success.
