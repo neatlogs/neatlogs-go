@@ -46,6 +46,12 @@ func run(arguments []string) int {
 	}
 	ctx := context.Background()
 	cfg := neatlogs.Config{APIKey: os.Getenv("NEATLOGS_API_KEY"), Endpoint: os.Getenv("NEATLOGS_ENDPOINT"), WorkflowName: "neatlogs.doctor.v2"}
+	if mode == "probe" && strings.TrimSpace(cfg.APIKey) == "" {
+		return output(doctorPreflightFailure("CREDENTIAL_MISSING", "A project ingestion credential is required", "SET_CREDENTIAL"), jsonOutput, 3)
+	}
+	if mode == "probe" && !validDoctorEndpoint(cfg.Endpoint) {
+		return output(doctorPreflightFailure("ENDPOINT_INVALID", "The trace endpoint is invalid", "SET_ENDPOINT"), jsonOutput, 3)
+	}
 	options := []neatlogs.Option{
 		neatlogs.WithExporter(tracetest.NewInMemoryExporter()),
 		neatlogs.WithDoctorProbe(),
@@ -129,6 +135,21 @@ func doctorSpanAttributes(spanType string) []attribute.KeyValue {
 		attribute.String("telemetry.sdk.language", "go"),
 		attribute.String("telemetry.sdk.version", neatlogs.Version),
 		attribute.String("neatlogs.span.type", spanType),
+	}
+}
+
+func doctorPreflightFailure(code, message, remediation string) neatlogs.DoctorV2Result {
+	return neatlogs.DoctorV2Result{
+		FormatVersion: neatlogs.DoctorV2FormatVersion,
+		Mode:          "probe",
+		Status:        neatlogs.DoctorFail,
+		FirstFailure:  &code,
+		Runtime: neatlogs.DoctorV2Runtime{
+			Language: "go", SDKVersion: neatlogs.Version, SchemaVersion: "2", Transport: "otlp_http_protobuf",
+		},
+		Checks: []neatlogs.DoctorV2Check{{
+			Name: "configuration", Status: neatlogs.DoctorFail, ReasonCode: code, Message: message, RemediationCode: remediation,
+		}},
 	}
 }
 

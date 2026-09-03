@@ -46,7 +46,7 @@ var persistedDoctorSpanID = regexp.MustCompile(`^[0-9a-f]{16}$`)
 func DoctorProbeV2(ctx context.Context, local DoctorV2Result, options DoctorProbeOptions) DoctorV2Result {
 	result := local
 	result.Mode = "probe"
-	if local.Capture == nil || local.Status == DoctorFail {
+	if local.Capture == nil || !doctorReadbackEligible(local) {
 		return result
 	}
 	if strings.TrimSpace(options.APIKey) == "" {
@@ -116,6 +116,25 @@ func DoctorProbeV2(ctx context.Context, local DoctorV2Result, options DoctorProb
 		case <-time.After(interval):
 		}
 	}
+}
+
+// A rejected OTLP export can still leave a complete post-mask capture. In that
+// case the authenticated product read is the authoritative way to classify a
+// bad project key. Structural/capture failures remain local and never trigger a
+// misleading backend request.
+func doctorReadbackEligible(local DoctorV2Result) bool {
+	for _, check := range local.Checks {
+		if check.Status != DoctorFail {
+			continue
+		}
+		switch check.ReasonCode {
+		case "EXPORT_RETRY_EXHAUSTED", "FLUSH_TIMEOUT":
+			continue
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func safeDoctorEndpoint(value string) (*url.URL, error) {
@@ -332,7 +351,15 @@ func doctorInt(value any) (int, bool) {
 }
 
 func probeReadFailure(result DoctorV2Result, code, message, remediation string) DoctorV2Result {
-	result.Checks = append(result.Checks, failV2("probe_transport", code, message, remediation))
+	check := failV2("probe_transport", code, message, remediation)
+	if code == "AUTH_FAILED" {
+		// Authentication is the actionable root classification even when the
+		// preceding OTLP flush recorded the same rejected credential as a
+		// transport failure.
+		result.Checks = append([]DoctorV2Check{check}, result.Checks...)
+	} else {
+		result.Checks = append(result.Checks, check)
+	}
 	return finishDoctorV2(result)
 }
 

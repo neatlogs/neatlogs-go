@@ -34,35 +34,49 @@ func TestResponseAccumulatorPreservesChoicesAndSemanticStreamEvidence(t *testing
 	}
 	defer shutdown(ctx)
 
-	wrapper := &GenAIModels{provider: geminiProvider, system: geminiSystem}
-	spanCtx, span, end := wrapper.startLLMSpan(ctx, "gemini-test", nil, true)
-	traceID := span.SpanContext().TraceID().String()
-	acc := newResponseAccumulator()
-	recordStreamChunk(span, acc, &google.GenerateContentResponse{Candidates: []*google.Candidate{
+	client, err := google.NewClient(ctx, &google.ClientConfig{
+		APIKey:  "test-google-key",
+		Backend: google.BackendGeminiAPI,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapper := WrapGenAI(client)
+	responses := []*google.GenerateContentResponse{{Candidates: []*google.Candidate{
 		{Index: 0, Content: &google.Content{Role: "model", Parts: []*google.Part{{Text: "A"}}}},
 		{Index: 1, Content: &google.Content{Role: "model", Parts: []*google.Part{
 			{Text: "X"},
 			{FunctionCall: &google.FunctionCall{ID: "call-1", Name: "weather", Args: map[string]any{"city": "Paris"}}},
 		}}},
-	}})
-	recordStreamChunk(span, acc, &google.GenerateContentResponse{Candidates: []*google.Candidate{
+	}}, {Candidates: []*google.Candidate{
 		{Index: 0, FinishReason: google.FinishReasonStop, Content: &google.Content{Role: "model", Parts: []*google.Part{{Text: "B"}}}},
 		{Index: 1, FinishReason: google.FinishReasonMaxTokens, Content: &google.Content{Role: "model", Parts: []*google.Part{
 			{Text: "Y"},
 			{FunctionCall: &google.FunctionCall{ID: "call-1", Name: "weather", Args: map[string]any{"unit": "C"}}},
 		}}},
-	}})
-	finalizeStream(span, acc, true, false)
-	_, tool, endTool := neatlogs.StartProviderSpan(spanCtx, "weather", attrs.KindTool)
-	tool.SetAttributes(
-		attribute.String(attrs.SpanKind, attrs.KindTool),
-		attribute.String("neatlogs.tool_call.id", "call-1"),
-		attribute.String("neatlogs.tool.name", "weather"),
-		attribute.String("neatlogs.tool.input", `{"city":"Paris","unit":"C"}`),
-		attribute.String("neatlogs.tool.output", `{"temperature":21}`),
-	)
-	endTool()
-	end()
+	}}}
+	wrapper.stream = func(streamCtx context.Context, _ string, _ []*google.Content, _ *google.GenerateContentConfig) iter.Seq2[*google.GenerateContentResponse, error] {
+		return func(yield func(*google.GenerateContentResponse, error) bool) {
+			for _, response := range responses {
+				if !yield(response, nil) {
+					return
+				}
+			}
+			_, tool, endTool := neatlogs.StartProviderSpan(streamCtx, "weather", attrs.KindTool)
+			tool.SetAttributes(
+				attribute.String(attrs.SpanKind, attrs.KindTool),
+				attribute.String("neatlogs.tool_call.id", "call-1"),
+				attribute.String("neatlogs.tool.name", "weather"),
+				attribute.String("neatlogs.tool.input", `{"city":"Paris","unit":"C"}`),
+				attribute.String("neatlogs.tool.output", `{"temperature":21}`),
+			)
+			endTool()
+		}
+	}
+	for range wrapper.GenerateContentStream(ctx, "gemini-test", nil, nil) {
+		// Consuming both responses exercises the wrapper's normal successful
+		// stream finalization path rather than manually invoking its helpers.
+	}
 	if err := neatlogs.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -78,6 +92,7 @@ func TestResponseAccumulatorPreservesChoicesAndSemanticStreamEvidence(t *testing
 	if got == nil {
 		t.Fatal("stream span not exported")
 	}
+	traceID := got.SpanContext.TraceID().String()
 	assertStringAttribute(t, got.Attributes, attrs.LLMOutputMessagePrefix+"0.content", "AB")
 	assertStringAttribute(t, got.Attributes, attrs.LLMOutputMessagePrefix+"1.content", "XY")
 	assertStringAttribute(t, got.Attributes, attrs.LLMChoicePrefix+"0.finish_reason", string(google.FinishReasonStop))
@@ -89,9 +104,11 @@ func TestResponseAccumulatorPreservesChoicesAndSemanticStreamEvidence(t *testing
 		t.Fatal("streamed fragments of one tool call were emitted as duplicate calls")
 	}
 	assertIntAttribute(t, got.Attributes, attrs.StreamChunkCount, 2)
-	assertBoolAttribute(t, got.Attributes, attrs.StreamCancelled, true)
-	if got.Status.Code != codes.Unset {
-		t.Fatalf("cancelled stream status = %v, want UNSET", got.Status.Code)
+	if value, ok := findAttribute(got.Attributes, attrs.StreamCancelled); ok && value.AsBool() {
+		t.Fatal("fully consumed stream was marked cancelled")
+	}
+	if got.Status.Code != codes.Ok {
+		t.Fatalf("completed stream status = %v, want OK", got.Status.Code)
 	}
 	if len(got.Events) != 2 {
 		t.Fatalf("stream events = %d, want one per chunk", len(got.Events))
@@ -113,7 +130,7 @@ func TestResponseAccumulatorPreservesChoicesAndSemanticStreamEvidence(t *testing
 		TraceID: traceID, RootSampleRate: 1, FlushOutcome: "success", FlushTimeout: time.Second,
 	})
 	if doctor.Status != neatlogs.DoctorPass || doctor.Capture == nil || doctor.Capture.SpanCount != 3 {
-		t.Fatalf("GenAI wrapper output did not survive Doctor capture: %#v spans=%#v", doctor, sink.GetSpans())
+		t.Fatalf("GenAI wrapper output did not survive Doctor capture for trace %q: %#v spans=%#v", traceID, doctor, sink.GetSpans())
 	}
 	rootID, llmID, toolID, expectedChoices := "1111111111111111", "2222222222222222", "3333333333333333", 2
 	expectedDigest, err := neatlogs.DoctorSemanticDigestV2(neatlogs.DoctorEnvelope{
@@ -123,8 +140,9 @@ func TestResponseAccumulatorPreservesChoicesAndSemanticStreamEvidence(t *testing
 			{SpanID: llmID, ParentSpanID: &rootID, Name: "google_genai.models.generate_content", Kind: "LLM", Status: "OK", Sampled: true, Ended: true,
 				Choices: []map[string]any{
 					{"index": 0, "message": map[string]any{"role": "assistant", "content": "AB"}, "finish_reason": string(google.FinishReasonStop)},
-					{"index": 1, "message": map[string]any{"role": "assistant", "content": "XY", "tool_calls": []map[string]any{{"id": "call-1", "name": "weather", "arguments": map[string]any{"city": "Paris", "unit": "C"}, "choice_index": int64(1), "tool_call_index": int64(0)}}}, "finish_reason": string(google.FinishReasonMaxTokens)},
-				}, ExpectedChoiceCount: &expectedChoices, Streaming: true},
+					{"index": 1, "message": map[string]any{"role": "assistant", "content": "XY"}, "finish_reason": string(google.FinishReasonMaxTokens)},
+				}, ExpectedChoiceCount: &expectedChoices,
+				ToolCalls: []map[string]any{{"id": "call-1", "name": "weather", "arguments": map[string]any{"city": "Paris", "unit": "C"}, "choice_index": int64(1), "tool_call_index": int64(0)}}, Streaming: true},
 			{SpanID: toolID, ParentSpanID: &llmID, Name: "weather", Kind: "TOOL", Status: "OK", Sampled: true, Ended: true,
 				ToolCall: map[string]any{"id": "call-1", "name": "weather", "arguments": map[string]any{"city": "Paris", "unit": "C"}, "result": map[string]any{"temperature": float64(21)}}},
 		},

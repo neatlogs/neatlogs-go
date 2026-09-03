@@ -31,6 +31,7 @@ type DoctorSpan struct {
 	Output              any            `json:"output,omitempty"`
 	Choices             any            `json:"choices,omitempty"`
 	ExpectedChoiceCount *int           `json:"expected_choice_count,omitempty"`
+	ToolCalls           any            `json:"tool_calls,omitempty"`
 	ToolCall            any            `json:"tool_call,omitempty"`
 	StreamFragments     any            `json:"stream_fragments,omitempty"`
 	Streaming           bool           `json:"streaming,omitempty"`
@@ -184,6 +185,7 @@ func doctorSpanFrom(span sdktrace.ReadOnlySpan) DoctorSpan {
 	input := doctorJSONValue(values["neatlogs.input.value"])
 	output := doctorJSONValue(values["neatlogs.output.value"])
 	choices, expectedChoiceCount := doctorChoices(values)
+	toolCalls := doctorToolCalls(values)
 	streamFragments := doctorStreamFragments(span)
 	toolCall := doctorToolCall(values, strings.EqualFold(strings.TrimPrefix(kind, "Neatlogs."), "tool"))
 	payloadReferences := doctorPayloadReferences(values)
@@ -202,7 +204,8 @@ func doctorSpanFrom(span sdktrace.ReadOnlySpan) DoctorSpan {
 	return DoctorSpan{SpanID: span.SpanContext().SpanID().String(), ParentSpanID: parent,
 		Name: span.Name(), Kind: strings.ToUpper(strings.TrimPrefix(kind, "Neatlogs.")), Status: status,
 		Input: input, Output: output, Choices: choices, ExpectedChoiceCount: expectedChoiceCount,
-		ToolCall: toolCall, StreamFragments: streamFragments, Streaming: streaming,
+		ToolCalls: toolCalls,
+		ToolCall:  toolCall, StreamFragments: streamFragments, Streaming: streaming,
 		Oversized: oversized, PayloadReferences: payloadReferences,
 		Sampled: span.SpanContext().IsSampled(), Ended: !span.EndTime().IsZero(), Attributes: values}
 }
@@ -212,7 +215,6 @@ func doctorChoices(values map[string]any) (any, *int) {
 	indexes := make(map[int]bool)
 	messages := make(map[int]map[string]any)
 	finishes := make(map[int]any)
-	toolCalls := make(map[int][]map[string]any)
 	for key, value := range values {
 		if index, field, ok := doctorIndexedField(key, "neatlogs.llm.output_messages."); ok {
 			indexes[index] = true
@@ -227,34 +229,6 @@ func doctorChoices(values map[string]any) (any, *int) {
 			finishes[index] = doctorJSONValue(value)
 		}
 	}
-	indexedCalls := make(map[int]map[string]any)
-	for key, value := range values {
-		index, field, ok := doctorIndexedField(key, "neatlogs.llm.tool_calls.")
-		if !ok {
-			continue
-		}
-		if indexedCalls[index] == nil {
-			indexedCalls[index] = make(map[string]any)
-		}
-		indexedCalls[index][field] = doctorJSONValue(value)
-	}
-	callIndexes := make([]int, 0, len(indexedCalls))
-	for index := range indexedCalls {
-		callIndexes = append(callIndexes, index)
-	}
-	sort.Ints(callIndexes)
-	for _, index := range callIndexes {
-		call := indexedCalls[index]
-		if _, ok := call["id"].(string); !ok {
-			continue
-		}
-		choiceIndex, ok := doctorInteger(call["choice_index"])
-		if !ok {
-			choiceIndex = 0
-		}
-		indexes[choiceIndex] = true
-		toolCalls[choiceIndex] = append(toolCalls[choiceIndex], call)
-	}
 	ordered := make([]int, 0, len(indexes))
 	for index := range indexes {
 		ordered = append(ordered, index)
@@ -265,9 +239,6 @@ func doctorChoices(values map[string]any) (any, *int) {
 		message := messages[index]
 		if message == nil {
 			message = make(map[string]any)
-		}
-		if len(toolCalls[index]) > 0 {
-			message["tool_calls"] = toolCalls[index]
 		}
 		choice := map[string]any{"index": index, "message": message}
 		if finish, ok := finishes[index]; ok {
@@ -282,6 +253,36 @@ func doctorChoices(values map[string]any) (any, *int) {
 		expected = len(choices)
 	}
 	return choicesOrNil(choices), &expected
+}
+
+func doctorToolCalls(values map[string]any) any {
+	indexed := make(map[int]map[string]any)
+	for key, value := range values {
+		index, field, ok := doctorIndexedField(key, "neatlogs.llm.tool_calls.")
+		if !ok {
+			continue
+		}
+		if indexed[index] == nil {
+			indexed[index] = make(map[string]any)
+		}
+		indexed[index][field] = doctorJSONValue(value)
+	}
+	indexes := make([]int, 0, len(indexed))
+	for index := range indexed {
+		indexes = append(indexes, index)
+	}
+	sort.Ints(indexes)
+	calls := make([]map[string]any, 0, len(indexes))
+	for _, index := range indexes {
+		call := indexed[index]
+		if _, ok := call["id"].(string); ok {
+			calls = append(calls, call)
+		}
+	}
+	if len(calls) == 0 {
+		return nil
+	}
+	return calls
 }
 
 func choicesOrNil(choices []map[string]any) any {
@@ -461,6 +462,7 @@ func semanticDigest(envelope DoctorEnvelope) (string, error) {
 		}
 		optional := map[string]any{
 			"input": span.Input, "output": span.Output, "choices": span.Choices,
+			"tool_calls":         span.ToolCalls,
 			"tool_call":          span.ToolCall,
 			"payload_references": span.PayloadReferences,
 		}

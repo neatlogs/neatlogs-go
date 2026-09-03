@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -49,6 +50,30 @@ func TestDoctorV2CapturesFinalEnvelope(t *testing.T) {
 	encoded, _ := json.Marshal(result)
 	if strings.Contains(string(encoded), "secret") {
 		t.Fatal("doctor leaked pre-mask content")
+	}
+}
+
+func TestDoctorLocalPreservesExplicitZeroRootSampleRate(t *testing.T) {
+	ctx := context.Background()
+	client, err := NewClient(ctx, Config{}, WithExporter(tracetest.NewInMemoryExporter()), WithDoctorProbe())
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientCtx := client.Context(ctx)
+	_, root, end := Trace(clientCtx, "doctor.zero-sample-rate")
+	traceID := root.SpanContext().TraceID().String()
+	end()
+	if err := client.Flush(clientCtx); err != nil {
+		t.Fatal(err)
+	}
+	result := DoctorCapturedLocalV2(clientCtx, DoctorLocalOptions{
+		TraceID: traceID, RootSampleRate: 0, FlushOutcome: "success", FlushTimeout: time.Second,
+	})
+	if result.Sampling == nil || result.Sampling.RootSampleRate != 0 {
+		t.Fatalf("root sample rate = %#v, want explicit 0", result.Sampling)
+	}
+	if err := client.Shutdown(ctx); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -139,6 +164,13 @@ func TestEmittedSpanCaptureDerivesChoicesStreamToolAndPayloadFields(t *testing.T
 	if projected.ExpectedChoiceCount == nil || *projected.ExpectedChoiceCount != 2 || doctorCollectionLength(projected.Choices) != 2 {
 		t.Fatalf("choice projection = %#v", projected)
 	}
+	if doctorCollectionLength(projected.ToolCalls) != 1 {
+		t.Fatalf("top-level tool request projection = %#v", projected.ToolCalls)
+	}
+	encodedChoices, err := json.Marshal(projected.Choices)
+	if err != nil || strings.Contains(string(encodedChoices), `"tool_calls":`) {
+		t.Fatalf("tool requests were duplicated into choices: %s err=%v", encodedChoices, err)
+	}
 	if !projected.Streaming || doctorCollectionLength(projected.StreamFragments) != 1 || !projected.Oversized || !doctorHasValidPayloadReference(projected.PayloadReferences) {
 		t.Fatalf("stream/payload projection = %#v", projected)
 	}
@@ -167,6 +199,25 @@ func TestDoctorSemanticDigestMatchesCanonicalFixture(t *testing.T) {
 	}
 	if digest != "sha256:824650f5fbc6d9f8d92381356411609263417219eaf7fdafbd2ba94795b6c4f7" {
 		t.Fatalf("digest=%s", digest)
+	}
+}
+
+func TestDoctorSemanticDigestMatchesSharedRichFixture(t *testing.T) {
+	fixture, err := os.ReadFile("testdata/doctor-v2/rich-envelope.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope DoctorEnvelope
+	if err := json.Unmarshal(fixture, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := DoctorSemanticDigestV2(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const expected = "sha256:45b1ebe029b272ceb45edb210978f6600d29ac50ca4d9cd0f4ef5abb3eff063e"
+	if digest != expected {
+		t.Fatalf("rich digest=%s, want %s", digest, expected)
 	}
 }
 

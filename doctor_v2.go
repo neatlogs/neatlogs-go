@@ -265,6 +265,9 @@ func validateDoctorEnvelope(envelope DoctorEnvelope) []DoctorV2Check {
 		if span.Oversized && !doctorHasValidPayloadReference(span.PayloadReferences) {
 			return []DoctorV2Check{failV2("payload", "PAYLOAD_ATTACHMENT_REQUIRED", "Oversized content requires a valid payload reference", "UPLOAD_PAYLOAD_ATTACHMENT")}
 		}
+		collectDoctorToolIDs(span.ToolCalls, toolRequests)
+		// Continue accepting legacy/manual envelopes that preserve requests in
+		// choices; runtime capture emits the canonical top-level field only.
 		collectDoctorToolIDs(span.Choices, toolRequests)
 		collectDoctorToolIDs(span.ToolCall, toolExecutions)
 	}
