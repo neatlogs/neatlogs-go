@@ -342,7 +342,7 @@ func initializationSignature(cfg Config, options initOptions) string {
 	}
 	keyDigest := sha256.Sum256([]byte(apiKey))
 	return fmt.Sprintf(
-		"key=%x|endpoint=%s|workflow=%s|tags=%q|debug=%t|rate=%g|disable=%t|uploads=%s|mask=%s|exporter=%s|signals=%t/%t",
+		"key=%x|endpoint=%s|workflow=%s|tags=%q|debug=%t|rate=%g|disable=%t|uploads=%s|mask=%s|exporter=%s|signals=%t/%t|doctor=%t",
 		keyDigest,
 		endpoint,
 		resolvedWorkflowNameFrom(cfg),
@@ -355,6 +355,7 @@ func initializationSignature(cfg Config, options initOptions) string {
 		identityOf(options.exporter),
 		cfg.EnableSignalHandlers,
 		cfg.DisableSignalHandlers,
+		options.doctorProbe,
 	)
 }
 

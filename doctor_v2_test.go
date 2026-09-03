@@ -540,6 +540,100 @@ func TestDoctorProbeMarkerUsesNormalOTLPRoute(t *testing.T) {
 	}
 }
 
+func TestGlobalInitOrdinaryThenDoctorDoesNotLeakProbeState(t *testing.T) {
+	var (
+		mu      sync.Mutex
+		headers []string
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		headers = append(headers, r.Header.Get("x-neatlogs-doctor"))
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	ctx := context.Background()
+	cfg := Config{APIKey: "project-key", Endpoint: server.URL, WorkflowName: "init-mode-isolation"}
+	shutdown, err := Init(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = shutdown(context.Background()) })
+	if _, err := Init(ctx, cfg, WithDoctorProbe()); err == nil {
+		t.Fatal("Doctor Init reused an ordinary global runtime")
+	}
+
+	_, span, end := Trace(ctx, "ordinary.after-conflicting-doctor-init")
+	traceID := span.SpanContext().TraceID().String()
+	end()
+	if err := Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := CapturedTraceIDs(ctx); len(got) != 0 {
+		t.Fatalf("ordinary runtime retained Doctor captures: %v", got)
+	}
+	if traceID == "00000000000000000000000000000000" {
+		t.Fatal("ordinary runtime emitted an invalid trace ID")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(headers) == 0 {
+		t.Fatal("ordinary runtime did not export")
+	}
+	for _, marker := range headers {
+		if marker != "" {
+			t.Fatalf("ordinary export leaked Doctor marker %q", marker)
+		}
+	}
+}
+
+func TestGlobalInitDoctorThenOrdinaryDoesNotLoseProbeState(t *testing.T) {
+	var (
+		mu      sync.Mutex
+		headers []string
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		headers = append(headers, r.Header.Get("x-neatlogs-doctor"))
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	ctx := context.Background()
+	cfg := Config{APIKey: "project-key", Endpoint: server.URL, WorkflowName: "init-mode-isolation"}
+	shutdown, err := Init(ctx, cfg, WithDoctorProbe())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = shutdown(context.Background()) })
+	if _, err := Init(ctx, cfg); err == nil {
+		t.Fatal("ordinary Init reused a Doctor global runtime")
+	}
+
+	_, span, end := Trace(ctx, "doctor.after-conflicting-ordinary-init")
+	traceID := span.SpanContext().TraceID().String()
+	end()
+	if err := Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ids := CapturedTraceIDs(ctx)
+	if len(ids) != 1 || ids[0] != traceID {
+		t.Fatalf("Doctor capture trace IDs = %v, want [%s]", ids, traceID)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(headers) == 0 {
+		t.Fatal("Doctor runtime did not export")
+	}
+	for _, marker := range headers {
+		if marker != "v1" {
+			t.Fatalf("Doctor export marker = %q, want v1", marker)
+		}
+	}
+}
+
 func TestDoctorProbeResourceMetadataIsVersioned(t *testing.T) {
 	resource := buildResource(context.Background(), Config{WorkflowName: "neatlogs.doctor.v2"}, true)
 	values := map[string]any{}
