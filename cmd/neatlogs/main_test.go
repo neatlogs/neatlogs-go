@@ -138,6 +138,51 @@ func TestProbeRejectsInvalidEndpointBeforeExport(t *testing.T) {
 	}
 }
 
+func TestDoctorInitializationFailurePreservesCanonicalFailureContract(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		mode string
+		exit int
+	}{
+		{name: "local", mode: "--local", exit: 2},
+		{name: "probe", mode: "--probe", exit: 3},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("NEATLOGS_API_KEY", "test-key")
+			t.Setenv("NEATLOGS_ENDPOINT", "http://127.0.0.1:1")
+			t.Setenv("NEATLOGS_UPLOADS_ENABLED", "invalid")
+
+			read, write, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			original := os.Stdout
+			os.Stdout = write
+			exit := run([]string{"doctor", test.mode, "--json"})
+			os.Stdout = original
+			_ = write.Close()
+			payload, readErr := io.ReadAll(read)
+			_ = read.Close()
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if exit != test.exit {
+				t.Fatalf("%s exit = %d, want %d\n%s", test.name, exit, test.exit, payload)
+			}
+			var result neatlogs.DoctorV2Result
+			if err := json.Unmarshal(payload, &result); err != nil {
+				t.Fatalf("decode Doctor result: %v\n%s", err, payload)
+			}
+			if result.Status != neatlogs.DoctorFail || result.FirstFailure == nil || *result.FirstFailure != "INSTRUMENTOR_INACTIVE" {
+				t.Fatalf("failure contract = status %q, first_failure %v", result.Status, result.FirstFailure)
+			}
+			if result.Mode != test.name || len(result.Checks) != 1 || result.Checks[0].ReasonCode != *result.FirstFailure {
+				t.Fatalf("failure result is inconsistent: %#v", result)
+			}
+		})
+	}
+}
+
 func TestProbeClassifiesRejectedProjectKeyThroughWriteAndReadRoutes(t *testing.T) {
 	const projectKey = "test-project-key-must-not-leak"
 	var posts atomic.Int32

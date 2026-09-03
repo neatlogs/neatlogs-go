@@ -63,7 +63,11 @@ func run(arguments []string) int {
 	}
 	client, err := neatlogs.NewClient(ctx, cfg, options...)
 	if err != nil {
-		return output(neatlogs.DoctorV2Result{FormatVersion: neatlogs.DoctorV2FormatVersion, Mode: mode, Status: neatlogs.DoctorFail, Runtime: neatlogs.DoctorV2Runtime{Language: "go", SDKVersion: neatlogs.Version, SchemaVersion: "2", Transport: "otlp_http_protobuf"}, Checks: []neatlogs.DoctorV2Check{{Name: "configuration", Status: neatlogs.DoctorFail, ReasonCode: "INSTRUMENTOR_INACTIVE", Message: "Doctor could not initialize an isolated runtime", RemediationCode: "ENABLE_INSTRUMENTOR"}}}, jsonOutput, 2)
+		exit := 2
+		if mode == "probe" {
+			exit = 3
+		}
+		return output(doctorFailure(mode, "INSTRUMENTOR_INACTIVE", "Doctor could not initialize an isolated runtime", "ENABLE_INSTRUMENTOR"), jsonOutput, exit)
 	}
 	clientCtx := client.Context(ctx)
 	rootCtx, root, endRoot := neatlogs.Trace(clientCtx, "doctor.probe.root")
@@ -139,9 +143,13 @@ func doctorSpanAttributes(spanType string) []attribute.KeyValue {
 }
 
 func doctorPreflightFailure(code, message, remediation string) neatlogs.DoctorV2Result {
+	return doctorFailure("probe", code, message, remediation)
+}
+
+func doctorFailure(mode, code, message, remediation string) neatlogs.DoctorV2Result {
 	return neatlogs.DoctorV2Result{
 		FormatVersion: neatlogs.DoctorV2FormatVersion,
-		Mode:          "probe",
+		Mode:          mode,
 		Status:        neatlogs.DoctorFail,
 		FirstFailure:  &code,
 		Runtime: neatlogs.DoctorV2Runtime{
