@@ -11,9 +11,6 @@
 !/examples/*/go.mod
 !/examples/*/go.sum
 !/examples/*/.env.example
-!/examples/genai/phase5/
-!/examples/genai/phase5/*.go
-!/examples/genai/phase5/*.md
 
 # Test / coverage
 *.test

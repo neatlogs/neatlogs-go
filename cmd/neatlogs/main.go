@@ -46,7 +46,10 @@ func run(arguments []string) int {
 	}
 	ctx := context.Background()
 	cfg := neatlogs.Config{APIKey: os.Getenv("NEATLOGS_API_KEY"), Endpoint: os.Getenv("NEATLOGS_ENDPOINT"), WorkflowName: "neatlogs.doctor.v2"}
-	options := []neatlogs.Option{neatlogs.WithExporter(tracetest.NewInMemoryExporter())}
+	options := []neatlogs.Option{
+		neatlogs.WithExporter(tracetest.NewInMemoryExporter()),
+		neatlogs.WithDoctorProbe(),
+	}
 	if mode == "probe" && cfg.APIKey != "" && validDoctorEndpoint(cfg.Endpoint) {
 		// Probe uses the same authenticated OTLP exporter as user telemetry. The
 		// versioned marker changes observability only; it never selects a tenant.
@@ -76,7 +79,8 @@ func run(arguments []string) int {
 	_, tool, endTool := neatlogs.StartSpan(rootCtx, "doctor.probe.tool", "tool", append(doctorSpanAttributes("TOOL"), attribute.String("neatlogs.input.value", `{"value":1}`), attribute.String("neatlogs.output.value", `{"value":2}`))...)
 	_ = tool
 	endTool()
-	_ = neatlogs.SetTraceOutput(root, map[string]any{"result": "generated diagnostic output"})
+	_ = neatlogs.SetTraceOutput(root, map[string]any{"result": map[string]int{"value": 2}})
+	root.SetAttributes(attribute.String("neatlogs.output.value", `{"result":{"value":2}}`))
 	endRoot()
 	flushStart := time.Now()
 	flushCtx, cancel := context.WithTimeout(clientCtx, 5*time.Second)

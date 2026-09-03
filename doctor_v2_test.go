@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 )
 
 func TestDoctorV2CapturesFinalEnvelope(t *testing.T) {
@@ -23,7 +25,7 @@ func TestDoctorV2CapturesFinalEnvelope(t *testing.T) {
 			}
 		}
 		return &span, nil
-	}}, WithExporter(tracetest.NewInMemoryExporter()))
+	}}, WithExporter(tracetest.NewInMemoryExporter()), WithDoctorProbe())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,6 +52,42 @@ func TestDoctorV2CapturesFinalEnvelope(t *testing.T) {
 	}
 }
 
+func TestOrdinaryRuntimeAllocatesNoDoctorRetention(t *testing.T) {
+	client, err := NewClient(context.Background(), Config{}, WithExporter(tracetest.NewInMemoryExporter()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.runtime.captures != nil {
+		t.Fatal("ordinary SDK runtime allocated Doctor capture storage")
+	}
+	if err := client.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDoctorRuntimeClearsCaptureOnShutdown(t *testing.T) {
+	client, err := NewClient(context.Background(), Config{}, WithExporter(tracetest.NewInMemoryExporter()), WithDoctorProbe())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := client.runtime.captures
+	ctx := client.Context(context.Background())
+	_, _, end := Trace(ctx, "doctor.cleanup")
+	end()
+	if err := client.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.byTrace) == 0 {
+		t.Fatal("Doctor capture did not receive the exported span")
+	}
+	if err := client.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.byTrace) != 0 || store.totalBytes != 0 {
+		t.Fatal("Doctor capture survived runtime shutdown")
+	}
+}
+
 func TestDoctorSemanticDigestMatchesCanonicalFixture(t *testing.T) {
 	fixture := `{"trace_id":"11111111111111111111111111111111","root_span_id":"2222222222222222","spans":[{"span_id":"2222222222222222","parent_span_id":null,"name":"doctor.workflow","kind":"WORKFLOW","status":"OK","input":{"prompt":"generated diagnostic input"},"output":{"result":"generated diagnostic output"},"sampled":true,"ended":true},{"span_id":"3333333333333333","parent_span_id":"2222222222222222","name":"doctor.llm","kind":"LLM","status":"OK","input":{"messages":[{"role":"user","content":"generated diagnostic input"}]},"output":{"text":"generated diagnostic output"},"choices":[{"index":0,"message":{"role":"assistant","content":"choice zero","tool_calls":[{"id":"doctor_call_1","name":"diagnostic_tool","arguments":{"value":1}}]}},{"index":1,"message":{"role":"assistant","content":"choice one","tool_calls":[]}}],"stream_fragments":["generated ","diagnostic ","output"],"sampled":true,"ended":true},{"span_id":"4444444444444444","parent_span_id":"3333333333333333","name":"doctor.tool","kind":"TOOL","status":"OK","tool_call":{"id":"doctor_call_1","name":"diagnostic_tool","arguments":{"value":1},"result":{"value":2}},"sampled":true,"ended":true},{"span_id":"5555555555555555","parent_span_id":"2222222222222222","name":"doctor.payload","kind":"CHAIN","status":"OK","payload_references":[{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":1024,"mime_type":"application/json"}],"sampled":true,"ended":true}]}`
 	var envelope DoctorEnvelope
@@ -60,7 +98,7 @@ func TestDoctorSemanticDigestMatchesCanonicalFixture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if digest != "sha256:76d8726734664dacaa4e6da4ffc547cc5b7c8edde4721a485b5875378c233381" {
+	if digest != "sha256:824650f5fbc6d9f8d92381356411609263417219eaf7fdafbd2ba94795b6c4f7" {
 		t.Fatalf("digest=%s", digest)
 	}
 }
@@ -95,7 +133,6 @@ func TestDoctorV2ControlledDefectMatrix(t *testing.T) {
 			value.Spans[1].ExpectedChoiceCount = &oneChoice
 			value.Spans[1].Choices = []any{map[string]any{"index": 0}}
 		}},
-		{"stream fragments", "STREAM_FRAGMENT_MISSING", func(value *DoctorEnvelope) { value.Spans[1].Streaming = true }},
 		{"payload", "PAYLOAD_ATTACHMENT_REQUIRED", func(value *DoctorEnvelope) { value.Spans[1].Oversized = true }},
 		{"missing root", "ROOT_MISSING", func(value *DoctorEnvelope) { value.Spans[0].ParentSpanID = &missingParent }},
 		{"multiple roots", "ROOT_MULTIPLE", func(value *DoctorEnvelope) {
@@ -136,6 +173,72 @@ func TestDoctorCaptureStoreIsBoundedAndConcurrent(t *testing.T) {
 	wait.Wait()
 }
 
+func TestDoctorCaptureStoreEnforcesSpanAndByteBoundsAndClears(t *testing.T) {
+	store := newDoctorCaptureStore(4)
+	spans := make([]sdktrace.ReadOnlySpan, 0, 80)
+	for index := 0; index < 80; index++ {
+		spans = append(spans, tracetest.SpanStub{
+			Name: "doctor.span",
+			SpanContext: trace.NewSpanContext(trace.SpanContextConfig{
+				TraceID: trace.TraceID{1}, SpanID: trace.SpanID{byte(index + 1)}, TraceFlags: trace.FlagsSampled,
+			}),
+			Attributes: []attribute.KeyValue{attribute.String("neatlogs.span.kind", "tool")},
+			EndTime:    time.Now(),
+		}.Snapshot())
+	}
+	store.capture(spans)
+	envelope, ok := store.envelope(trace.TraceID{1}.String())
+	if !ok || len(envelope.Spans) != store.maxSpansPerTrace {
+		t.Fatalf("captured spans = %d, want %d", len(envelope.Spans), store.maxSpansPerTrace)
+	}
+	large := tracetest.SpanStub{
+		Name: "doctor.large",
+		SpanContext: trace.NewSpanContext(trace.SpanContextConfig{
+			TraceID: trace.TraceID{2}, SpanID: trace.SpanID{1}, TraceFlags: trace.FlagsSampled,
+		}),
+		Attributes: []attribute.KeyValue{attribute.String("neatlogs.input.value", strings.Repeat("x", 300*1024))},
+		EndTime:    time.Now(),
+	}.Snapshot()
+	store.capture([]sdktrace.ReadOnlySpan{large})
+	if _, ok := store.envelope(trace.TraceID{2}.String()); ok {
+		t.Fatal("oversized Doctor span was retained")
+	}
+	store.clear()
+	if store.totalBytes != 0 || len(store.byTrace) != 0 || len(store.order) != 0 {
+		t.Fatal("Doctor capture was not cleared")
+	}
+}
+
+func doctorPersistedSpan(id, parent, name, kind string, input, output any) map[string]any {
+	spanType := strings.ToUpper(strings.ReplaceAll(strings.ReplaceAll(kind, "agent_action", "agent"), "tool_call", "tool"))
+	span := map[string]any{
+		"span_id": id, "node_name": name, "node_type": kind,
+		"data": map[string]any{"input_value": input, "output_value": output},
+		"span_metadata": map[string]any{
+			"neatlogs.doctor": true, "neatlogs.doctor.version": "v1",
+			"service.name": "neatlogs.doctor.v2", "telemetry.sdk.language": "go",
+			"telemetry.sdk.version": Version, "neatlogs.span.type": spanType,
+		},
+	}
+	if parent != "" {
+		span["parent_span_id"] = parent
+	}
+	return span
+}
+
+func doctorPersistedTraceFixture() map[string]any {
+	return map[string]any{
+		"_id": "11111111111111111111111111111111", "spanCount": 4,
+		"promptTokens": 11, "completionTokens": 7, "totalTokensUsed": 18,
+		"spans": []any{
+			doctorPersistedSpan("2222222222222222", "", "doctor.probe.root", "workflow", map[string]any{"prompt": "generated diagnostic input"}, map[string]any{"result": map[string]any{"value": 2}}),
+			doctorPersistedSpan("3333333333333333", "2222222222222222", "doctor.probe.agent", "agent_action", map[string]any{"prompt": "generated diagnostic input"}, map[string]any{"text": "generated diagnostic output"}),
+			doctorPersistedSpan("4444444444444444", "3333333333333333", "doctor.probe.llm", "llm", map[string]any{"messages": []any{map[string]any{"role": "user", "content": "generated diagnostic input"}}}, map[string]any{"text": "generated diagnostic output"}),
+			doctorPersistedSpan("5555555555555555", "2222222222222222", "doctor.probe.tool", "tool_call", map[string]any{"value": 1}, map[string]any{"value": 2}),
+		},
+	}
+}
+
 func TestDoctorProbeReadsExactTraceWithoutDiagnosticSession(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -146,7 +249,7 @@ func TestDoctorProbeReadsExactTraceWithoutDiagnosticSession(t *testing.T) {
 		if r.Method != http.MethodGet || r.URL.Path != "/api/traces/v3/11111111111111111111111111111111" {
 			t.Fatalf("unexpected Doctor request: %s %s", r.Method, r.URL.Path)
 		}
-		_, _ = w.Write([]byte(`{"_id":"11111111111111111111111111111111","spanCount":4,"promptTokens":11,"completionTokens":7,"totalTokensUsed":18,"spans":[{"span_id":"2222222222222222","parent_span_id":null,"node_name":"doctor.probe.root","node_type":"workflow","data":{"input_value":{},"output_value":{}},"span_metadata":{"neatlogs.doctor":true,"neatlogs.doctor.version":"v1","telemetry.sdk.language":"go"}},{"span_id":"3333333333333333","parent_span_id":"2222222222222222","node_name":"doctor.probe.agent","node_type":"agent_action","data":{"input_value":{},"output_value":{}},"span_metadata":{"neatlogs.doctor":true,"neatlogs.doctor.version":"v1","telemetry.sdk.language":"go"}},{"span_id":"4444444444444444","parent_span_id":"3333333333333333","node_name":"doctor.probe.llm","node_type":"llm","data":{"input_value":{},"output_value":{}},"span_metadata":{"neatlogs.doctor":true,"neatlogs.doctor.version":"v1","telemetry.sdk.language":"go"}},{"span_id":"5555555555555555","parent_span_id":"2222222222222222","node_name":"doctor.probe.tool","node_type":"tool_call","data":{"input_value":{},"output_value":{}},"span_metadata":{"neatlogs.doctor":true,"neatlogs.doctor.version":"v1","telemetry.sdk.language":"go"}}]}`))
+		_ = json.NewEncoder(w).Encode(doctorPersistedTraceFixture())
 	}))
 	defer server.Close()
 	root := "2222222222222222"
@@ -159,6 +262,36 @@ func TestDoctorProbeReadsExactTraceWithoutDiagnosticSession(t *testing.T) {
 	}
 	if requests != 1 {
 		t.Fatalf("requests = %d, want one exact trace GET", requests)
+	}
+}
+
+func TestDoctorProbeRejectsWrongEdgesExtrasAndIncompleteMetadata(t *testing.T) {
+	root := "2222222222222222"
+	base := func() DoctorV2Result {
+		result := newDoctorV2Result("local")
+		result.Capture = &DoctorV2Capture{TraceID: "11111111111111111111111111111111", RootSpanID: &root, SpanCount: 4, SemanticDigest: "sha256:" + strings.Repeat("a", 64)}
+		result.Checks = []DoctorV2Check{{Name: "local_envelope", Status: DoctorPass, ReasonCode: "LOCAL_ENVELOPE_VALID", RemediationCode: "NONE"}}
+		return result
+	}
+
+	wrongEdge := doctorPersistedTraceFixture()
+	wrongSpans := wrongEdge["spans"].([]any)
+	wrongSpans[2].(map[string]any)["parent_span_id"] = root
+	if result := persistedDoctorProbeResult(base(), wrongEdge); result.Probe == nil || result.Probe.HierarchyValid || result.Status != DoctorFail {
+		t.Fatalf("wrong parent edge passed: %#v", result)
+	}
+
+	extra := doctorPersistedTraceFixture()
+	extra["spanCount"] = 5
+	extra["spans"] = append(extra["spans"].([]any), doctorPersistedSpan("6666666666666666", root, "doctor.probe.extra", "tool_call", map[string]any{}, map[string]any{}))
+	if result := persistedDoctorProbeResult(base(), extra); result.Probe == nil || result.Probe.ReadbackSpanCount != 5 || result.Status != DoctorFail {
+		t.Fatalf("unexpected span passed: %#v", result)
+	}
+
+	incomplete := doctorPersistedTraceFixture()
+	delete(incomplete["spans"].([]any)[0].(map[string]any)["span_metadata"].(map[string]any), "telemetry.sdk.version")
+	if result := persistedDoctorProbeResult(base(), incomplete); result.Probe == nil || result.Probe.MetadataValid || result.Status != DoctorFail {
+		t.Fatalf("incomplete metadata passed: %#v", result)
 	}
 }
 

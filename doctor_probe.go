@@ -129,25 +129,15 @@ func safeDoctorEndpoint(value string) (*url.URL, error) {
 func persistedDoctorProbeResult(result DoctorV2Result, traceData map[string]any) DoctorV2Result {
 	spans := doctorObjectSlice(traceData["spans"])
 	idSet := make(map[string]bool, len(spans))
-	rootCount := 0
-	hierarchyValid := true
+	byName := make(map[string]map[string]any, len(spans))
+	hierarchyValid := len(spans) == 4
 	for _, span := range spans {
 		id, _ := span["span_id"].(string)
 		if !persistedDoctorSpanID.MatchString(id) || idSet[id] {
 			hierarchyValid = false
 		}
 		idSet[id] = true
-		if parent, ok := span["parent_span_id"].(string); !ok || parent == "" {
-			rootCount++
-		}
-	}
-	if rootCount != 1 {
-		hierarchyValid = false
-	}
-	for _, span := range spans {
-		if parent, ok := span["parent_span_id"].(string); ok && parent != "" && !idSet[parent] {
-			hierarchyValid = false
-		}
+		byName[doctorString(span["node_name"], span["span_name"])] = span
 	}
 
 	expected := map[string]string{
@@ -156,35 +146,51 @@ func persistedDoctorProbeResult(result DoctorV2Result, traceData map[string]any)
 		"doctor.probe.llm":   "llm",
 		"doctor.probe.tool":  "tool_call",
 	}
-	attributesValid := true
+	attributesValid := len(byName) == len(expected)
 	inputOutputValid := true
 	metadataValid := true
+	expectedIO := map[string][2]any{
+		"doctor.probe.root":  {map[string]any{"prompt": "generated diagnostic input"}, map[string]any{"result": map[string]any{"value": float64(2)}}},
+		"doctor.probe.agent": {map[string]any{"prompt": "generated diagnostic input"}, map[string]any{"text": "generated diagnostic output"}},
+		"doctor.probe.llm":   {map[string]any{"messages": []any{map[string]any{"role": "user", "content": "generated diagnostic input"}}}, map[string]any{"text": "generated diagnostic output"}},
+		"doctor.probe.tool":  {map[string]any{"value": float64(1)}, map[string]any{"value": float64(2)}},
+	}
 	for name, kind := range expected {
-		var match map[string]any
-		for _, span := range spans {
-			spanName := doctorString(span["node_name"], span["span_name"])
-			spanType := strings.ToLower(doctorString(span["node_type"], span["span_type"]))
-			if spanName == name && spanType == kind {
-				match = span
-				break
-			}
-		}
+		match := byName[name]
 		if match == nil {
 			attributesValid = false
 			inputOutputValid = false
 			metadataValid = false
 			continue
 		}
+		if strings.ToLower(doctorString(match["node_type"], match["span_type"])) != kind {
+			attributesValid = false
+		}
 		data := doctorObject(match["data"])
-		_, hasInput := data["input_value"]
-		_, hasOutput := data["output_value"]
-		if !hasInput || !hasOutput {
+		io := expectedIO[name]
+		if !doctorValuesEqual(doctorJSONValue(data["input_value"]), io[0]) ||
+			!doctorValuesEqual(doctorJSONValue(data["output_value"]), io[1]) {
 			inputOutputValid = false
 		}
 		metadata := doctorObject(match["span_metadata"])
-		if metadata["neatlogs.doctor"] != true || metadata["neatlogs.doctor.version"] != "v1" || metadata["telemetry.sdk.language"] != "go" {
+		spanType := strings.ToUpper(strings.ReplaceAll(strings.ReplaceAll(kind, "agent_action", "agent"), "tool_call", "tool"))
+		if metadata["neatlogs.doctor"] != true || metadata["neatlogs.doctor.version"] != "v1" ||
+			metadata["service.name"] != "neatlogs.doctor.v2" || metadata["telemetry.sdk.language"] != "go" ||
+			metadata["telemetry.sdk.version"] != Version || metadata["neatlogs.span.type"] != spanType {
 			metadataValid = false
 		}
+	}
+	if len(byName) != 4 {
+		hierarchyValid = false
+	}
+	if hierarchyValid {
+		rootID, _ := byName["doctor.probe.root"]["span_id"].(string)
+		agentID, _ := byName["doctor.probe.agent"]["span_id"].(string)
+		rootParent, _ := byName["doctor.probe.root"]["parent_span_id"].(string)
+		hierarchyValid = rootParent == "" &&
+			doctorString(byName["doctor.probe.agent"]["parent_span_id"]) == rootID &&
+			doctorString(byName["doctor.probe.llm"]["parent_span_id"]) == agentID &&
+			doctorString(byName["doctor.probe.tool"]["parent_span_id"]) == rootID
 	}
 
 	typedTokensValid := doctorExactNumber(traceData["promptTokens"], 11) &&
@@ -207,7 +213,7 @@ func persistedDoctorProbeResult(result DoctorV2Result, traceData map[string]any)
 		name, passCode, remediation, message string
 		passed                               bool
 	}{
-		{"probe_visibility", "TRACE_VISIBLE", "WAIT_FOR_TRACE", "The exact Doctor trace is visible through the authenticated trace API", visible && result.Capture != nil && readbackSpanCount >= result.Capture.SpanCount},
+		{"probe_visibility", "TRACE_VISIBLE", "WAIT_FOR_TRACE", "The exact Doctor trace is visible through the authenticated trace API", visible && result.Capture != nil && readbackSpanCount == 4 && len(spans) == 4},
 		{"probe_hierarchy", "HIERARCHY_VALID", "CHECK_TRACE_FINALIZER", "The persisted Doctor hierarchy has one root and valid parents", hierarchyValid},
 		{"probe_attributes", "ATTRIBUTES_VALID", "CHECK_ATTRIBUTE_MAPPING", "The persisted Doctor span names and types are complete", attributesValid},
 		{"probe_input_output", "INPUT_OUTPUT_VALID", "CHECK_PAYLOAD_MAPPING", "The persisted Doctor spans retain input and output", inputOutputValid},
@@ -222,6 +228,12 @@ func persistedDoctorProbeResult(result DoctorV2Result, traceData map[string]any)
 		}
 	}
 	return finishDoctorV2(result)
+}
+
+func doctorValuesEqual(left, right any) bool {
+	leftJSON, leftErr := json.Marshal(left)
+	rightJSON, rightErr := json.Marshal(right)
+	return leftErr == nil && rightErr == nil && string(leftJSON) == string(rightJSON)
 }
 
 func doctorObject(value any) map[string]any {

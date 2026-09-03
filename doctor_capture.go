@@ -43,40 +43,102 @@ type DoctorSpan struct {
 }
 
 type doctorCaptureStore struct {
-	mu       sync.RWMutex
-	capacity int
-	order    []string
-	byTrace  map[string]map[string]DoctorSpan
+	mu               sync.RWMutex
+	capacity         int
+	maxSpansPerTrace int
+	maxBytesPerTrace int
+	maxBytesTotal    int
+	totalBytes       int
+	order            []string
+	byTrace          map[string]map[string]DoctorSpan
+	traceBytes       map[string]int
 }
 
 func newDoctorCaptureStore(capacity int) *doctorCaptureStore {
-	return &doctorCaptureStore{capacity: capacity, byTrace: make(map[string]map[string]DoctorSpan)}
+	return &doctorCaptureStore{
+		capacity: capacity, maxSpansPerTrace: 64, maxBytesPerTrace: 256 * 1024,
+		maxBytesTotal: 1024 * 1024, byTrace: make(map[string]map[string]DoctorSpan),
+		traceBytes: make(map[string]int),
+	}
 }
 
 func (s *doctorCaptureStore) capture(spans []sdktrace.ReadOnlySpan) {
 	if s == nil {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	type preparedSpan struct {
+		traceID, spanID string
+		span            DoctorSpan
+		size            int
+	}
+	prepared := make([]preparedSpan, 0, len(spans))
 	for _, span := range spans {
-		// The backend folds the completion marker into trace lifecycle state, so
-		// Doctor compares only the four user-visible semantic fixture spans.
 		if span.Name() == completionMarkerName {
 			continue
 		}
-		traceID := span.SpanContext().TraceID().String()
-		spanID := span.SpanContext().SpanID().String()
+		item := doctorSpanFrom(span)
+		encoded, err := json.Marshal(item)
+		if err != nil || len(encoded) > s.maxBytesPerTrace {
+			continue
+		}
+		prepared = append(prepared, preparedSpan{
+			traceID: span.SpanContext().TraceID().String(),
+			spanID:  span.SpanContext().SpanID().String(),
+			span:    item, size: len(encoded),
+		})
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, item := range prepared {
+		traceID, spanID := item.traceID, item.spanID
 		if _, exists := s.byTrace[traceID]; !exists {
 			if len(s.order) == s.capacity {
-				delete(s.byTrace, s.order[0])
+				s.evictLocked(s.order[0])
 				s.order = s.order[1:]
 			}
 			s.order = append(s.order, traceID)
 			s.byTrace[traceID] = make(map[string]DoctorSpan)
 		}
-		s.byTrace[traceID][spanID] = doctorSpanFrom(span)
+		previous, exists := s.byTrace[traceID][spanID]
+		if !exists && len(s.byTrace[traceID]) >= s.maxSpansPerTrace {
+			continue
+		}
+		previousSize := 0
+		if exists {
+			encoded, _ := json.Marshal(previous)
+			previousSize = len(encoded)
+		}
+		nextTraceBytes := s.traceBytes[traceID] - previousSize + item.size
+		if nextTraceBytes > s.maxBytesPerTrace {
+			continue
+		}
+		s.byTrace[traceID][spanID] = item.span
+		s.traceBytes[traceID] = nextTraceBytes
+		s.totalBytes += item.size - previousSize
+		for s.totalBytes > s.maxBytesTotal && len(s.order) > 1 {
+			evicted := s.order[0]
+			s.order = s.order[1:]
+			s.evictLocked(evicted)
+		}
 	}
+}
+
+func (s *doctorCaptureStore) evictLocked(traceID string) {
+	s.totalBytes -= s.traceBytes[traceID]
+	delete(s.traceBytes, traceID)
+	delete(s.byTrace, traceID)
+}
+
+func (s *doctorCaptureStore) clear() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.order = nil
+	s.byTrace = make(map[string]map[string]DoctorSpan)
+	s.traceBytes = make(map[string]int)
+	s.totalBytes = 0
+	s.mu.Unlock()
 }
 
 func (s *doctorCaptureStore) envelope(traceID string) (DoctorEnvelope, bool) {
@@ -167,17 +229,51 @@ func doctorAttributeValue(value attribute.Value) any {
 }
 
 func semanticDigest(envelope DoctorEnvelope) (string, error) {
-	encoded, err := json.Marshal(envelope)
-	if err != nil {
-		return "", err
+	namesByID := make(map[string]string, len(envelope.Spans))
+	for _, span := range envelope.Spans {
+		namesByID[span.SpanID] = span.Name
 	}
-	// Round-trip through interface maps so encoding/json emits every object key
-	// lexicographically, independent of Go struct declaration order.
-	var canonical any
-	if err := json.Unmarshal(encoded, &canonical); err != nil {
-		return "", err
+	projection := make([]map[string]any, 0, len(envelope.Spans))
+	for _, span := range envelope.Spans {
+		if span.Name == completionMarkerName {
+			continue
+		}
+		item := map[string]any{
+			"name": span.Name, "kind": span.Kind, "status": span.Status,
+			"sampled": span.Sampled, "ended": span.Ended,
+		}
+		if span.ParentSpanID == nil {
+			item["parent"] = nil
+		} else {
+			item["parent"] = namesByID[*span.ParentSpanID]
+		}
+		optional := map[string]any{
+			"input": span.Input, "output": span.Output, "choices": span.Choices,
+			"tool_call":          span.ToolCall,
+			"payload_references": span.PayloadReferences,
+		}
+		for key, value := range optional {
+			if value != nil {
+				item[key] = value
+			}
+		}
+		if span.ExpectedChoiceCount != nil {
+			item["expected_choice_count"] = *span.ExpectedChoiceCount
+		}
+		if span.Streaming {
+			item["streaming"] = true
+		}
+		if span.Oversized {
+			item["oversized"] = true
+		}
+		projection = append(projection, item)
 	}
-	encoded, err = json.Marshal(canonical)
+	sort.Slice(projection, func(i, j int) bool {
+		left, right := projection[i], projection[j]
+		return left["name"].(string) < right["name"].(string) ||
+			(left["name"] == right["name"] && left["kind"].(string) < right["kind"].(string))
+	})
+	encoded, err := json.Marshal(map[string]any{"spans": projection})
 	if err != nil {
 		return "", err
 	}

@@ -440,6 +440,10 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 	)
 
 	var mediaStore *internalmedia.Store
+	var captures *doctorCaptureStore
+	if io.doctorProbe {
+		captures = newDoctorCaptureStore(16)
+	}
 	if !disable {
 		exp := io.exporter
 		if exp == nil {
@@ -466,7 +470,7 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 		batchProcessor := sdktrace.NewBatchSpanProcessor(
 			&normalizingExporter{
 				next: byteLimited, mapper: attributes.Default(), mask: cfg.Mask,
-				delivery: delivery, uploads: uploads, release: queue.release,
+				delivery: delivery, uploads: uploads, captures: captures, release: queue.release,
 			},
 			sdktrace.WithMaxQueueSize(defaultMaxQueueSize),
 			sdktrace.WithMaxExportBatchSize(defaultMaxExportBatchSize),
@@ -486,7 +490,7 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 	if !disable {
 		tp.RegisterSpanProcessor(&completionProcessor{tracer: tp.Tracer(tracerName, trace.WithInstrumentationVersion(Version))})
 	}
-	return newSDKRuntime(tp, lifecycle, resolvedWorkflowNameFrom(cfg), io.delivery, mediaStore), base, !disable, nil
+	return newSDKRuntime(tp, lifecycle, resolvedWorkflowNameFrom(cfg), io.delivery, mediaStore, captures), base, !disable, nil
 }
 
 func resolveUploadsEnabled(cfg Config) (bool, error) {

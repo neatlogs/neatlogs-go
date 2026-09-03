@@ -37,13 +37,14 @@ type sdkRuntime struct {
 	workflowName string
 	delivery     *deliveryDiagnostics
 	media        *internalmedia.Store
+	captures     *doctorCaptureStore
 
 	done        chan struct{}
 	shutdownErr error
 	signals     *shutdownSignalController
 }
 
-func newSDKRuntime(tp *sdktrace.TracerProvider, lifecycle *activeSpanRegistry, workflowName string, delivery *deliveryDiagnostics, media *internalmedia.Store) *sdkRuntime {
+func newSDKRuntime(tp *sdktrace.TracerProvider, lifecycle *activeSpanRegistry, workflowName string, delivery *deliveryDiagnostics, media *internalmedia.Store, captures *doctorCaptureStore) *sdkRuntime {
 	return &sdkRuntime{
 		state:        stateRunning,
 		provider:     tp,
@@ -52,6 +53,7 @@ func newSDKRuntime(tp *sdktrace.TracerProvider, lifecycle *activeSpanRegistry, w
 		workflowName: workflowName,
 		delivery:     delivery,
 		media:        media,
+		captures:     captures,
 		done:         make(chan struct{}),
 	}
 }
@@ -186,6 +188,9 @@ func (r *sdkRuntime) shutdown(ctx context.Context, reason string) error {
 	err := r.provider.Shutdown(ctx)
 	if r.media != nil {
 		r.media.Close()
+	}
+	if r.captures != nil {
+		r.captures.clear()
 	}
 
 	r.mu.Lock()

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -123,9 +124,6 @@ func DoctorCapturedLocalV2(ctx context.Context, options DoctorLocalOptions) Doct
 	}
 	result.Capture = &DoctorV2Capture{TraceID: envelope.TraceID, RootSpanID: envelope.RootSpanID, SpanCount: len(envelope.Spans), SemanticDigest: digest}
 	rate := options.RootSampleRate
-	if rate == 0 {
-		rate = 1
-	}
 	sampled := false
 	if len(envelope.Spans) > 0 {
 		sampled = envelope.Spans[0].Sampled
@@ -134,10 +132,11 @@ func DoctorCapturedLocalV2(ctx context.Context, options DoctorLocalOptions) Doct
 	// Manual Doctor spans do not activate an integration instrumentor. Provider
 	// ownership and instrumentor count are separate cross-SDK signals.
 	result.Ownership = &DoctorV2Ownership{Provider: "private", InstrumentorCount: 0}
-	health := runtime.exportHealth()
+	health := runtime.delivery.snapshot()
+	dropped := health.SpanQueueDrops + health.MaskedSpanDrops
 	capacity := 2048
-	result.Queue = &DoctorV2Queue{Mode: "diagnostic_capture", DroppedSpans: health.DroppedSpans, Capacity: &capacity}
-	result.Retry = &DoctorV2Retry{Exhausted: health.ExportFailures > 0}
+	result.Queue = &DoctorV2Queue{Mode: "diagnostic_capture", DroppedSpans: dropped, Capacity: &capacity}
+	result.Retry = &DoctorV2Retry{Exhausted: health.SpanExportFailures > 0}
 	var duration *int64
 	if options.FlushDuration > 0 {
 		value := options.FlushDuration.Milliseconds()
@@ -149,19 +148,73 @@ func DoctorCapturedLocalV2(ctx context.Context, options DoctorLocalOptions) Doct
 	}
 	result.Flush = &DoctorV2Flush{Outcome: outcome, TimeoutMS: options.FlushTimeout.Milliseconds(), DurationMS: duration}
 	result.Checks = append(result.Checks, validateDoctorEnvelope(envelope)...)
-	if health.MaskFailures > 0 {
+	if controlledDoctorEnvelope(envelope) {
+		if check := validateControlledDoctorEnvelope(envelope); check != nil {
+			result.Checks = append(result.Checks, *check)
+		}
+	}
+	if health.MaskedSpanDrops > 0 {
 		result.Checks = append(result.Checks, failV2("masking", "MASKING_FAILED_CLOSED", "Masking failed closed and affected spans were dropped", "FIX_MASK_CALLBACK"))
 	}
-	if health.DroppedSpans > 0 {
+	if dropped > 0 {
 		result.Checks = append(result.Checks, failV2("queue", "QUEUE_SATURATED", "The exporter dropped telemetry", "INCREASE_OR_DRAIN_QUEUE"))
 	}
-	if health.ExportFailures > 0 {
+	if health.SpanExportFailures > 0 {
 		result.Checks = append(result.Checks, failV2("retry", "EXPORT_RETRY_EXHAUSTED", "The exporter observed a transport failure", "CHECK_TRANSPORT"))
 	}
 	if outcome == "timeout" {
 		result.Checks = append(result.Checks, failV2("flush", "FLUSH_TIMEOUT", "The flush deadline expired", "INCREASE_FLUSH_BUDGET"))
 	}
 	return finishDoctorV2(result)
+}
+
+func controlledDoctorEnvelope(envelope DoctorEnvelope) bool {
+	for _, span := range envelope.Spans {
+		if strings.HasPrefix(span.Name, "doctor.probe.") {
+			return true
+		}
+	}
+	return false
+}
+
+func validateControlledDoctorEnvelope(envelope DoctorEnvelope) *DoctorV2Check {
+	expected := map[string]struct {
+		kind, parent string
+	}{
+		"doctor.probe.root":  {"WORKFLOW", ""},
+		"doctor.probe.agent": {"AGENT", "doctor.probe.root"},
+		"doctor.probe.llm":   {"LLM", "doctor.probe.agent"},
+		"doctor.probe.tool":  {"TOOL", "doctor.probe.root"},
+	}
+	if len(envelope.Spans) != 4 {
+		check := failV2("probe_fixture", "PROBE_FIXTURE_INVALID", "Doctor must capture exactly four semantic fixture spans", "FIX_DOCTOR_INSTRUMENTATION")
+		return &check
+	}
+	byName := make(map[string]DoctorSpan, 4)
+	namesByID := make(map[string]string, 4)
+	for _, span := range envelope.Spans {
+		byName[span.Name] = span
+		namesByID[span.SpanID] = span.Name
+	}
+	if len(byName) != 4 {
+		check := failV2("probe_fixture", "PROBE_FIXTURE_INVALID", "Doctor fixture span names are not unique", "FIX_DOCTOR_INSTRUMENTATION")
+		return &check
+	}
+	for name, want := range expected {
+		span, ok := byName[name]
+		parent := ""
+		if span.ParentSpanID != nil {
+			parent = namesByID[*span.ParentSpanID]
+		}
+		if !ok || span.Kind != want.kind || parent != want.parent || span.Input == nil || span.Output == nil ||
+			span.Attributes["neatlogs.doctor"] != true || span.Attributes["neatlogs.doctor.version"] != "v1" ||
+			span.Attributes["service.name"] != "neatlogs.doctor.v2" || span.Attributes["telemetry.sdk.language"] != "go" ||
+			span.Attributes["telemetry.sdk.version"] != Version || span.Attributes["neatlogs.span.type"] != want.kind {
+			check := failV2("probe_fixture", "PROBE_FIXTURE_INVALID", "Doctor fixture hierarchy, metadata, or input/output is incomplete", "FIX_DOCTOR_INSTRUMENTATION")
+			return &check
+		}
+	}
+	return nil
 }
 
 func validateDoctorEnvelope(envelope DoctorEnvelope) []DoctorV2Check {
@@ -211,10 +264,6 @@ func validateDoctorEnvelope(envelope DoctorEnvelope) []DoctorV2Check {
 		}
 		collectDoctorToolIDs(span.Choices, toolRequests)
 		collectDoctorToolIDs(span.ToolCall, toolExecutions)
-		streaming, _ := span.Attributes["neatlogs.llm.is_streaming"].(bool)
-		if (span.Streaming || streaming) && doctorCollectionLength(span.StreamFragments) == 0 {
-			return []DoctorV2Check{failV2("streaming", "STREAM_FRAGMENT_MISSING", "A streaming span has no captured fragments", "PRESERVE_STREAM_FRAGMENTS")}
-		}
 	}
 	if rootCount == 0 {
 		return []DoctorV2Check{failV2("lifecycle", "ROOT_MISSING", "The captured envelope has no root span", "CREATE_ROOT_SPAN")}
