@@ -144,8 +144,9 @@ type globalLifecycle struct {
 type Option func(*initOptions)
 
 type initOptions struct {
-	exporter sdktrace.SpanExporter
-	delivery *deliveryDiagnostics
+	exporter    sdktrace.SpanExporter
+	delivery    *deliveryDiagnostics
+	doctorProbe bool
 }
 
 // WithExporter overrides the OTLP/HTTP exporter with a custom SpanExporter. The
@@ -155,6 +156,14 @@ type initOptions struct {
 // suppresses all export.
 func WithExporter(exp sdktrace.SpanExporter) Option {
 	return func(o *initOptions) { o.exporter = exp }
+}
+
+// WithDoctorProbe marks the isolated pipeline as a versioned Doctor probe.
+// It is intended for the Neatlogs Doctor CLI: normal application telemetry
+// must not use this option. Authentication and tenant selection still come
+// exclusively from Config.APIKey.
+func WithDoctorProbe() Option {
+	return func(o *initOptions) { o.doctorProbe = true }
 }
 
 // Init configures a private OpenTelemetry TracerProvider for Neatlogs and
@@ -333,7 +342,7 @@ func initializationSignature(cfg Config, options initOptions) string {
 	}
 	keyDigest := sha256.Sum256([]byte(apiKey))
 	return fmt.Sprintf(
-		"key=%x|endpoint=%s|workflow=%s|tags=%q|debug=%t|rate=%g|disable=%t|uploads=%s|mask=%s|exporter=%s|signals=%t/%t",
+		"key=%x|endpoint=%s|workflow=%s|tags=%q|debug=%t|rate=%g|disable=%t|uploads=%s|mask=%s|exporter=%s|signals=%t/%t|doctor=%t",
 		keyDigest,
 		endpoint,
 		resolvedWorkflowNameFrom(cfg),
@@ -346,6 +355,7 @@ func initializationSignature(cfg Config, options initOptions) string {
 		identityOf(options.exporter),
 		cfg.EnableSignalHandlers,
 		cfg.DisableSignalHandlers,
+		options.doctorProbe,
 	)
 }
 
@@ -423,19 +433,22 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 			return nil, nil, false, fmt.Errorf("neatlogs: sample rate must be between 0 and 1, got %v", sampleRate)
 		}
 	}
-
 	var tpOpts []sdktrace.TracerProviderOption
 	tpOpts = append(
 		tpOpts,
-		sdktrace.WithResource(buildResource(ctx, cfg)),
+		sdktrace.WithResource(buildResource(ctx, cfg, io.doctorProbe)),
 		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(sampleRate))),
 	)
 
 	var mediaStore *internalmedia.Store
+	var captures *doctorCaptureStore
+	if io.doctorProbe {
+		captures = newDoctorCaptureStore(16)
+	}
 	if !disable {
 		exp := io.exporter
 		if exp == nil {
-			exp, err = newOTLPExporter(ctx, base, apiKey)
+			exp, err = newOTLPExporter(ctx, base, apiKey, io.doctorProbe)
 			if err != nil {
 				return nil, nil, false, fmt.Errorf("neatlogs: create exporter: %w", err)
 			}
@@ -458,7 +471,7 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 		batchProcessor := sdktrace.NewBatchSpanProcessor(
 			&normalizingExporter{
 				next: byteLimited, mapper: attributes.Default(), mask: cfg.Mask,
-				delivery: delivery, uploads: uploads, release: queue.release,
+				delivery: delivery, uploads: uploads, captures: captures, release: queue.release,
 			},
 			sdktrace.WithMaxQueueSize(defaultMaxQueueSize),
 			sdktrace.WithMaxExportBatchSize(defaultMaxExportBatchSize),
@@ -478,7 +491,7 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 	if !disable {
 		tp.RegisterSpanProcessor(&completionProcessor{tracer: tp.Tracer(tracerName, trace.WithInstrumentationVersion(Version))})
 	}
-	return newSDKRuntime(tp, lifecycle, resolvedWorkflowNameFrom(cfg), io.delivery, mediaStore), base, !disable, nil
+	return newSDKRuntime(tp, lifecycle, resolvedWorkflowNameFrom(cfg), io.delivery, mediaStore, captures), base, !disable, nil
 }
 
 func resolveUploadsEnabled(cfg Config) (bool, error) {
@@ -509,11 +522,15 @@ func uploadsSignature(cfg Config) string {
 
 // newOTLPExporter builds an OTLP/HTTP span exporter targeting {base}/v1/traces
 // with the x-api-key auth header Neatlogs ingestion expects.
-func newOTLPExporter(ctx context.Context, base *url.URL, apiKey string) (sdktrace.SpanExporter, error) {
+func newOTLPExporter(ctx context.Context, base *url.URL, apiKey string, doctorProbe bool) (sdktrace.SpanExporter, error) {
+	headers := map[string]string{"x-api-key": apiKey}
+	if doctorProbe {
+		headers["x-neatlogs-doctor"] = "v1"
+	}
 	opts := []otlptracehttp.Option{
 		otlptracehttp.WithEndpoint(base.Host),
 		otlptracehttp.WithURLPath("/v1/traces"),
-		otlptracehttp.WithHeaders(map[string]string{"x-api-key": apiKey}),
+		otlptracehttp.WithHeaders(headers),
 		otlptracehttp.WithCompression(otlptracehttp.GzipCompression),
 	}
 	if base.Scheme == "http" {
@@ -532,13 +549,21 @@ func resolvedWorkflowNameFrom(cfg Config) string {
 	return defaultWorkflowName()
 }
 
-func buildResource(ctx context.Context, cfg Config) *resource.Resource {
+func buildResource(ctx context.Context, cfg Config, doctorProbe bool) *resource.Resource {
 	workflow := resolvedWorkflowNameFrom(cfg)
 
 	attrs := []attribute.KeyValue{
 		semconv.ServiceName(workflow),
 		semconv.ServiceVersion(Version),
 		attribute.String(attributes.WorkflowName, workflow),
+	}
+	if doctorProbe {
+		attrs = append(attrs,
+			attribute.Bool("neatlogs.doctor", true),
+			attribute.String("neatlogs.doctor.version", "v1"),
+			attribute.String("telemetry.sdk.language", "go"),
+			attribute.String("telemetry.sdk.version", Version),
+		)
 	}
 	if len(cfg.Tags) > 0 {
 		attrs = append(attrs, attribute.String(attributes.Tags, strings.Join(cfg.Tags, ",")))

@@ -15,6 +15,16 @@ go get github.com/neatlogs/neatlogs-go
 go get github.com/neatlogs/neatlogs-go/contrib/genai
 ```
 
+The library install does not install the optional Doctor CLI. Install that
+binary separately when you want to run diagnostics:
+
+```bash
+go install github.com/neatlogs/neatlogs-go/cmd/neatlogs@latest
+```
+
+Ensure `$(go env GOPATH)/bin` is on `PATH`. When Wizard cannot discover the
+binary from `PATH`, set `NEATLOGS_DOCTOR_GO` to its absolute path.
+
 ## Quick start
 
 ```go
@@ -177,3 +187,28 @@ token, and shutdown or any dropped span releases its staged bytes.
 v0.1 — Google Gemini (`google.golang.org/genai`) active wrapping, direct
 LLM/retriever/tool helpers, and an isolated private provider. More providers and
 explicit framework wrappers will follow.
+
+## Doctor v2
+
+Install the Doctor CLI as shown above before running these commands.
+
+Run the isolated, network-free SDK check:
+
+```bash
+neatlogs doctor --local --json
+```
+
+Run the authenticated backend path probe:
+
+```bash
+NEATLOGS_API_KEY='<project-key>' \
+NEATLOGS_ENDPOINT='https://ingest.neatlogs.com' \
+neatlogs doctor --probe --json
+```
+
+Probe uses the normal `/v1/traces` OTLP route with the
+`x-neatlogs-doctor: v1` observability marker, then polls the existing
+`/api/traces/v3/:traceId` product route with the same project key. It passes
+only when the exact trace is visible and its persisted hierarchy, span
+semantics, input/output, versioned metadata, and numeric token totals validate.
+HTTP acceptance or exporter flush alone never reports success.

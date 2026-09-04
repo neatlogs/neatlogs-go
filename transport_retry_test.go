@@ -52,7 +52,7 @@ func TestOTLPHTTPRetriesTransientStatusesAndUsesGzip(t *testing.T) {
 			}))
 			defer server.Close()
 			base, _ := url.Parse(server.URL)
-			exporter, err := newOTLPExporter(context.Background(), base, "test-key")
+			exporter, err := newOTLPExporter(context.Background(), base, "test-key", false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -76,7 +76,7 @@ func TestOTLPHTTPHonorsTimeoutAndRejectsAfterShutdown(t *testing.T) {
 	}))
 	defer server.Close()
 	base, _ := url.Parse(server.URL)
-	exporter, err := newOTLPExporter(context.Background(), base, "test-key")
+	exporter, err := newOTLPExporter(context.Background(), base, "test-key", false)
 	if err != nil {
 		t.Fatal(err)
 	}

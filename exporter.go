@@ -29,6 +29,7 @@ type normalizingExporter struct {
 	mask      MaskFunc
 	delivery  *deliveryDiagnostics
 	uploads   uploadAuthority
+	captures  *doctorCaptureStore
 	release   func(int)
 	maskOnce  sync.Once
 	maskSlots chan struct{}
@@ -142,6 +143,9 @@ func (e *normalizingExporter) ExportSpans(ctx context.Context, spans []trace.Rea
 		e.recordFailure(len(rewritten))
 		return newUploadFailure("prepare", contextReason(ctx), contextRetryable(ctx))
 	}
+	// Capture is allocated only for an explicit Doctor pipeline. Ordinary SDK
+	// exporters leave this nil and retain no diagnostic copy of user telemetry.
+	e.captures.capture(rewritten)
 	if err := e.next.ExportSpans(ctx, rewritten); err != nil {
 		return err
 	}
