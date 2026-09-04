@@ -105,7 +105,9 @@ func run(arguments []string) int {
 		}
 		local = neatlogs.DoctorProbeV2(ctx, local, neatlogs.DoctorProbeOptions{Endpoint: endpoint, APIKey: cfg.APIKey, Timeout: 45 * time.Second})
 	}
-	_ = client.Shutdown(context.Background())
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_ = client.Shutdown(shutdownCtx)
+	shutdownCancel()
 	exit := 0
 	if local.Status == neatlogs.DoctorWarn {
 		exit = 1

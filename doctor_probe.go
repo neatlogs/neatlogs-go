@@ -179,6 +179,14 @@ func DoctorProbeV2(ctx context.Context, local DoctorV2Result, options DoctorProb
 			return probeReadFailureWithDetails(result, "BACKEND_PROBE_UNAVAILABLE", "Trace ingestion reported a terminal failure", "CHECK_TRACE_ENDPOINT", currentDiagnostics)
 		}
 		if status != http.StatusAccepted && status != http.StatusNotFound {
+			if retryableDoctorReadStatus(status) {
+				select {
+				case <-probeCtx.Done():
+					return probeReadFailureWithDetails(result, "BACKEND_PROBE_UNAVAILABLE", "Timed out waiting for the exact Doctor trace", "WAIT_FOR_TRACE", lastDiagnostics)
+				case <-time.After(interval):
+					continue
+				}
+			}
 			if status >= http.StatusInternalServerError {
 				return probeReadFailureWithDetails(result, "BACKEND_PROBE_UNAVAILABLE", "The existing trace read path returned an unexpected status", "CHECK_TRACE_ENDPOINT", lastDiagnostics)
 			}
@@ -190,6 +198,12 @@ func DoctorProbeV2(ctx context.Context, local DoctorV2Result, options DoctorProb
 		case <-time.After(interval):
 		}
 	}
+}
+
+func retryableDoctorReadStatus(status int) bool {
+	return status == http.StatusBadGateway ||
+		status == http.StatusServiceUnavailable ||
+		status == http.StatusGatewayTimeout
 }
 
 // A rejected OTLP export can still leave a complete post-mask capture. In that

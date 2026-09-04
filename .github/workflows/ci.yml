@@ -26,11 +26,23 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Test
-        run: go test ./...
+      - name: Test every workspace module
+        shell: bash
+        run: |
+          set -euo pipefail
+          for module in . contrib/adk contrib/genai examples/adk examples/genai; do
+            (cd "$module" && go test ./...)
+          done
+          (cd testdata/external-consumer && GOWORK=off go test ./...)
 
-      - name: Vet
-        run: go vet ./...
+      - name: Vet every workspace module
+        shell: bash
+        run: |
+          set -euo pipefail
+          for module in . contrib/adk contrib/genai examples/adk examples/genai; do
+            (cd "$module" && go vet ./...)
+          done
+          (cd testdata/external-consumer && GOWORK=off go vet ./...)
 
       - name: Build the CLI
         run: go build ./cmd/neatlogs
@@ -40,9 +52,9 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    environment:
+      name: doctor-e2e-dev
     env:
-      NEATLOGS_API_KEY: ${{ secrets.NEATLOGS_DEV_API_KEY }}
-      NEATLOGS_ENDPOINT: ${{ vars.NEATLOGS_DEV_ENDPOINT }}
       EVIDENCE_DIR: ${{ github.workspace }}/.doctor-evidence
     steps:
       - uses: actions/checkout@v4
@@ -52,31 +64,27 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Require protected canary configuration
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -n "${NEATLOGS_API_KEY:-}" || {
-            echo 'NEATLOGS_DEV_API_KEY is not configured' >&2
-            exit 1
-          }
-          test -n "${NEATLOGS_ENDPOINT:-}" || {
-            echo 'NEATLOGS_DEV_ENDPOINT is not configured' >&2
-            exit 1
-          }
-
       - name: Build the CLI
         shell: bash
         run: go build -o "$RUNNER_TEMP/neatlogs-doctor" ./cmd/neatlogs
 
-      - name: Run local and hosted Doctor checks
+      - name: Run local Doctor check
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$EVIDENCE_DIR"
-          env -u NEATLOGS_API_KEY -u NEATLOGS_ENDPOINT \
-            "$RUNNER_TEMP/neatlogs-doctor" doctor --local --json \
+          "$RUNNER_TEMP/neatlogs-doctor" doctor --local --json \
             > "$EVIDENCE_DIR/doctor-local.json"
+
+      - name: Run hosted Doctor probe
+        shell: bash
+        env:
+          NEATLOGS_API_KEY: ${{ secrets.NEATLOGS_DEV_API_KEY }}
+          NEATLOGS_ENDPOINT: ${{ vars.NEATLOGS_DEV_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          test -n "${NEATLOGS_API_KEY:-}" || { echo 'NEATLOGS_DEV_API_KEY is not configured' >&2; exit 1; }
+          test -n "${NEATLOGS_ENDPOINT:-}" || { echo 'NEATLOGS_DEV_ENDPOINT is not configured' >&2; exit 1; }
           "$RUNNER_TEMP/neatlogs-doctor" doctor --probe --json \
             > "$EVIDENCE_DIR/doctor-probe.json"
 

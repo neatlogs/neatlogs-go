@@ -436,6 +436,29 @@ func TestDoctorProbeReadsExactTraceWithoutDiagnosticSession(t *testing.T) {
 	}
 }
 
+func TestDoctorProbeRetriesTransientReadbackFailures(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if requests == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(doctorV3MaterializedTraceFixture())
+	}))
+	defer server.Close()
+
+	root := "2222222222222222"
+	local := newDoctorV2Result("local")
+	local.Capture = &DoctorV2Capture{TraceID: "11111111111111111111111111111111", RootSpanID: &root, SpanCount: 4, SemanticDigest: "sha256:" + strings.Repeat("a", 64)}
+	local.Checks = []DoctorV2Check{{Name: "local_envelope", Status: DoctorPass, ReasonCode: "LOCAL_ENVELOPE_VALID", Message: "valid", RemediationCode: "NONE"}}
+
+	result := DoctorProbeV2(context.Background(), local, DoctorProbeOptions{Endpoint: server.URL, APIKey: "local-key", Timeout: time.Second, PollInterval: time.Millisecond})
+	if result.Status != DoctorPass || requests != 2 {
+		t.Fatalf("transient readback result = %#v, requests = %d", result, requests)
+	}
+}
+
 func TestDoctorProbeRejectsWrongMaterializedInputOutput(t *testing.T) {
 	root := "2222222222222222"
 	local := newDoctorV2Result("local")
