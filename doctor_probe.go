@@ -43,6 +43,7 @@ var safeDoctorFailureCode = regexp.MustCompile(`^[A-Z0-9_]{1,64}$`)
 
 const (
 	maxDoctorReadbackBytes       = 1 << 20
+	defaultDoctorRequestTimeout  = 5 * time.Second
 	doctorReasonReadbackTimeout  = "TRACE_READBACK_TIMEOUT"
 	doctorReasonPipelineFailed   = "INGESTION_PIPELINE_FAILED"
 	doctorReasonHTTPError        = "BACKEND_HTTP_ERROR"
@@ -132,6 +133,9 @@ func DoctorProbeV2(ctx context.Context, local DoctorV2Result, options DoctorProb
 		baseClient = &http.Client{}
 	}
 	client := *baseClient
+	if client.Timeout <= 0 || client.Timeout > defaultDoctorRequestTimeout {
+		client.Timeout = defaultDoctorRequestTimeout
+	}
 	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
@@ -141,7 +145,7 @@ func DoctorProbeV2(ctx context.Context, local DoctorV2Result, options DoctorProb
 	readURL.RawQuery = ""
 	readURL.Fragment = ""
 	var lastDiagnostics map[string]any
-	lastRetryableHTTPStatus := 0
+	lastCompletedStatus := 0
 
 	for {
 		request, requestErr := http.NewRequestWithContext(probeCtx, http.MethodGet, readURL.String(), nil)
@@ -153,10 +157,12 @@ func DoctorProbeV2(ctx context.Context, local DoctorV2Result, options DoctorProb
 		response, requestErr := client.Do(request)
 		if requestErr != nil {
 			if probeCtx.Err() != nil {
-				if lastRetryableHTTPStatus != 0 {
+				if retryableDoctorReadStatus(lastCompletedStatus) {
 					return probeReadFailureWithDetails(result, doctorReasonHTTPError, "The existing trace read path remained unavailable", "CHECK_TRACE_ENDPOINT", lastDiagnostics)
 				}
-				return probeReadFailureWithDetails(result, doctorReasonReadbackTimeout, "Timed out waiting for the exact Doctor trace", "WAIT_FOR_TRACE", lastDiagnostics)
+				if lastCompletedStatus == http.StatusAccepted || lastCompletedStatus == http.StatusNotFound {
+					return probeReadFailureWithDetails(result, doctorReasonReadbackTimeout, "Timed out waiting for the exact Doctor trace", "WAIT_FOR_TRACE", lastDiagnostics)
+				}
 			}
 			return probeReadFailureWithDetails(result, doctorReasonConnectionFailed, "Could not connect to the existing trace read path", "CHECK_TRACE_ENDPOINT", lastDiagnostics)
 		}
@@ -175,29 +181,40 @@ func DoctorProbeV2(ctx context.Context, local DoctorV2Result, options DoctorProb
 			return persistedDoctorProbeResultWithDiagnostics(result, traceData, lastDiagnostics)
 		}
 		status := response.StatusCode
+		lastCompletedStatus = status
 		var currentDiagnostics map[string]any
+		terminalDLQ := false
+		validTerminalDLQ := false
 		var decodeErr error
 		if status == http.StatusAccepted || status == http.StatusNotFound || status == http.StatusConflict {
 			var value map[string]any
 			decodeErr = decodeLimited(response, &value)
 			if decodeErr == nil {
+				finalizationStatus, _ := value["finalizationStatus"].(string)
+				terminalDLQ = finalizationStatus == "dlq"
 				if diagnostics := doctorIngestionDiagnosticDetails(value); diagnostics != nil {
 					currentDiagnostics = diagnostics
 					lastDiagnostics = diagnostics
+				}
+				if terminalDLQ {
+					_, errorOK := value["error"].(string)
+					message, messagePresent := value["message"]
+					_, messageOK := message.(string)
+					_, diagnosticsPresent := value["ingestionDiagnostics"]
+					validTerminalDLQ = errorOK && (!messagePresent || messageOK) && (!diagnosticsPresent || currentDiagnostics != nil)
 				}
 			}
 		}
 		response.Body.Close()
 		if status == http.StatusConflict {
 			state, stateOK := currentDiagnostics["ingestion_state"].(string)
-			if decodeErr != nil || !stateOK || state != "failed" {
+			if decodeErr != nil || (terminalDLQ && !validTerminalDLQ) || (!terminalDLQ && (!stateOK || state != "failed")) {
 				return probeReadFailure(result, doctorReasonReadbackInvalid, "Trace read-back returned an invalid terminal receipt", "CONTACT_SUPPORT")
 			}
 			return probeReadFailureWithDetails(result, doctorReasonPipelineFailed, "Trace ingestion reported a terminal pipeline failure", "CONTACT_SUPPORT", currentDiagnostics)
 		}
 		if status != http.StatusAccepted && status != http.StatusNotFound {
 			if retryableDoctorReadStatus(status) {
-				lastRetryableHTTPStatus = status
 				select {
 				case <-probeCtx.Done():
 					return probeReadFailureWithDetails(result, doctorReasonHTTPError, "The existing trace read path remained unavailable", "CHECK_TRACE_ENDPOINT", lastDiagnostics)
@@ -210,7 +227,6 @@ func DoctorProbeV2(ctx context.Context, local DoctorV2Result, options DoctorProb
 			}
 			return probeReadFailure(result, doctorReasonHTTPError, "The existing trace read path returned an unexpected status", "CHECK_TRACE_ENDPOINT")
 		}
-		lastRetryableHTTPStatus = 0
 		select {
 		case <-probeCtx.Done():
 			return probeReadFailureWithDetails(result, doctorReasonReadbackTimeout, "Timed out waiting for the exact Doctor trace", "WAIT_FOR_TRACE", lastDiagnostics)
@@ -478,14 +494,16 @@ func probeReadFailureWithDetails(result DoctorV2Result, code, message, remediati
 	if details != nil {
 		check.Details = details
 	}
-	if code == "AUTH_FAILED" {
-		// Authentication is the actionable root classification even when the
-		// preceding OTLP flush recorded the same rejected credential as a
-		// transport failure.
-		result.Checks = append([]DoctorV2Check{check}, result.Checks...)
-	} else {
-		result.Checks = append(result.Checks, check)
+	insertAt := len(result.Checks)
+	for index, existing := range result.Checks {
+		if existing.Status == DoctorFail {
+			insertAt = index
+			break
+		}
 	}
+	result.Checks = append(result.Checks, DoctorV2Check{})
+	copy(result.Checks[insertAt+1:], result.Checks[insertAt:])
+	result.Checks[insertAt] = check
 	return finishDoctorV2(result)
 }
 
