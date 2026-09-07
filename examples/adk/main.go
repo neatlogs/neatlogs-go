@@ -1,12 +1,12 @@
-// Command adk demonstrates Neatlogs passive passthrough for Google ADK across
-// every execution path ADK-Go supports, each exported to the Neatlogs backend
-// under its own workflow name so it can be found individually in the UI.
+//go:build adk_legacy
+
+// Command adk retains the former Google ADK passive-passthrough example only as
+// a legacy compatibility fixture. It is not a supported Neatlogs integration.
 //
-// ADK auto-instruments agent runs via the global OpenTelemetry TracerProvider.
-// Because neatlogs.Init installs that global provider, ADK's spans
-// (invoke_agent → agent, generate_content → llm, execute_tool → tool) flow
-// through and are normalized into the neatlogs.* namespace WITHOUT wrapping any
-// ADK call. The only Neatlogs-specific lines are Init and the deferred shutdown.
+// ADK resolves its tracer from OpenTelemetry's process-global provider, while
+// Neatlogs deliberately uses a private provider for project isolation. As a
+// result, this passthrough path does not export ADK spans to Neatlogs. Do not
+// restore global-provider ownership to make this example pass.
 //
 // Scenarios (each its own workflow in the UI):
 //
@@ -19,14 +19,11 @@
 //	adk-a2a             remote agent over the A2A protocol
 //	adk-concurrent      N agents run concurrently (goroutine safety)
 //
-// Run:
+// To inspect the legacy application code:
 //
-//	export NEATLOGS_API_KEY=...   # spans dropped if unset
-//	export GOOGLE_API_KEY=...
-//	go run .
+//	go run -tags adk_legacy .
 //
-// Keys may instead be placed in a .env file in this directory. Audio/bidi
-// (RunLive) is intentionally out of scope.
+// The command can call ADK, but it does not produce Neatlogs semantic spans.
 package main
 
 import (
@@ -94,10 +91,9 @@ func main() {
 	// running everything at once floods the workflow with a dozen traces. Pick a
 	// scenario with -scenario, or pass -scenario=all to run them all.
 	//
-	// Neatlogs is initialized ONCE here. ADK (like all OTel libraries) binds its
-	// tracer to the first global TracerProvider installed, and that binding is
-	// one-shot — re-initializing per scenario would leave later scenarios with no
-	// spans. A real app likewise calls Init once at startup.
+	// This initialization uses Neatlogs' private provider. ADK remains bound to
+	// the process-global provider, which is why this legacy path captures no ADK
+	// semantic spans.
 	ctx := context.Background()
 	shutdown, err := neatlogs.Init(ctx, neatlogs.Config{
 		APIKey:       os.Getenv("NEATLOGS_API_KEY"),
@@ -129,7 +125,7 @@ func main() {
 	if err := neatlogs.Flush(ctx); err != nil {
 		log.Printf("flush: %v", err)
 	}
-	fmt.Println("\nExported under the adk-example workflow.")
+	fmt.Println("\nLegacy ADK scenario completed; no Neatlogs ADK spans are expected.")
 }
 
 func scenarioList(m map[string]func(context.Context, string)) string {

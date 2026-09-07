@@ -35,6 +35,15 @@ jobs:
           done
           (cd testdata/external-consumer && GOWORK=off go test ./...)
 
+      - name: Test independently published modules outside the workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          for module in contrib/genai examples/genai; do
+            (cd "$module" && GOWORK=off go mod tidy -diff)
+            (cd "$module" && GOWORK=off go test -mod=readonly ./...)
+          done
+
       - name: Vet every workspace module
         shell: bash
         run: |
