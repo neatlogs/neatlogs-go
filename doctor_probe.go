@@ -41,7 +41,14 @@ type DoctorProbeOptions struct {
 var persistedDoctorSpanID = regexp.MustCompile(`^[0-9a-f]{16}$`)
 var safeDoctorFailureCode = regexp.MustCompile(`^[A-Z0-9_]{1,64}$`)
 
-const maxDoctorReadbackBytes = 1 << 20
+const (
+	maxDoctorReadbackBytes       = 1 << 20
+	doctorReasonReadbackTimeout  = "TRACE_READBACK_TIMEOUT"
+	doctorReasonPipelineFailed   = "INGESTION_PIPELINE_FAILED"
+	doctorReasonHTTPError        = "BACKEND_HTTP_ERROR"
+	doctorReasonConnectionFailed = "BACKEND_CONNECTION_FAILED"
+	doctorReasonReadbackInvalid  = "TRACE_READBACK_INVALID"
+)
 
 var doctorIngestionStages = map[string]bool{
 	"kafka_published": true, "pii_dispatch": true, "pii_redaction": true,
@@ -134,6 +141,7 @@ func DoctorProbeV2(ctx context.Context, local DoctorV2Result, options DoctorProb
 	readURL.RawQuery = ""
 	readURL.Fragment = ""
 	var lastDiagnostics map[string]any
+	lastRetryableHTTPStatus := 0
 
 	for {
 		request, requestErr := http.NewRequestWithContext(probeCtx, http.MethodGet, readURL.String(), nil)
@@ -145,9 +153,12 @@ func DoctorProbeV2(ctx context.Context, local DoctorV2Result, options DoctorProb
 		response, requestErr := client.Do(request)
 		if requestErr != nil {
 			if probeCtx.Err() != nil {
-				return probeReadFailureWithDetails(result, "BACKEND_PROBE_UNAVAILABLE", "Timed out waiting for the exact Doctor trace", "WAIT_FOR_TRACE", lastDiagnostics)
+				if lastRetryableHTTPStatus != 0 {
+					return probeReadFailureWithDetails(result, doctorReasonHTTPError, "The existing trace read path remained unavailable", "CHECK_TRACE_ENDPOINT", lastDiagnostics)
+				}
+				return probeReadFailureWithDetails(result, doctorReasonReadbackTimeout, "Timed out waiting for the exact Doctor trace", "WAIT_FOR_TRACE", lastDiagnostics)
 			}
-			return probeReadFailureWithDetails(result, "BACKEND_PROBE_UNAVAILABLE", "The existing trace read path is unavailable", "CHECK_TRACE_ENDPOINT", lastDiagnostics)
+			return probeReadFailureWithDetails(result, doctorReasonConnectionFailed, "Could not connect to the existing trace read path", "CHECK_TRACE_ENDPOINT", lastDiagnostics)
 		}
 		if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
 			response.Body.Close()
@@ -158,16 +169,18 @@ func DoctorProbeV2(ctx context.Context, local DoctorV2Result, options DoctorProb
 			decodeErr := decodeLimited(response, &traceData)
 			response.Body.Close()
 			if decodeErr != nil {
-				return probeReadFailure(result, "BACKEND_PROBE_UNAVAILABLE", "Trace read-back returned an invalid response", "CHECK_TRACE_ENDPOINT")
+				return probeReadFailure(result, doctorReasonReadbackInvalid, "Trace read-back returned an invalid response", "CONTACT_SUPPORT")
 			}
 			lastDiagnostics = doctorIngestionDiagnosticDetails(traceData)
 			return persistedDoctorProbeResultWithDiagnostics(result, traceData, lastDiagnostics)
 		}
 		status := response.StatusCode
 		var currentDiagnostics map[string]any
+		var decodeErr error
 		if status == http.StatusAccepted || status == http.StatusNotFound || status == http.StatusConflict {
 			var value map[string]any
-			if decodeLimited(response, &value) == nil {
+			decodeErr = decodeLimited(response, &value)
+			if decodeErr == nil {
 				if diagnostics := doctorIngestionDiagnosticDetails(value); diagnostics != nil {
 					currentDiagnostics = diagnostics
 					lastDiagnostics = diagnostics
@@ -176,25 +189,31 @@ func DoctorProbeV2(ctx context.Context, local DoctorV2Result, options DoctorProb
 		}
 		response.Body.Close()
 		if status == http.StatusConflict {
-			return probeReadFailureWithDetails(result, "BACKEND_PROBE_UNAVAILABLE", "Trace ingestion reported a terminal failure", "CHECK_TRACE_ENDPOINT", currentDiagnostics)
+			state, stateOK := currentDiagnostics["ingestion_state"].(string)
+			if decodeErr != nil || !stateOK || state != "failed" {
+				return probeReadFailure(result, doctorReasonReadbackInvalid, "Trace read-back returned an invalid terminal receipt", "CONTACT_SUPPORT")
+			}
+			return probeReadFailureWithDetails(result, doctorReasonPipelineFailed, "Trace ingestion reported a terminal pipeline failure", "CONTACT_SUPPORT", currentDiagnostics)
 		}
 		if status != http.StatusAccepted && status != http.StatusNotFound {
 			if retryableDoctorReadStatus(status) {
+				lastRetryableHTTPStatus = status
 				select {
 				case <-probeCtx.Done():
-					return probeReadFailureWithDetails(result, "BACKEND_PROBE_UNAVAILABLE", "Timed out waiting for the exact Doctor trace", "WAIT_FOR_TRACE", lastDiagnostics)
+					return probeReadFailureWithDetails(result, doctorReasonHTTPError, "The existing trace read path remained unavailable", "CHECK_TRACE_ENDPOINT", lastDiagnostics)
 				case <-time.After(interval):
 					continue
 				}
 			}
 			if status >= http.StatusInternalServerError {
-				return probeReadFailureWithDetails(result, "BACKEND_PROBE_UNAVAILABLE", "The existing trace read path returned an unexpected status", "CHECK_TRACE_ENDPOINT", lastDiagnostics)
+				return probeReadFailureWithDetails(result, doctorReasonHTTPError, "The existing trace read path returned an unexpected status", "CHECK_TRACE_ENDPOINT", lastDiagnostics)
 			}
-			return probeReadFailure(result, "BACKEND_PROBE_UNAVAILABLE", "The existing trace read path returned an unexpected status", "CHECK_TRACE_ENDPOINT")
+			return probeReadFailure(result, doctorReasonHTTPError, "The existing trace read path returned an unexpected status", "CHECK_TRACE_ENDPOINT")
 		}
+		lastRetryableHTTPStatus = 0
 		select {
 		case <-probeCtx.Done():
-			return probeReadFailureWithDetails(result, "BACKEND_PROBE_UNAVAILABLE", "Timed out waiting for the exact Doctor trace", "WAIT_FOR_TRACE", lastDiagnostics)
+			return probeReadFailureWithDetails(result, doctorReasonReadbackTimeout, "Timed out waiting for the exact Doctor trace", "WAIT_FOR_TRACE", lastDiagnostics)
 		case <-time.After(interval):
 		}
 	}
