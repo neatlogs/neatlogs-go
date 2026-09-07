@@ -546,8 +546,8 @@ func TestDoctorProbePendingTraceNeverPasses(t *testing.T) {
 			local := newDoctorV2Result("local")
 			local.Capture = &DoctorV2Capture{TraceID: "11111111111111111111111111111111", RootSpanID: &root, SpanCount: 4, SemanticDigest: "sha256:" + strings.Repeat("a", 64)}
 			local.Checks = []DoctorV2Check{{Name: "local_envelope", Status: DoctorPass, ReasonCode: "LOCAL_ENVELOPE_VALID", Message: "valid", RemediationCode: "NONE"}}
-			result := DoctorProbeV2(context.Background(), local, DoctorProbeOptions{Endpoint: server.URL, APIKey: "local-key", Timeout: 10 * time.Millisecond, PollInterval: time.Millisecond})
-			if result.Status != DoctorFail || result.FirstFailure == nil || *result.FirstFailure != "BACKEND_PROBE_UNAVAILABLE" {
+			result := DoctorProbeV2(context.Background(), local, DoctorProbeOptions{Endpoint: server.URL, APIKey: "local-key", Timeout: 100 * time.Millisecond, PollInterval: time.Millisecond})
+			if result.Status != DoctorFail || result.FirstFailure == nil || *result.FirstFailure != "TRACE_READBACK_TIMEOUT" {
 				t.Fatalf("pending trace falsely passed: %#v", result)
 			}
 			if !reflect.DeepEqual(result.Checks[len(result.Checks)-1].Details, map[string]any{
@@ -579,13 +579,16 @@ func TestDoctorProbeRefusesCrossOriginRedirectWithoutForwardingCredentials(t *te
 	local.Capture = &DoctorV2Capture{TraceID: "11111111111111111111111111111111", RootSpanID: &root, SpanCount: 4, SemanticDigest: "sha256:" + strings.Repeat("a", 64)}
 	local.Checks = []DoctorV2Check{{Name: "local_envelope", Status: DoctorPass, ReasonCode: "LOCAL_ENVELOPE_VALID", RemediationCode: "NONE"}}
 	result := DoctorProbeV2(context.Background(), local, DoctorProbeOptions{Endpoint: origin.URL, APIKey: "local-key", Timeout: time.Second})
-	if targetRequests != 0 || result.FirstFailure == nil || *result.FirstFailure != "BACKEND_PROBE_UNAVAILABLE" {
+	if targetRequests != 0 || result.FirstFailure == nil || *result.FirstFailure != "BACKEND_HTTP_ERROR" {
 		t.Fatalf("redirect result = %#v, target requests = %d", result, targetRequests)
 	}
 }
 
 func TestDoctorProbeCapsAllReadbackStatusBodies(t *testing.T) {
-	for _, status := range []int{http.StatusOK, http.StatusAccepted, http.StatusConflict} {
+	for status, reason := range map[int]string{
+		http.StatusOK:       "TRACE_READBACK_INVALID",
+		http.StatusConflict: "TRACE_READBACK_INVALID",
+	} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(status)
@@ -596,8 +599,8 @@ func TestDoctorProbeCapsAllReadbackStatusBodies(t *testing.T) {
 			local := newDoctorV2Result("local")
 			local.Capture = &DoctorV2Capture{TraceID: "11111111111111111111111111111111", RootSpanID: &root, SpanCount: 4, SemanticDigest: "sha256:" + strings.Repeat("a", 64)}
 			local.Checks = []DoctorV2Check{{Name: "local_envelope", Status: DoctorPass, ReasonCode: "LOCAL_ENVELOPE_VALID", RemediationCode: "NONE"}}
-			result := DoctorProbeV2(context.Background(), local, DoctorProbeOptions{Endpoint: server.URL, APIKey: "local-key", Timeout: 10 * time.Millisecond, PollInterval: time.Millisecond})
-			if result.FirstFailure == nil || *result.FirstFailure != "BACKEND_PROBE_UNAVAILABLE" {
+			result := DoctorProbeV2(context.Background(), local, DoctorProbeOptions{Endpoint: server.URL, APIKey: "local-key", Timeout: time.Second, PollInterval: time.Millisecond})
+			if result.FirstFailure == nil || *result.FirstFailure != reason {
 				t.Fatalf("oversized status %d result = %#v", status, result)
 			}
 			for _, check := range result.Checks {
@@ -606,6 +609,108 @@ func TestDoctorProbeCapsAllReadbackStatusBodies(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDoctorProbeClassifiesDLQWithoutOptionalDiagnosticsAsPipelineFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"Trace processing failed","finalizationStatus":"dlq","message":"We couldn't finish preparing this trace. Please retry or contact support."}`))
+	}))
+	defer server.Close()
+	root := "2222222222222222"
+	local := newDoctorV2Result("local")
+	local.Capture = &DoctorV2Capture{TraceID: "11111111111111111111111111111111", RootSpanID: &root, SpanCount: 4, SemanticDigest: "sha256:" + strings.Repeat("a", 64)}
+	local.Checks = []DoctorV2Check{{Name: "local_envelope", Status: DoctorPass, ReasonCode: "LOCAL_ENVELOPE_VALID", RemediationCode: "NONE"}}
+
+	result := DoctorProbeV2(context.Background(), local, DoctorProbeOptions{Endpoint: server.URL, APIKey: "local-key", Timeout: time.Second})
+	if result.FirstFailure == nil || *result.FirstFailure != "INGESTION_PIPELINE_FAILED" {
+		t.Fatalf("DLQ result = %#v", result)
+	}
+	failure := result.Checks[len(result.Checks)-1]
+	if failure.ReasonCode != "INGESTION_PIPELINE_FAILED" || failure.Details != nil {
+		t.Fatalf("DLQ failure = %#v", failure)
+	}
+}
+
+func TestDoctorProbeRejectsDLQWithoutRequiredError(t *testing.T) {
+	client := &http.Client{Transport: doctorRoundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		body := `{"finalizationStatus":"dlq"}`
+		return &http.Response{StatusCode: http.StatusConflict, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}
+	root := "2222222222222222"
+	local := newDoctorV2Result("local")
+	local.Capture = &DoctorV2Capture{TraceID: "11111111111111111111111111111111", RootSpanID: &root, SpanCount: 4, SemanticDigest: "sha256:" + strings.Repeat("a", 64)}
+	local.Checks = []DoctorV2Check{{Name: "local_envelope", Status: DoctorPass, ReasonCode: "LOCAL_ENVELOPE_VALID", RemediationCode: "NONE"}}
+
+	result := DoctorProbeV2(context.Background(), local, DoctorProbeOptions{Endpoint: "http://localhost:4100", APIKey: "local-key", Timeout: time.Second, HTTPClient: client})
+	if result.FirstFailure == nil || *result.FirstFailure != "TRACE_READBACK_INVALID" {
+		t.Fatalf("invalid DLQ result = %#v", result)
+	}
+}
+
+func TestDoctorProbeClassifiesUnresponsiveRequestAsConnectionFailure(t *testing.T) {
+	client := &http.Client{
+		Timeout: 20 * time.Millisecond,
+		Transport: doctorRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+			<-request.Context().Done()
+			return nil, request.Context().Err()
+		}),
+	}
+	root := "2222222222222222"
+	local := newDoctorV2Result("local")
+	local.Capture = &DoctorV2Capture{TraceID: "11111111111111111111111111111111", RootSpanID: &root, SpanCount: 4, SemanticDigest: "sha256:" + strings.Repeat("a", 64)}
+	local.Checks = []DoctorV2Check{{Name: "local_envelope", Status: DoctorPass, ReasonCode: "LOCAL_ENVELOPE_VALID", RemediationCode: "NONE"}}
+
+	result := DoctorProbeV2(context.Background(), local, DoctorProbeOptions{Endpoint: "http://localhost:4100", APIKey: "local-key", Timeout: 100 * time.Millisecond, HTTPClient: client})
+	if result.FirstFailure == nil || *result.FirstFailure != "BACKEND_CONNECTION_FAILED" {
+		t.Fatalf("unresponsive read result = %#v", result)
+	}
+}
+
+func TestDoctorProbeDefaultsHTTPReadToBoundedTimeout(t *testing.T) {
+	client := &http.Client{Transport: doctorRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		deadline, ok := request.Context().Deadline()
+		remaining := time.Until(deadline)
+		if !ok || remaining < 4*time.Second || remaining > 6*time.Second {
+			t.Fatalf("request deadline = %v, remaining = %v", deadline, remaining)
+		}
+		return nil, errors.New("network unavailable")
+	})}
+	root := "2222222222222222"
+	local := newDoctorV2Result("local")
+	local.Capture = &DoctorV2Capture{TraceID: "11111111111111111111111111111111", RootSpanID: &root, SpanCount: 4, SemanticDigest: "sha256:" + strings.Repeat("a", 64)}
+	local.Checks = []DoctorV2Check{{Name: "local_envelope", Status: DoctorPass, ReasonCode: "LOCAL_ENVELOPE_VALID", RemediationCode: "NONE"}}
+
+	result := DoctorProbeV2(context.Background(), local, DoctorProbeOptions{Endpoint: "http://localhost:4100", APIKey: "local-key", Timeout: 30 * time.Second, HTTPClient: client})
+	if result.FirstFailure == nil || *result.FirstFailure != "BACKEND_CONNECTION_FAILED" {
+		t.Fatalf("bounded read result = %#v", result)
+	}
+}
+
+func TestDoctorProbePrioritizesSpecificReadFailureOverExportRetry(t *testing.T) {
+	client := &http.Client{Transport: doctorRoundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		return nil, errors.New("network unavailable")
+	})}
+	root := "2222222222222222"
+	local := newDoctorV2Result("local")
+	local.Capture = &DoctorV2Capture{TraceID: "11111111111111111111111111111111", RootSpanID: &root, SpanCount: 4, SemanticDigest: "sha256:" + strings.Repeat("a", 64)}
+	local.Checks = []DoctorV2Check{
+		{Name: "local_envelope", Status: DoctorPass, ReasonCode: "LOCAL_ENVELOPE_VALID", RemediationCode: "NONE"},
+		{Name: "retry", Status: DoctorFail, ReasonCode: "EXPORT_RETRY_EXHAUSTED", RemediationCode: "CHECK_TRANSPORT"},
+	}
+
+	result := DoctorProbeV2(context.Background(), local, DoctorProbeOptions{Endpoint: "http://localhost:4100", APIKey: "local-key", Timeout: time.Second, HTTPClient: client})
+	if result.FirstFailure == nil || *result.FirstFailure != "BACKEND_CONNECTION_FAILED" {
+		t.Fatalf("first failure = %v, checks = %#v", result.FirstFailure, result.Checks)
+	}
+	foundRetry := false
+	for _, check := range result.Checks {
+		foundRetry = foundRetry || check.ReasonCode == "EXPORT_RETRY_EXHAUSTED"
+	}
+	if !foundRetry {
+		t.Fatalf("export retry evidence was removed: %#v", result.Checks)
 	}
 }
 
@@ -667,8 +772,24 @@ func TestDoctorProbeRetainsDiagnosticsOnlyOnNetworkAndServerFailures(t *testing.
 			local := newDoctorV2Result("local")
 			local.Capture = &DoctorV2Capture{TraceID: "11111111111111111111111111111111", RootSpanID: &root, SpanCount: 4, SemanticDigest: "sha256:" + strings.Repeat("a", 64)}
 			local.Checks = []DoctorV2Check{{Name: "local_envelope", Status: DoctorPass, ReasonCode: "LOCAL_ENVELOPE_VALID", RemediationCode: "NONE"}}
-			result := DoctorProbeV2(context.Background(), local, DoctorProbeOptions{Endpoint: "http://localhost:4100", APIKey: "local-key", Timeout: time.Second, PollInterval: time.Millisecond, HTTPClient: client})
-			failure := result.Checks[len(result.Checks)-1]
+			result := DoctorProbeV2(context.Background(), local, DoctorProbeOptions{Endpoint: "http://localhost:4100", APIKey: "local-key", Timeout: 20 * time.Millisecond, PollInterval: time.Millisecond, HTTPClient: client})
+			var failure DoctorV2Check
+			for _, check := range result.Checks {
+				if check.Name == "probe_transport" {
+					failure = check
+					break
+				}
+			}
+			wantReason := map[string]string{
+				"network":  "BACKEND_CONNECTION_FAILED",
+				"server":   "BACKEND_HTTP_ERROR",
+				"auth":     "AUTH_FAILED",
+				"redirect": "BACKEND_HTTP_ERROR",
+				"client":   "BACKEND_HTTP_ERROR",
+			}[terminal]
+			if failure.ReasonCode != wantReason {
+				t.Fatalf("%s reason = %s; want %s", terminal, failure.ReasonCode, wantReason)
+			}
 			if terminal != "network" && terminal != "server" {
 				if failure.Details != nil {
 					t.Fatalf("%s failure exposed stale diagnostics: %#v", terminal, failure)
@@ -690,7 +811,7 @@ func TestDoctorProbeDoesNotRetainStaleDetailsForMalformedTerminalReceipt(t *test
 		body := `{"ingestionDiagnostics":{"protocolVersion":"v1","state":"processing","currentStage":"raw_durable","retryable":false}}`
 		status := http.StatusAccepted
 		if requests == 2 {
-			body = `{"ingestionDiagnostics":{"protocolVersion":"v2"}}`
+			body = `{"error":"Trace processing failed","finalizationStatus":"dlq","ingestionDiagnostics":{"protocolVersion":"v2"}}`
 			status = http.StatusConflict
 		}
 		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
@@ -701,6 +822,9 @@ func TestDoctorProbeDoesNotRetainStaleDetailsForMalformedTerminalReceipt(t *test
 	local.Checks = []DoctorV2Check{{Name: "local_envelope", Status: DoctorPass, ReasonCode: "LOCAL_ENVELOPE_VALID", RemediationCode: "NONE"}}
 	result := DoctorProbeV2(context.Background(), local, DoctorProbeOptions{Endpoint: "http://localhost:4100", APIKey: "local-key", Timeout: time.Second, PollInterval: time.Millisecond, HTTPClient: client})
 	failure := result.Checks[len(result.Checks)-1]
+	if failure.ReasonCode != "TRACE_READBACK_INVALID" {
+		t.Fatalf("malformed terminal receipt reason = %s", failure.ReasonCode)
+	}
 	if failure.Details != nil {
 		t.Fatalf("malformed terminal receipt exposed stale diagnostics: %#v", failure)
 	}
@@ -720,7 +844,7 @@ func TestDoctorProbeStopsOnTerminalStageReceiptWithSafeDetails(t *testing.T) {
 	local.Capture = &DoctorV2Capture{TraceID: "11111111111111111111111111111111", RootSpanID: &root, SpanCount: 4, SemanticDigest: "sha256:" + strings.Repeat("a", 64)}
 	local.Checks = []DoctorV2Check{{Name: "local_envelope", Status: DoctorPass, ReasonCode: "LOCAL_ENVELOPE_VALID", Message: "valid", RemediationCode: "NONE"}}
 	result := DoctorProbeV2(context.Background(), local, DoctorProbeOptions{Endpoint: server.URL, APIKey: "local-key", Timeout: time.Second})
-	if requests != 1 || result.Status != DoctorFail || result.FirstFailure == nil || *result.FirstFailure != "BACKEND_PROBE_UNAVAILABLE" {
+	if requests != 1 || result.Status != DoctorFail || result.FirstFailure == nil || *result.FirstFailure != "INGESTION_PIPELINE_FAILED" {
 		t.Fatalf("terminal stage result = %#v, requests = %d", result, requests)
 	}
 	want := map[string]any{
