@@ -6,9 +6,83 @@ import (
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 
 	attrs "github.com/neatlogs/neatlogs-go/internal/attributes"
 )
+
+func TestStartSpanRejectsHTTPKind(t *testing.T) {
+	ctx, span, end := StartSpan(context.Background(), "GET", "HTTP")
+	defer end()
+	if span.IsRecording() {
+		t.Fatal("HTTP StartSpan must return a non-recording span")
+	}
+	if trace.SpanFromContext(ctx).SpanContext().IsValid() {
+		t.Fatal("rejected HTTP span must not alter the caller context")
+	}
+}
+
+func TestExporterDropsInjectedHTTPSpanAndCompletionMarker(t *testing.T) {
+	sink := tracetest.NewInMemoryExporter()
+	client, err := NewClient(
+		context.Background(),
+		Config{WorkflowName: "http-suppression"},
+		WithExporter(sink),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Shutdown(context.Background())
+
+	_, span := client.runtime.provider.Tracer(
+		"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp",
+	).Start(
+		context.Background(),
+		"GET",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(attribute.String("url.full", "https://example.com")),
+	)
+	span.End()
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := sink.GetSpans(); len(got) != 0 {
+		t.Fatalf("HTTP transport emitted %d spans, want none", len(got))
+	}
+}
+
+func TestExporterKeepsCanonicalSemanticSpanWithHTTPMetadata(t *testing.T) {
+	sink := tracetest.NewInMemoryExporter()
+	client, err := NewClient(
+		context.Background(),
+		Config{WorkflowName: "http-suppression"},
+		WithExporter(sink),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Shutdown(context.Background())
+
+	_, span := client.runtime.provider.Tracer(
+		"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp",
+	).Start(
+		context.Background(),
+		"rerank",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			attribute.String("neatlogs.span.kind", "RERANKER"),
+			attribute.String("openinference.span.kind", "HTTP"),
+			attribute.String("url.full", "https://provider.example/rerank"),
+		),
+	)
+	span.End()
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := byName(sink, "rerank"); got.Name != "rerank" {
+		t.Fatal("canonical semantic span carrying HTTP metadata was dropped")
+	}
+}
 
 func attrString(kvs []attribute.KeyValue, key string) (string, bool) {
 	for _, kv := range kvs {

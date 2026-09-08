@@ -78,7 +78,7 @@ func (p *completionProcessor) OnEnd(s sdktrace.ReadOnlySpan) {
 	// Only root spans complete a trace; skip the marker itself to avoid
 	// recursing (the marker is parented to the root, so it is not itself root,
 	// but guard by name regardless).
-	if s.Parent().HasSpanID() || s.Name() == completionMarkerName {
+	if s.Parent().HasSpanID() || s.Name() == completionMarkerName || isHTTPReadOnlySpan(s) {
 		return
 	}
 

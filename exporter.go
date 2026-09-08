@@ -57,15 +57,19 @@ func (e *normalizingExporter) ExportSpans(ctx context.Context, spans []trace.Rea
 		e.discardAndRecord(spans, nil)
 		return newUploadFailure("prepare", contextReason(ctx), contextRetryable(ctx))
 	}
-	stubs := make([]spanStub, len(spans))
-	for index, s := range spans {
+	stubs := make([]spanStub, 0, len(spans))
+	for _, s := range spans {
 		if err := ctx.Err(); err != nil {
 			e.discardAndRecord(spans, nil)
 			return newUploadFailure("prepare", contextReason(ctx), contextRetryable(ctx))
 		}
+		if isHTTPReadOnlySpan(s) {
+			internalmedia.DiscardSpan(s.SpanContext())
+			continue
+		}
 		stub := tracetest.SpanStubFromReadOnlySpan(s)
 		stub.Attributes = e.mapper.Normalize(stub.Attributes)
-		stubs[index] = stub
+		stubs = append(stubs, stub)
 		if err := ctx.Err(); err != nil {
 			e.discardAndRecord(spans, nil)
 			return newUploadFailure("prepare", contextReason(ctx), contextRetryable(ctx))
@@ -96,6 +100,14 @@ func (e *normalizingExporter) ExportSpans(ctx context.Context, spans []trace.Rea
 				continue
 			}
 			applySpanData(&stubs[index], result)
+			if isHTTPSpanAttributes(
+				stubs[index].Attributes,
+				stubs[index].SpanKind,
+				stubs[index].InstrumentationScope,
+			) {
+				keep[index] = false
+				internalmedia.DiscardSpan(stubs[index].SpanContext)
+			}
 		}
 	}
 	if err := ctx.Err(); err != nil {
