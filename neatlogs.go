@@ -472,6 +472,7 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 			&normalizingExporter{
 				next: byteLimited, mapper: attributes.Default(), mask: cfg.Mask,
 				delivery: delivery, uploads: uploads, captures: captures, release: queue.release,
+				emitCompletionMarkers: true,
 			},
 			sdktrace.WithMaxQueueSize(defaultMaxQueueSize),
 			sdktrace.WithMaxExportBatchSize(defaultMaxExportBatchSize),
@@ -488,9 +489,6 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 	lifecycle := newActiveSpanRegistry()
 	tp.RegisterSpanProcessor(lifecycle)
 	tp.RegisterSpanProcessor(&identityProcessor{})
-	if !disable {
-		tp.RegisterSpanProcessor(&completionProcessor{tracer: tp.Tracer(tracerName, trace.WithInstrumentationVersion(Version))})
-	}
 	return newSDKRuntime(tp, lifecycle, resolvedWorkflowNameFrom(cfg), io.delivery, mediaStore, captures), base, !disable, nil
 }
 

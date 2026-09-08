@@ -10,6 +10,8 @@
 // target keys in that JSON.
 package attributes
 
+import "strings"
+
 // Span classification.
 const (
 	SpanKind = "neatlogs.span.kind" // value: "llm", "tool", "agent", "embedding", ...
@@ -26,6 +28,17 @@ const (
 // (invoke_agent / generate_content / execute_tool / ...). The mapper reads it to
 // classify span kind when no explicit span-kind attribute is present.
 const GenAIOperationName = "gen_ai.operation.name"
+
+// ResolveCanonicalSpanKind applies the same explicit-kind precedence used by
+// normalization and transport filtering.
+func ResolveCanonicalSpanKind(neatlogsKind, openInferenceKind, traceloopKind string) string {
+	for _, kind := range []string{neatlogsKind, openInferenceKind, traceloopKind} {
+		if value := strings.TrimSpace(kind); value != "" {
+			return value
+		}
+	}
+	return ""
+}
 
 // LLM attributes emitted by the genai wrapper.
 const (

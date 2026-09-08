@@ -81,6 +81,9 @@ func StartSpan(
 	kind string,
 	attributes ...attribute.KeyValue,
 ) (context.Context, trace.Span, func()) {
+	if isHTTPKind(kind) {
+		return startNoopSpan(ctx, name)
+	}
 	attributes = append([]attribute.KeyValue{
 		attribute.String(attrs.SpanKind, kind),
 	}, attributes...)
