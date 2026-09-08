@@ -304,20 +304,17 @@ func (m *Mapper) firstSource(node map[string]any, attrs map[string]attribute.Val
 // logic: honor explicit openinference/neatlogs kinds, else infer LLM, else
 // "unknown".
 func (m *Mapper) mapSpanKind(attrs map[string]attribute.Value) string {
-	var raw string
-	if v, ok := attrs["openinference.span.kind"]; ok {
-		raw = v.AsString()
-	}
-	if raw == "" {
-		if v, ok := attrs["traceloop.span.kind"]; ok {
-			raw = v.AsString()
+	value := func(key string) string {
+		if item, ok := attrs[key]; ok {
+			return item.AsString()
 		}
+		return ""
 	}
-	if raw == "" {
-		if v, ok := attrs[SpanKind]; ok { // a wrapper may set neatlogs.span.kind directly
-			raw = v.AsString()
-		}
-	}
+	raw := ResolveCanonicalSpanKind(
+		value(SpanKind),
+		value("openinference.span.kind"),
+		value("traceloop.span.kind"),
+	)
 	// Preserve a kind a wrapper/processor set deliberately that is not part of
 	// the normalized vocabulary (e.g. the "Neatlogs.INTERNAL" completion marker).
 	// Without this it would be clobbered to "unknown".

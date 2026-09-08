@@ -7,6 +7,8 @@ import (
 	"go.opentelemetry.io/otel/sdk/instrumentation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
+
+	attrs "github.com/neatlogs/neatlogs-go/internal/attributes"
 )
 
 var httpScopePrefixes = []string{
@@ -51,6 +53,7 @@ func isHTTPSpanAttributes(
 ) bool {
 	neatlogsKind := ""
 	openInferenceKind := ""
+	traceloopKind := ""
 	hasHTTPAttribute := false
 	for _, item := range attributes {
 		key := string(item.Key)
@@ -60,20 +63,22 @@ func isHTTPSpanAttributes(
 		if key == "openinference.span.kind" {
 			openInferenceKind = strings.ToUpper(strings.TrimSpace(item.Value.AsString()))
 		}
+		if key == "traceloop.span.kind" {
+			traceloopKind = strings.ToUpper(strings.TrimSpace(item.Value.AsString()))
+		}
 		if _, ok := httpAttributeKeys[key]; ok {
 			hasHTTPAttribute = true
 		}
 	}
-	if neatlogsKind == "HTTP" {
+	resolvedKind := strings.ToUpper(attrs.ResolveCanonicalSpanKind(
+		neatlogsKind,
+		openInferenceKind,
+		traceloopKind,
+	))
+	if resolvedKind == "HTTP" {
 		return true
 	}
-	if _, ok := semanticSpanKinds[neatlogsKind]; ok {
-		return false
-	}
-	if openInferenceKind == "HTTP" {
-		return true
-	}
-	if _, ok := semanticSpanKinds[openInferenceKind]; ok {
+	if _, ok := semanticSpanKinds[resolvedKind]; ok {
 		return false
 	}
 	for _, prefix := range httpScopePrefixes {

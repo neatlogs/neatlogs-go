@@ -4,7 +4,6 @@ import (
 	"context"
 
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
 
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
@@ -58,64 +57,3 @@ func (p *identityProcessor) ForceFlush(context.Context) error { return nil }
 // trace. The Python and TypeScript SDKs emit the same marker; without it the
 // backend receives spans but never surfaces the completed trace.
 const completionMarkerName = "neatlogs.trace.complete"
-
-// completionProcessor emits a neatlogs.trace.complete marker span whenever a
-// root span (one with no parent) ends. The marker shares the root's trace and
-// is parented to it, signalling the backend that the trace is complete.
-//
-// This runs as a SpanProcessor rather than in the exporter because it must
-// create a new span on the same provider; the marker then flows through the
-// normalizing exporter like any other span.
-type completionProcessor struct {
-	tracer trace.Tracer
-}
-
-var _ sdktrace.SpanProcessor = (*completionProcessor)(nil)
-
-func (p *completionProcessor) OnStart(context.Context, sdktrace.ReadWriteSpan) {}
-
-func (p *completionProcessor) OnEnd(s sdktrace.ReadOnlySpan) {
-	// Only root spans complete a trace; skip the marker itself to avoid
-	// recursing (the marker is parented to the root, so it is not itself root,
-	// but guard by name regardless).
-	if s.Parent().HasSpanID() || s.Name() == completionMarkerName || isHTTPReadOnlySpan(s) {
-		return
-	}
-
-	// Re-parent a new span onto the ending root's context so the marker shares
-	// its trace ID and points at the root as parent.
-	rootCtx := trace.ContextWithSpanContext(context.Background(), s.SpanContext())
-	markerAttrs := []attribute.KeyValue{
-		attribute.Bool(completionMarkerName, true),
-		attribute.Bool("neatlogs.internal", true),
-		attribute.String("neatlogs.span.kind", "Neatlogs.INTERNAL"),
-	}
-	// The marker may be exported separately from the root. Carry root-owned
-	// identity and session metadata so ingestion can still finalize it under
-	// the correct session without depending on batch order.
-	identityKeys := map[attribute.Key]struct{}{
-		attribute.Key(attrs.SessionID):          {},
-		attribute.Key(attrs.SessionParentID):    {},
-		attribute.Key(attrs.SessionFeatureName): {},
-		attribute.Key(attrs.SessionEntryPoint):  {},
-		attribute.Key(attrs.EndUserID):          {},
-		attribute.Key(attrs.EndUserMetadata):    {},
-	}
-	for _, kv := range s.Attributes() {
-		if _, ok := identityKeys[kv.Key]; ok {
-			markerAttrs = append(markerAttrs, kv)
-		}
-	}
-	// Carry forward trace-level tags from the resource, mirroring the TS SDK.
-	if res := s.Resource(); res != nil {
-		if v, ok := res.Set().Value(attrs.Tags); ok {
-			markerAttrs = append(markerAttrs, attribute.String(attrs.Tags, v.AsString()))
-		}
-	}
-
-	_, marker := p.tracer.Start(rootCtx, completionMarkerName, trace.WithAttributes(markerAttrs...))
-	marker.End()
-}
-
-func (p *completionProcessor) Shutdown(context.Context) error   { return nil }
-func (p *completionProcessor) ForceFlush(context.Context) error { return nil }

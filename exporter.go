@@ -2,12 +2,16 @@ package neatlogs
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/sdk/instrumentation"
 	"go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"github.com/neatlogs/neatlogs-go/internal/attributes"
 	internalmedia "github.com/neatlogs/neatlogs-go/internal/media"
@@ -24,15 +28,16 @@ import (
 // This makes spans created through Neatlogs wrappers or an explicitly injected
 // private tracer arrive keyed by the neatlogs.* contract.
 type normalizingExporter struct {
-	next      trace.SpanExporter
-	mapper    *attributes.Mapper
-	mask      MaskFunc
-	delivery  *deliveryDiagnostics
-	uploads   uploadAuthority
-	captures  *doctorCaptureStore
-	release   func(int)
-	maskOnce  sync.Once
-	maskSlots chan struct{}
+	next                  trace.SpanExporter
+	mapper                *attributes.Mapper
+	mask                  MaskFunc
+	delivery              *deliveryDiagnostics
+	uploads               uploadAuthority
+	captures              *doctorCaptureStore
+	release               func(int)
+	emitCompletionMarkers bool
+	maskOnce              sync.Once
+	maskSlots             chan struct{}
 }
 
 const (
@@ -134,7 +139,7 @@ func (e *normalizingExporter) ExportSpans(ctx context.Context, spans []trace.Rea
 	}
 	cancelUploads()
 
-	rewritten := make([]trace.ReadOnlySpan, 0, len(stubs))
+	rewritten := make([]trace.ReadOnlySpan, 0, len(stubs)*2)
 	for index := range stubs {
 		if keep[index] {
 			if err := ctx.Err(); err != nil {
@@ -142,6 +147,10 @@ func (e *normalizingExporter) ExportSpans(ctx context.Context, spans []trace.Rea
 				return newUploadFailure("prepare", contextReason(ctx), contextRetryable(ctx))
 			}
 			rewritten = append(rewritten, stubs[index].Snapshot())
+			if e.emitCompletionMarkers && !stubs[index].Parent.IsValid() && stubs[index].Name != completionMarkerName {
+				marker := completionMarkerStub(stubs[index])
+				rewritten = append(rewritten, marker.Snapshot())
+			}
 			if err := ctx.Err(); err != nil {
 				e.recordFailure(countKept(keep))
 				return newUploadFailure("prepare", contextReason(ctx), contextRetryable(ctx))
@@ -168,6 +177,62 @@ func (e *normalizingExporter) ExportSpans(ctx context.Context, spans []trace.Rea
 		return newUploadFailure("typed_media", "one_or_more_uploads_failed", false)
 	}
 	return nil
+}
+
+func completionMarkerStub(root spanStub) spanStub {
+	traceID := root.SpanContext.TraceID()
+	rootSpanID := root.SpanContext.SpanID()
+	digest := sha256.New()
+	_, _ = digest.Write(traceID[:])
+	_, _ = digest.Write(rootSpanID[:])
+	_, _ = digest.Write([]byte(completionMarkerName))
+	var markerSpanID oteltrace.SpanID
+	copy(markerSpanID[:], digest.Sum(nil)[:len(markerSpanID)])
+	markerContext := oteltrace.NewSpanContext(oteltrace.SpanContextConfig{
+		TraceID:    traceID,
+		SpanID:     markerSpanID,
+		TraceFlags: root.SpanContext.TraceFlags(),
+		TraceState: root.SpanContext.TraceState(),
+	})
+
+	markerAttributes := []attribute.KeyValue{
+		attribute.Bool(completionMarkerName, true),
+		attribute.Bool("neatlogs.internal", true),
+		attribute.String(attributes.SpanKind, "Neatlogs.INTERNAL"),
+	}
+	identityKeys := map[attribute.Key]struct{}{
+		attribute.Key(attributes.SessionID):          {},
+		attribute.Key(attributes.SessionParentID):    {},
+		attribute.Key(attributes.SessionFeatureName): {},
+		attribute.Key(attributes.SessionEntryPoint):  {},
+		attribute.Key(attributes.EndUserID):          {},
+		attribute.Key(attributes.EndUserMetadata):    {},
+	}
+	for _, item := range root.Attributes {
+		if _, ok := identityKeys[item.Key]; ok {
+			markerAttributes = append(markerAttributes, item)
+		}
+	}
+	if root.Resource != nil {
+		if value, ok := root.Resource.Set().Value(attributes.Tags); ok {
+			markerAttributes = append(
+				markerAttributes,
+				attribute.String(attributes.Tags, value.AsString()),
+			)
+		}
+	}
+
+	return spanStub{
+		Name:                 completionMarkerName,
+		SpanContext:          markerContext,
+		Parent:               root.SpanContext,
+		SpanKind:             oteltrace.SpanKindInternal,
+		StartTime:            root.EndTime,
+		EndTime:              root.EndTime,
+		Attributes:           markerAttributes,
+		Resource:             root.Resource,
+		InstrumentationScope: instrumentation.Scope{Name: "neatlogs.internal", Version: Version},
+	}
 }
 
 func countKept(keep []bool) int {

@@ -81,7 +81,99 @@ func TestExporterKeepsCanonicalSemanticSpanWithHTTPMetadata(t *testing.T) {
 	}
 	if got := byName(sink, "rerank"); got.Name != "rerank" {
 		t.Fatal("canonical semantic span carrying HTTP metadata was dropped")
+	} else if kind, _ := attrString(got.Attributes, attrs.SpanKind); kind != "reranker" {
+		t.Fatalf("canonical span kind = %q, want reranker", kind)
 	}
+}
+
+func TestExporterKeepsCanonicalSemanticSpanWithIdentityMask(t *testing.T) {
+	sink := tracetest.NewInMemoryExporter()
+	client, err := NewClient(
+		context.Background(),
+		Config{
+			WorkflowName: "http-suppression",
+			Mask: func(_ context.Context, data SpanData) (*SpanData, error) {
+				return &data, nil
+			},
+		},
+		WithExporter(sink),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Shutdown(context.Background())
+
+	_, span := client.runtime.provider.Tracer(
+		"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp",
+	).Start(
+		context.Background(),
+		"rerank-masked",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			attribute.String("neatlogs.span.kind", "RERANKER"),
+			attribute.String("openinference.span.kind", "HTTP"),
+			attribute.String("url.full", "https://provider.example/rerank"),
+		),
+	)
+	span.End()
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	got := byName(sink, "rerank-masked")
+	if got.Name != "rerank-masked" {
+		t.Fatal("identity mask dropped canonical semantic span")
+	}
+	if kind, _ := attrString(got.Attributes, attrs.SpanKind); kind != "reranker" {
+		t.Fatalf("canonical span kind = %q, want reranker", kind)
+	}
+}
+
+func TestPostMaskHTTPRootDoesNotEmitCompletionMarker(t *testing.T) {
+	sink := tracetest.NewInMemoryExporter()
+	client, err := NewClient(
+		context.Background(),
+		Config{
+			WorkflowName: "http-suppression",
+			Mask: func(_ context.Context, data SpanData) (*SpanData, error) {
+				if data.Name == "workflow" {
+					for index := range data.Attributes {
+						if string(data.Attributes[index].Key) == attrs.SpanKind {
+							data.Attributes[index] = attribute.String(attrs.SpanKind, "HTTP")
+						}
+					}
+				}
+				return &data, nil
+			},
+		},
+		WithExporter(sink),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Shutdown(context.Background())
+
+	ctx := client.Context(context.Background())
+	rootCtx, _, endRoot := Trace(ctx, "workflow")
+	_, _, endTool := StartSpan(rootCtx, "tool", attrs.KindTool)
+	endTool()
+	endRoot()
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	spans := sink.GetSpans()
+	if len(spans) != 1 || spans[0].Name != "tool" {
+		t.Fatalf("exported spans = %v, want only retained tool", spanNames(spans))
+	}
+}
+
+func spanNames(spans []tracetest.SpanStub) []string {
+	names := make([]string, 0, len(spans))
+	for _, span := range spans {
+		names = append(names, span.Name)
+	}
+	return names
 }
 
 func attrString(kvs []attribute.KeyValue, key string) (string, bool) {
