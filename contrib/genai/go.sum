@@ -60,8 +60,8 @@ github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aN
 github.com/gorilla/websocket v1.5.3/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
 github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 h1:5VipnvEpbqr2gA2VbM+nYVbkIF28c5ZQfqCBQ5g2xfk=
 github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0/go.mod h1:Hyl3n6Twe1hvtd9XUXDec4pTvgMSEixRuQKPTMH2bNs=
-github.com/neatlogs/neatlogs-go v0.1.7 h1:dk8vSb/j9a1oahfTQy+rFDS1psnWJeFyRg4+UytCxiE=
-github.com/neatlogs/neatlogs-go v0.1.7/go.mod h1:+X4/FARLKnbmlVxAyy20qKwsEU/TbJt5ahh1hfX7/KM=
+github.com/neatlogs/neatlogs-go v0.1.8 h1:XgkHNSTmgRR9QKYLKHxsS4mF8QMhCa5fbijhY3S2Tq0=
+github.com/neatlogs/neatlogs-go v0.1.8/go.mod h1:+X4/FARLKnbmlVxAyy20qKwsEU/TbJt5ahh1hfX7/KM=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/prometheus/client_model v0.0.0-20190812154241-14fe0d1b01d4/go.mod h1:xMI15A0UPsDsEKsMN9yxemIoYk6Tm2C1GtYGdfGttqA=
