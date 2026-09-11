@@ -403,6 +403,30 @@ func disableExportEnvSet() bool {
 
 // buildSDKRuntime constructs one private provider. Supplying a custom exporter
 // transfers its shutdown ownership to the returned runtime.
+// defaultMaxSpanAttributes mirrors the Python and TypeScript SDKs
+// (_DEFAULT_MAX_SPAN_ATTRIBUTES / spanLimits.attributeCountLimit): OTel's
+// default of 128 span attributes silently drops semantic attributes when
+// instrumenting LLM apps (chat history, retrieval docs, tool IO).
+const defaultMaxSpanAttributes = 10_000
+
+// spanLimitsForCaptureEverything raises the span attribute budget to match
+// the Python and TypeScript SDKs. Explicit OTel limits via env vars win; the
+// SDK already reads OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT /
+// OTEL_ATTRIBUTE_COUNT_LIMIT when building its defaults.
+func spanLimitsForCaptureEverything() sdktrace.SpanLimits {
+	if strings.TrimSpace(os.Getenv("OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT")) != "" ||
+		strings.TrimSpace(os.Getenv("OTEL_ATTRIBUTE_COUNT_LIMIT")) != "" {
+		return sdktrace.NewSpanLimits()
+	}
+	return sdktrace.SpanLimits{
+		AttributeCountLimit:         defaultMaxSpanAttributes,
+		EventCountLimit:             128,
+		LinkCountLimit:              128,
+		AttributePerEventCountLimit: 128,
+		AttributePerLinkCountLimit:  128,
+	}
+}
+
 func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRuntime, *url.URL, bool, error) {
 	apiKey := strings.TrimSpace(cfg.APIKey)
 	if apiKey == "" {
@@ -461,6 +485,7 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 		tpOpts,
 		sdktrace.WithResource(buildResource(ctx, cfg, io.doctorProbe)),
 		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(sampleRate))),
+		sdktrace.WithSpanLimits(spanLimitsForCaptureEverything()),
 	)
 
 	var mediaStore *internalmedia.Store
