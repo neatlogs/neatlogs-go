@@ -39,8 +39,8 @@ github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aN
 github.com/gorilla/websocket v1.5.3/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
 github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 h1:5VipnvEpbqr2gA2VbM+nYVbkIF28c5ZQfqCBQ5g2xfk=
 github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0/go.mod h1:Hyl3n6Twe1hvtd9XUXDec4pTvgMSEixRuQKPTMH2bNs=
-github.com/neatlogs/neatlogs-go v0.1.8 h1:XgkHNSTmgRR9QKYLKHxsS4mF8QMhCa5fbijhY3S2Tq0=
-github.com/neatlogs/neatlogs-go v0.1.8/go.mod h1:+X4/FARLKnbmlVxAyy20qKwsEU/TbJt5ahh1hfX7/KM=
+github.com/neatlogs/neatlogs-go v0.1.9 h1:hCo29winSs9FQp1G8zhzH1k7COZnnqyNIKnyA6z6EBc=
+github.com/neatlogs/neatlogs-go v0.1.9/go.mod h1:+X4/FARLKnbmlVxAyy20qKwsEU/TbJt5ahh1hfX7/KM=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=

@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/a2aproject/a2a-go/v2 v2.3.1
-	github.com/neatlogs/neatlogs-go v0.1.8
+	github.com/neatlogs/neatlogs-go v0.1.9
 	github.com/neatlogs/neatlogs-go/contrib/adk v0.0.0-00010101000000-000000000000
 	google.golang.org/adk v1.4.0
 	google.golang.org/genai v1.61.0
