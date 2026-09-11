@@ -13,6 +13,7 @@ SDKs.
 ```bash
 go get github.com/neatlogs/neatlogs-go
 go get github.com/neatlogs/neatlogs-go/contrib/genai
+go get github.com/neatlogs/neatlogs-go/contrib/adk
 ```
 
 The library install does not install the optional Doctor CLI. Install that
@@ -98,10 +99,10 @@ shared verbatim with the Python and TypeScript SDKs, so every span kind
 `neatlogs.*` namespace by one shared contract. The mapper only renames keys; it
 performs no value rewriting or derived computation — the backend owns that.
 
-Frameworks that resolve tracers only from the global OTel API are not
-auto-instrumented. They require an explicit wrapper or an injected private
-tracer/provider integration. Google ADK support is therefore deferred until
-that integration can be isolated bidirectionally.
+Frameworks that resolve tracers only from the global OTel API are not passively
+captured. They require explicit wrappers that create spans on Neatlogs' private
+provider. Google ADK is supported through `contrib/adk`: use `adk.Run`,
+`adk.InstrumentConfig`, and the private A2A propagation helpers.
 
 ### Cross-process propagation
 
@@ -133,6 +134,8 @@ if err := neatlogs.SetTraceOutput(root, result); err != nil {
 ### Examples
 
 - [examples/genai](examples/genai/main.go) — the `WrapGenAI` path.
+- [examples/adk](examples/adk/main.go) — Google ADK model, tool, workflow,
+  streaming, concurrent, and A2A instrumentation.
 
 Export runs on a background batch processor, so instrumentation never blocks or
 delays your agent code.

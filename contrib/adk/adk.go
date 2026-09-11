@@ -1,32 +1,18 @@
-// Package adk adds Neatlogs input/output capture to Google ADK.
-//
-// Deprecated: this integration is incompatible with the isolated Neatlogs SDK
-// and no longer works. See DEPRECATED.md. It was built when neatlogs.Init
-// registered the process-GLOBAL OpenTelemetry TracerProvider, so ADK's
-// global-provider auto-instrumentation flowed into Neatlogs for free and
-// WrapModel only had to annotate the live span with message text. The SDK now
-// isolates onto a PRIVATE provider it never registers globally (so it can never
-// export or parent a co-tenant's spans, e.g. Datadog). As a result ADK's spans
-// never reach the Neatlogs provider, WrapModel finds no recording Neatlogs span
-// to annotate, and no ADK trace is captured (the suite fails with "no spans
-// captured"). The code is retained, compilable, for reference and a possible
-// future redesign (e.g. an ADK-side hook that accepts an injected provider);
-// do not wire it into new code.
-//
-// Original behavior: ADK-Go records prompt/completion TEXT only on the OTel
-// *logs* signal, never on spans; WrapModel wrote the request/response messages
-// onto the live generate_content span as neatlogs.llm.input_messages.* /
-// output_messages.* so the I/O landed on the trace where Neatlogs expects it.
+// Package adk instruments Google ADK with Neatlogs-owned spans. It never reads
+// or replaces the process-global OpenTelemetry provider.
 package adk
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"iter"
 	"strings"
 
+	neatlogs "github.com/neatlogs/neatlogs-go"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/adk/model"
 	"google.golang.org/genai"
@@ -36,6 +22,8 @@ const (
 	inputMsgPrefix  = "neatlogs.llm.input_messages."
 	outputMsgPrefix = "neatlogs.llm.output_messages."
 	toolCallPrefix  = "neatlogs.llm.tool_calls."
+	maxOutputBytes  = 1 << 20
+	maxToolCalls    = 128
 )
 
 // instrumentedModel wraps an ADK model.LLM, adding I/O capture onto the active
@@ -44,16 +32,14 @@ type instrumentedModel struct {
 	inner model.LLM
 }
 
-// WrapModel returns a model.LLM that records request/response messages onto the
-// generate_content span ADK starts around each call. If inner is nil it is
-// returned unchanged.
-//
-// Deprecated: no longer functional under the isolated Neatlogs SDK — ADK's
-// spans are started on the global OTel provider, which Neatlogs no longer owns,
-// so there is no recording Neatlogs span to annotate. See the package doc and
-// DEPRECATED.md.
+// WrapModel returns a model.LLM that records each ADK model call on the private
+// Neatlogs provider selected by ctx. It preserves streaming and never changes
+// the process-global OpenTelemetry provider. If inner is nil, it returns nil.
 func WrapModel(inner model.LLM) model.LLM {
 	if inner == nil {
+		return inner
+	}
+	if _, ok := inner.(*instrumentedModel); ok {
 		return inner
 	}
 	return &instrumentedModel{inner: inner}
@@ -62,76 +48,169 @@ func WrapModel(inner model.LLM) model.LLM {
 func (m *instrumentedModel) Name() string { return m.inner.Name() }
 
 func (m *instrumentedModel) GenerateContent(ctx context.Context, req *model.LLMRequest, stream bool) iter.Seq2[*model.LLMResponse, error] {
-	span := trace.SpanFromContext(ctx)
-	// Only annotate a live, recording span (the one ADK started). If there is
-	// none, pass through untouched.
-	if span == nil || !span.IsRecording() {
-		return m.inner.GenerateContent(ctx, req, stream)
-	}
-
-	setInputMessages(span, req)
-
-	seq := m.inner.GenerateContent(ctx, req, stream)
 	return func(yield func(*model.LLMResponse, error) bool) {
-		// ADK ends the span on yield of the final response, so output attributes
-		// must be set BEFORE each yield (not after the loop). Partial deltas are
-		// accumulated for the case where the final chunk carries no text.
-		var streamed string
-		var toolCalls []string
-		toolIdx := 0
-
-		annotate := func(resp *model.LLMResponse) {
-			if resp == nil || resp.Content == nil {
-				return
-			}
-			var text string
-			for _, part := range resp.Content.Parts {
-				if part == nil {
-					continue
-				}
-				switch {
-				case part.Text != "" && !part.Thought:
-					text += part.Text
-				case part.FunctionCall != nil:
-					fc := part.FunctionCall
-					span.SetAttributes(attribute.String(fmt.Sprintf("%s%d.name", toolCallPrefix, toolIdx), fc.Name))
-					if fc.ID != "" {
-						span.SetAttributes(attribute.String(fmt.Sprintf("%s%d.id", toolCallPrefix, toolIdx), fc.ID))
-					}
-					span.SetAttributes(attribute.String(fmt.Sprintf("%s%d.arguments", toolCallPrefix, toolIdx), mustJSON(fc.Args)))
-					toolCalls = append(toolCalls, fc.Name+"("+mustJSON(fc.Args)+")")
-					toolIdx++
-				}
-			}
-			if resp.Partial {
-				streamed += text
-				return
-			}
-			if text == "" {
-				text = streamed
-			}
-			// A tool-deciding turn produces no text, only function calls. Surface
-			// them as the span's output so the LLM row isn't blank.
-			if text == "" && len(toolCalls) > 0 {
-				text = "Tool calls: " + strings.Join(toolCalls, ", ")
-			}
-			if text != "" {
-				span.SetAttributes(
-					attribute.String("neatlogs.output.value", text),
-					attribute.String(outputMsgPrefix+"0.role", "assistant"),
-					attribute.String(outputMsgPrefix+"0.content", text),
-				)
-			}
+		modelName := m.Name()
+		if req != nil && strings.TrimSpace(req.Model) != "" {
+			modelName = req.Model
 		}
+		spanCtx, span, end := neatlogs.StartProviderSpan(ctx, "google.adk.generate_content", "llm")
+		defer end()
+		span.SetAttributes(
+			attribute.String("neatlogs.span.kind", "llm"),
+			attribute.String("neatlogs.llm.provider", "google"),
+			attribute.String("neatlogs.llm.system", "google_adk"),
+			attribute.String("neatlogs.llm.model_name", modelName),
+			attribute.Bool("neatlogs.llm.is_streaming", stream),
+		)
+		setInputMessages(span, req)
+		setInvocationParameters(span, req)
 
-		for resp, err := range seq {
-			if err == nil {
-				annotate(resp) // must run BEFORE yield — ADK ends the span on yield of a final resp
+		capture := responseCapture{}
+		for resp, err := range m.inner.GenerateContent(spanCtx, req, stream) {
+			if err != nil {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
+				capture.failed = true
+			} else {
+				capture.add(span, resp)
 			}
 			if !yield(resp, err) {
-				return
+				span.SetAttributes(attribute.Bool("neatlogs.stream.cancelled", true))
+				capture.cancelled = true
+				break
 			}
 		}
+		capture.apply(span)
+		if !capture.failed && !capture.cancelled {
+			span.SetStatus(codes.Ok, "")
+		}
+	}
+}
+
+type responseCapture struct {
+	output       strings.Builder
+	toolCalls    []string
+	toolCallKeys map[string]int
+	truncated    bool
+	failed       bool
+	cancelled    bool
+	usage        *genai.GenerateContentResponseUsageMetadata
+	finishReason string
+	droppedTools int
+}
+
+func (c *responseCapture) add(span trace.Span, resp *model.LLMResponse) {
+	if resp == nil {
+		return
+	}
+	if resp.ModelVersion != "" {
+		span.SetAttributes(attribute.String("neatlogs.llm.model_name", resp.ModelVersion))
+	}
+	if resp.UsageMetadata != nil {
+		c.usage = resp.UsageMetadata
+	}
+	if resp.FinishReason != "" {
+		c.finishReason = string(resp.FinishReason)
+	}
+	if resp.ErrorCode != "" || resp.ErrorMessage != "" {
+		err := errors.New(strings.TrimSpace(resp.ErrorCode + ": " + resp.ErrorMessage))
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		c.failed = true
+	}
+	if resp.Content == nil {
+		return
+	}
+	for _, part := range resp.Content.Parts {
+		if part == nil {
+			continue
+		}
+		if part.Text != "" && !part.Thought {
+			c.appendOutput(part.Text)
+		}
+		if part.FunctionCall != nil {
+			c.addToolCall(span, part.FunctionCall)
+		}
+	}
+}
+
+func (c *responseCapture) appendOutput(value string) {
+	remaining := maxOutputBytes - c.output.Len()
+	if remaining <= 0 {
+		c.truncated = true
+		return
+	}
+	if len(value) > remaining {
+		c.output.WriteString(boundedTextTo(value, remaining))
+		c.truncated = true
+		return
+	}
+	c.output.WriteString(value)
+}
+
+func (c *responseCapture) addToolCall(span trace.Span, call *genai.FunctionCall) {
+	if call == nil {
+		return
+	}
+	if c.toolCallKeys == nil {
+		c.toolCallKeys = make(map[string]int)
+	}
+	key := strings.TrimSpace(call.ID)
+	if key == "" {
+		key = strings.TrimSpace(call.Name) + ":" + boundedJSON(call.Args)
+	}
+	if index, exists := c.toolCallKeys[key]; exists {
+		args := boundedJSON(call.Args)
+		span.SetAttributes(attribute.String(fmt.Sprintf("%s%d.arguments", toolCallPrefix, index), args))
+		c.toolCalls[index] = call.Name + "(" + args + ")"
+		return
+	}
+	if len(c.toolCalls) >= maxToolCalls {
+		c.droppedTools++
+		return
+	}
+	index := len(c.toolCalls)
+	c.toolCallKeys[key] = index
+	args := boundedJSON(call.Args)
+	span.SetAttributes(
+		attribute.String(fmt.Sprintf("%s%d.name", toolCallPrefix, index), call.Name),
+		attribute.String(fmt.Sprintf("%s%d.arguments", toolCallPrefix, index), args),
+	)
+	if call.ID != "" {
+		span.SetAttributes(attribute.String(fmt.Sprintf("%s%d.id", toolCallPrefix, index), call.ID))
+	}
+	c.toolCalls = append(c.toolCalls, call.Name+"("+args+")")
+}
+
+func (c *responseCapture) apply(span trace.Span) {
+	output := c.output.String()
+	if output == "" && len(c.toolCalls) > 0 {
+		output = "Tool calls: " + strings.Join(c.toolCalls, ", ")
+	}
+	if output != "" {
+		span.SetAttributes(
+			attribute.String("neatlogs.output.value", output),
+			attribute.String(outputMsgPrefix+"0.role", "assistant"),
+			attribute.String(outputMsgPrefix+"0.content", output),
+		)
+	}
+	if c.truncated {
+		span.SetAttributes(attribute.Bool("neatlogs.output.truncated", true))
+	}
+	if c.finishReason != "" {
+		span.SetAttributes(attribute.String("neatlogs.llm.finish_reason", c.finishReason))
+	}
+	if c.droppedTools > 0 {
+		span.SetAttributes(attribute.Int("neatlogs.llm.tool_calls_truncated_count", c.droppedTools))
+	}
+	if c.usage != nil {
+		span.SetAttributes(
+			attribute.Int("neatlogs.llm.token_count.prompt", int(c.usage.PromptTokenCount)),
+			attribute.Int("neatlogs.llm.token_count.completion", int(c.usage.CandidatesTokenCount)),
+			attribute.Int("neatlogs.llm.token_count.total", int(c.usage.TotalTokenCount)),
+			attribute.Int("neatlogs.llm.token_count.reasoning", int(c.usage.ThoughtsTokenCount)),
+			attribute.Int("neatlogs.llm.token_count.cache_read", int(c.usage.CachedContentTokenCount)),
+		)
 	}
 }
 
@@ -152,6 +231,7 @@ func setInputMessages(span trace.Span, req *model.LLMRequest) {
 	idx := 0
 	var msgs []chatMessage
 	add := func(role, content string) {
+		content = boundedText(content)
 		span.SetAttributes(
 			attribute.String(fmt.Sprintf("%s%d.role", inputMsgPrefix, idx), role),
 			attribute.String(fmt.Sprintf("%s%d.content", inputMsgPrefix, idx), content),
@@ -177,37 +257,101 @@ func setInputMessages(span trace.Span, req *model.LLMRequest) {
 	}
 
 	if len(msgs) > 0 {
-		span.SetAttributes(attribute.String("neatlogs.input.value", mustJSON(msgs)))
+		span.SetAttributes(attribute.String("neatlogs.input.value", boundedJSON(msgs)))
 	}
 }
 
-// contentText joins the text parts of a Content, falling back to JSON for
-// non-text parts.
+func setInvocationParameters(span trace.Span, req *model.LLMRequest) {
+	if req == nil || req.Config == nil {
+		return
+	}
+	config := req.Config
+	params := make(map[string]any)
+	if config.Temperature != nil {
+		span.SetAttributes(attribute.Float64("neatlogs.llm.temperature", float64(*config.Temperature)))
+		params["temperature"] = *config.Temperature
+	}
+	if config.TopP != nil {
+		span.SetAttributes(attribute.Float64("neatlogs.llm.top_p", float64(*config.TopP)))
+		params["top_p"] = *config.TopP
+	}
+	if config.TopK != nil {
+		span.SetAttributes(attribute.Float64("neatlogs.llm.top_k", float64(*config.TopK)))
+		params["top_k"] = *config.TopK
+	}
+	if config.MaxOutputTokens > 0 {
+		span.SetAttributes(attribute.Int("neatlogs.llm.max_tokens", int(config.MaxOutputTokens)))
+		params["max_output_tokens"] = config.MaxOutputTokens
+	}
+	if config.CandidateCount > 0 {
+		params["candidate_count"] = config.CandidateCount
+	}
+	if len(params) > 0 {
+		span.SetAttributes(attribute.String("neatlogs.llm.invocation_parameters", boundedJSON(params)))
+	}
+}
+
+// contentText joins text without serializing binary or provider-owned payloads
+// into span attributes. Non-text media remains represented by the surrounding
+// ADK request rather than being copied into telemetry.
 func contentText(c *genai.Content) string {
 	if c == nil {
 		return ""
 	}
-	var text string
+	var text strings.Builder
 	hasText := false
 	for _, part := range c.Parts {
 		if part != nil && part.Text != "" {
 			if hasText {
-				text += "\n"
+				text.WriteByte('\n')
 			}
-			text += part.Text
+			remaining := maxOutputBytes - text.Len()
+			if remaining <= 0 {
+				break
+			}
+			text.WriteString(boundedTextTo(part.Text, remaining))
 			hasText = true
 		}
 	}
 	if hasText {
-		return text
+		return text.String()
 	}
-	return mustJSON(c.Parts)
+	if len(c.Parts) > 0 {
+		return "[non-text content]"
+	}
+	return ""
 }
 
 func mustJSON(v any) string {
 	b, err := json.Marshal(v)
 	if err != nil {
-		return ""
+		return `{"neatlogs_serialization_error":true}`
 	}
 	return string(b)
+}
+
+func boundedJSON(v any) string {
+	value := mustJSON(v)
+	if len(value) <= maxOutputBytes {
+		return value
+	}
+	preview := boundedTextTo(value, maxOutputBytes-128)
+	return mustJSON(map[string]any{
+		"neatlogs_truncated": true,
+		"preview":            preview,
+	})
+}
+
+func boundedText(value string) string {
+	return boundedTextTo(value, maxOutputBytes)
+}
+
+func boundedTextTo(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	for limit > 0 && (value[limit]&0xc0) == 0x80 {
+		limit--
+	}
+	return value[:limit]
 }

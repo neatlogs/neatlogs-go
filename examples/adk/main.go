@@ -1,12 +1,5 @@
-//go:build adk_legacy
-
-// Command adk retains the former Google ADK passive-passthrough example only as
-// a legacy compatibility fixture. It is not a supported Neatlogs integration.
-//
-// ADK resolves its tracer from OpenTelemetry's process-global provider, while
-// Neatlogs deliberately uses a private provider for project isolation. As a
-// result, this passthrough path does not export ADK spans to Neatlogs. Do not
-// restore global-provider ownership to make this example pass.
+// Command adk demonstrates explicit Google ADK instrumentation on Neatlogs'
+// private OpenTelemetry provider.
 //
 // Scenarios (each its own workflow in the UI):
 //
@@ -19,11 +12,7 @@
 //	adk-a2a             remote agent over the A2A protocol
 //	adk-concurrent      N agents run concurrently (goroutine safety)
 //
-// To inspect the legacy application code:
-//
-//	go run -tags adk_legacy .
-//
-// The command can call ADK, but it does not produce Neatlogs semantic spans.
+// Run one scenario with `go run . -scenario=tools`, or use `-scenario=all`.
 package main
 
 import (
@@ -87,13 +76,12 @@ func main() {
 		log.Fatal("set GOOGLE_API_KEY (or GEMINI_API_KEY) — these scenarios make real Gemini calls")
 	}
 
-	// One scenario per run keeps the UI clean: each runner.Run is one trace, so
+	// One scenario per run keeps the UI clean: each nladk.Run is one trace, so
 	// running everything at once floods the workflow with a dozen traces. Pick a
 	// scenario with -scenario, or pass -scenario=all to run them all.
 	//
-	// This initialization uses Neatlogs' private provider. ADK remains bound to
-	// the process-global provider, which is why this legacy path captures no ADK
-	// semantic spans.
+	// The wrapper and run helper below create spans directly on this private
+	// provider; they never replace the process-global OpenTelemetry provider.
 	ctx := context.Background()
 	shutdown, err := neatlogs.Init(ctx, neatlogs.Config{
 		APIKey:       os.Getenv("NEATLOGS_API_KEY"),
@@ -125,7 +113,7 @@ func main() {
 	if err := neatlogs.Flush(ctx); err != nil {
 		log.Printf("flush: %v", err)
 	}
-	fmt.Println("\nLegacy ADK scenario completed; no Neatlogs ADK spans are expected.")
+	fmt.Println("\nADK scenario completed; Neatlogs spans were flushed.")
 }
 
 func scenarioList(m map[string]func(context.Context, string)) string {
@@ -160,7 +148,7 @@ func runAgent(ctx context.Context, a agent.Agent, appName, prompt string, mode a
 		log.Fatalf("[%s] runner: %v", appName, err)
 	}
 	msg := genai.NewContentFromText(prompt, genai.RoleUser)
-	for ev, err := range r.Run(ctx, userID, sessionID, msg, agent.RunConfig{StreamingMode: mode}) {
+	for ev, err := range nladk.Run(ctx, r, userID, sessionID, msg, agent.RunConfig{StreamingMode: mode}) {
 		if err != nil {
 			log.Fatalf("[%s] run: %v", appName, err)
 		}
@@ -211,11 +199,11 @@ func runTools(ctx context.Context, key string) {
 	if err != nil {
 		log.Fatalf("tool: %v", err)
 	}
-	a, err := llmagent.New(llmagent.Config{
+	a, err := llmagent.New(nladk.InstrumentConfig(llmagent.Config{
 		Name: "weather_agent", Model: newModel(ctx, key),
 		Instruction: "Use the get_weather tool to answer, then report the result in one sentence.",
 		Tools:       []tool.Tool{weatherTool},
-	})
+	}))
 	if err != nil {
 		log.Fatalf("agent: %v", err)
 	}
@@ -374,7 +362,7 @@ func runConcurrent(ctx context.Context, key string, n int) {
 				log.Printf("runner %d: %v", i, err)
 				return
 			}
-			for _, err := range r.Run(ctx, "u", sid, genai.NewContentFromText("a river", genai.RoleUser), agent.RunConfig{}) {
+			for _, err := range nladk.Run(ctx, r, "u", sid, genai.NewContentFromText("a river", genai.RoleUser), agent.RunConfig{}) {
 				if err != nil {
 					log.Printf("run %d: %v", i, err)
 					return

@@ -1,22 +1,46 @@
-# Legacy Google ADK example
+# Google ADK instrumentation
 
-This directory is retained only as a compatibility fixture. Google ADK obtains
-its tracer from OpenTelemetry's process-global provider, while Neatlogs uses a
-private provider so traces cannot leak between projects or other observability
-SDKs. Consequently, the old passive-passthrough integration does not send ADK
-semantic spans to Neatlogs.
+This example uses explicit wrappers because Google ADK obtains its own spans
+from OpenTelemetry's process-global provider, while Neatlogs deliberately keeps
+each project on a private provider.
 
-The source and failure-reproduction tests are gated behind the `adk_legacy`
-build tag. Do not use this directory as a setup example and do not restore
-global-provider ownership to make it pass. Supported Go instrumentation should
-use the core SDK's explicit span helpers or an integration that accepts the
-Neatlogs provider directly.
-
-The known incompatibility can be reproduced without credentials:
+Install both modules:
 
 ```bash
-go test -tags adk_legacy -run '^TestADKPassthrough$' ./...
+go get github.com/neatlogs/neatlogs-go@latest
+go get github.com/neatlogs/neatlogs-go/contrib/adk@latest
 ```
 
-That command is expected to fail with `no spans captured` until Google ADK can
-be connected to the private Neatlogs provider.
+The integration has three deliberate hooks:
+
+```go
+config := nladk.InstrumentConfig(llmagent.Config{
+    Name:  "weather_agent",
+    Model: geminiModel,
+    Tools: tools,
+})
+agent, err := llmagent.New(config)
+
+for event, err := range nladk.Run(
+    ctx, runner, userID, sessionID, message, agent.RunConfig{},
+) {
+    // consume the unchanged ADK event stream
+}
+```
+
+- `InstrumentConfig` wraps model calls and tool callbacks.
+- `Run` creates the workflow root and carries the private trace context through
+  the ADK runner.
+- `A2AHTTPClient`, `A2AHandler`, `A2ABeforeRequest`, and `A2AAfterRequest`
+  preserve context and I/O across A2A boundaries without emitting HTTP spans.
+
+Set `NEATLOGS_API_KEY` and `GOOGLE_API_KEY`, then run:
+
+```bash
+go run . -scenario=non-streaming
+go run . -scenario=tools
+go run . -scenario=all
+```
+
+The example covers non-streaming, streaming, tools, sequential, parallel, loop,
+A2A, and concurrent executions.
