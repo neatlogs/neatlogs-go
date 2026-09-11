@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/a2aproject/a2a-go/v2 v2.3.1
-	github.com/neatlogs/neatlogs-go v0.1.8
+	github.com/neatlogs/neatlogs-go v0.1.9
 	go.opentelemetry.io/otel v1.44.0
 	go.opentelemetry.io/otel/sdk v1.44.0
 	go.opentelemetry.io/otel/trace v1.44.0
