@@ -438,6 +438,16 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 	if err != nil {
 		return nil, nil, false, fmt.Errorf("neatlogs: invalid endpoint %q: %w", endpoint, err)
 	}
+	// The endpoint must be a bare base URL or an OTLP traces URL ending in
+	// /v1/traces. Any other path would be silently dropped by the exporter
+	// (which targets {host}/v1/traces) and misroute telemetry, so it is
+	// rejected instead (same contract as the Python and TypeScript SDKs).
+	if base.Scheme == "" || base.Host == "" {
+		return nil, nil, false, fmt.Errorf("neatlogs: endpoint must be a base URL or an OTLP traces URL ending in /v1/traces, got %q", endpoint)
+	}
+	if p := strings.TrimRight(base.Path, "/"); p != "" && p != "/v1/traces" {
+		return nil, nil, false, fmt.Errorf("neatlogs: endpoint must be a base URL or an OTLP traces URL ending in /v1/traces, got %q", endpoint)
+	}
 
 	sampleRate := 1.0
 	if cfg.SampleRate != nil {
