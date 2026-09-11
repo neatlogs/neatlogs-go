@@ -349,7 +349,7 @@ func initializationSignature(cfg Config, options initOptions) string {
 		strings.Join(cfg.Tags, "\x00"),
 		cfg.Debug,
 		rate,
-		cfg.DisableExport,
+		cfg.DisableExport || disableExportEnvSet(),
 		uploadsSignature(cfg),
 		maskSignature(cfg.Mask),
 		identityOf(options.exporter),
@@ -388,6 +388,19 @@ func identityOf(value any) string {
 	}
 }
 
+// disableExportEnvSet reports whether NEATLOGS_DISABLE_EXPORT opts the process
+// out of export, matching the Python and TypeScript SDKs: the value "true",
+// "1", or "yes" (case-insensitive) disables export. Either the env var or
+// Config.DisableExport disables export; the env var cannot re-enable export
+// that Config disables.
+func disableExportEnvSet() bool {
+	switch strings.ToLower(os.Getenv("NEATLOGS_DISABLE_EXPORT")) {
+	case "true", "1", "yes":
+		return true
+	}
+	return false
+}
+
 // buildSDKRuntime constructs one private provider. Supplying a custom exporter
 // transfers its shutdown ownership to the returned runtime.
 func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRuntime, *url.URL, bool, error) {
@@ -404,7 +417,7 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 		return nil, nil, false, fmt.Errorf("neatlogs: uploads require NEATLOGS_API_KEY or Config.APIKey")
 	}
 
-	disable := cfg.DisableExport
+	disable := cfg.DisableExport || disableExportEnvSet()
 	// A custom exporter supplies its own transport, so the missing-API-key rule
 	// (which only governs the built-in OTLP exporter) does not apply to it.
 	if apiKey == "" && !disable && io.exporter == nil {
