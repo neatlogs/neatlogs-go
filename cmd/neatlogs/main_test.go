@@ -149,8 +149,10 @@ func TestDoctorInitializationFailurePreservesCanonicalFailureContract(t *testing
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Setenv("NEATLOGS_API_KEY", "test-key")
-			t.Setenv("NEATLOGS_ENDPOINT", "http://127.0.0.1:1")
-			t.Setenv("NEATLOGS_UPLOADS_ENABLED", "invalid")
+			// Endpoints with a path fail init (parity with the Python and
+			// TypeScript SDKs); NEATLOGS_UPLOADS_ENABLED no longer errors on
+			// unrecognized values, so it cannot force this failure anymore.
+			t.Setenv("NEATLOGS_ENDPOINT", "http://127.0.0.1:1/with-path")
 
 			read, write, err := os.Pipe()
 			if err != nil {
