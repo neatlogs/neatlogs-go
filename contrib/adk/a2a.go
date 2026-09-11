@@ -1,33 +1,28 @@
 package adk
 
 import (
+	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
-	"go.opentelemetry.io/otel"
+	neatlogs "github.com/neatlogs/neatlogs-go"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
-	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/adk/agent"
 	"google.golang.org/adk/session"
 )
 
 // A2A (agent-to-agent) calls cross an HTTP boundary, so without trace-context
-// propagation the remote agent's execution lands in a SEPARATE trace from the
-// caller. These helpers carry the W3C traceparent across that boundary using the
-// global OpenTelemetry propagator (installed by neatlogs.Init), so the remote
-// server's agent/LLM spans nest under the calling trace — one linked trace.
+// propagation the remote agent's execution lands in a separate trace from the
+// caller. These helpers carry Neatlogs' private W3C trace context without
+// reading or replacing the process-global OpenTelemetry propagator.
 //
 // They deliberately do NOT create their own HTTP spans (unlike otelhttp); they
 // only inject/extract the trace context, keeping the trace free of transport
 // noise.
 //
-// Deprecated: part of the quarantined ADK integration (see DEPRECATED.md). These
-// helpers read/write the GLOBAL OpenTelemetry propagator, which the isolated
-// Neatlogs SDK no longer installs, so no traceparent is propagated. Cross-process
-// continuation in the isolated SDK uses neatlogs.InjectTraceContext /
-// ExtractTraceContext (the SDK's private propagator) instead.
-
 // A2AHTTPClient returns an *http.Client whose transport injects the current
 // trace context as a traceparent header on every outbound request. Pass it to
 // the A2A client factory, e.g.:
@@ -44,7 +39,7 @@ func A2AHTTPClient() *http.Client {
 //	srv := &http.Server{Handler: nladk.A2AHandler(mux)}
 func A2AHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+		ctx := neatlogs.ExtractTraceContext(r.Context(), propagation.HeaderCarrier(r.Header))
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -54,8 +49,14 @@ func A2AHandler(next http.Handler) http.Handler {
 type injectingTransport struct{ base http.RoundTripper }
 
 func (t injectingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	otel.GetTextMapPropagator().Inject(req.Context(), propagation.HeaderCarrier(req.Header))
-	return t.base.RoundTrip(req)
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	clone := req.Clone(req.Context())
+	clone.Header = req.Header.Clone()
+	neatlogs.InjectTraceContext(clone.Context(), propagation.HeaderCarrier(clone.Header))
+	return base.RoundTrip(clone)
 }
 
 // Capturing A2A client I/O.
@@ -77,13 +78,16 @@ func (t injectingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 // remoteagent.AfterA2ARequestCallback. Returning (nil, nil) means "did not
 // intercept" so ADK proceeds normally.
 
-// A2ABeforeRequest records the outbound A2A request message on the active span.
-// It sets both the generic neatlogs.input.value (which the backend reads for any
-// span kind, including AGENT) and the indexed input_messages form (consumed for
-// LLM-shaped views), so the client's invoke_agent span shows what was sent.
+var activeA2ACalls activeCallRegistry
+
+// A2ABeforeRequest starts a Neatlogs-owned AGENT span for the outbound call.
 func A2ABeforeRequest(ctx agent.CallbackContext, req *a2a.SendMessageRequest) (*session.Event, error) {
-	span := trace.SpanFromContext(ctx)
-	if span != nil && span.IsRecording() && req != nil && req.Message != nil {
+	if req == nil {
+		return nil, nil
+	}
+	_, span, end := neatlogs.StartProviderSpan(ctx, "google.adk.a2a", "agent")
+	span.SetAttributes(attribute.String("neatlogs.span.kind", "agent"))
+	if req.Message != nil {
 		if text := a2aMessageText(req.Message); text != "" {
 			span.SetAttributes(
 				attribute.String("neatlogs.input.value", text),
@@ -92,6 +96,10 @@ func A2ABeforeRequest(ctx agent.CallbackContext, req *a2a.SendMessageRequest) (*
 			)
 		}
 	}
+	endEvicted(
+		activeA2ACalls.put(a2aCallKey(req), activeCall{span: span, end: end}),
+		"superseded or abandoned ADK A2A callback",
+	)
 	return nil, nil
 }
 
@@ -99,11 +107,25 @@ func A2ABeforeRequest(ctx agent.CallbackContext, req *a2a.SendMessageRequest) (*
 // sets neatlogs.output.value (read by the backend for AGENT spans — the indexed
 // output_messages form is only reconstructed for LLM spans) plus the indexed
 // form for completeness.
-func A2AAfterRequest(ctx agent.CallbackContext, _ *a2a.SendMessageRequest, resp *session.Event, _ error) (*session.Event, error) {
-	span := trace.SpanFromContext(ctx)
-	if span != nil && span.IsRecording() && resp != nil && resp.Content != nil {
+func A2AAfterRequest(ctx agent.CallbackContext, req *a2a.SendMessageRequest, resp *session.Event, callErr error) (*session.Event, error) {
+	var call activeCall
+	if req != nil {
+		call, _ = activeA2ACalls.take(a2aCallKey(req))
+	}
+	if call.span == nil {
+		_, call.span, call.end = neatlogs.StartProviderSpan(ctx, "google.adk.a2a", "agent")
+		call.span.SetAttributes(attribute.String("neatlogs.span.kind", "agent"))
+	}
+	defer call.end()
+	if callErr != nil {
+		call.span.RecordError(callErr)
+		call.span.SetStatus(codes.Error, callErr.Error())
+	} else {
+		call.span.SetStatus(codes.Ok, "")
+	}
+	if resp != nil && resp.Content != nil {
 		if text := contentText(resp.Content); text != "" {
-			span.SetAttributes(
+			call.span.SetAttributes(
 				attribute.String("neatlogs.output.value", text),
 				attribute.String(outputMsgPrefix+"0.role", "assistant"),
 				attribute.String(outputMsgPrefix+"0.content", text),
@@ -113,19 +135,33 @@ func A2AAfterRequest(ctx agent.CallbackContext, _ *a2a.SendMessageRequest, resp 
 	return nil, nil
 }
 
+func a2aCallKey(req *a2a.SendMessageRequest) string {
+	if req == nil {
+		return ""
+	}
+	if req.Message != nil && req.Message.ID != "" {
+		return fmt.Sprintf("%p:%s", req, req.Message.ID)
+	}
+	return fmt.Sprintf("%p", req)
+}
+
 // a2aMessageText joins the text parts of an A2A message.
 func a2aMessageText(msg *a2a.Message) string {
-	var text string
+	var text strings.Builder
 	for _, part := range msg.Parts {
 		if part == nil {
 			continue
 		}
 		if t := part.Text(); t != "" {
-			if text != "" {
-				text += "\n"
+			if text.Len() > 0 {
+				text.WriteByte('\n')
 			}
-			text += t
+			remaining := maxOutputBytes - text.Len()
+			if remaining <= 0 {
+				break
+			}
+			text.WriteString(boundedTextTo(t, remaining))
 		}
 	}
-	return text
+	return text.String()
 }
