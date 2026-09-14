@@ -169,3 +169,28 @@ func TestNormalize_ADKToolKeys(t *testing.T) {
 	checkStr(t, got, ToolInput, `{"city":"Tokyo"}`)
 	checkStr(t, got, ToolOutput, `{"report":"Sunny, 24C"}`)
 }
+
+func TestNormalize_MemorySpanKind(t *testing.T) {
+	in := []attribute.KeyValue{
+		attribute.String("openinference.span.kind", "MEMORY"),
+		attribute.String("memory.op", "recall"),
+	}
+	got := toMap(Default().Normalize(in))
+	checkStr(t, got, SpanKind, "memory")
+}
+
+func TestNormalize_GuardrailAttributes(t *testing.T) {
+	in := []attribute.KeyValue{
+		attribute.String("openinference.span.kind", "GUARDRAIL"),
+		attribute.Bool("guardrail.passed", true),
+		attribute.Float64("guardrail.score", 0.98),
+	}
+	got := toMap(Default().Normalize(in))
+	checkStr(t, got, SpanKind, "guardrail")
+	if v, ok := got["neatlogs.guardrail.passed"]; !ok || v.AsBool() != true {
+		t.Errorf("neatlogs.guardrail.passed = %v, want true", v)
+	}
+	if v, ok := got["neatlogs.guardrail.score"]; !ok || v.AsFloat64() != 0.98 {
+		t.Errorf("neatlogs.guardrail.score = %v, want 0.98", v)
+	}
+}
