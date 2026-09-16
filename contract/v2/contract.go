@@ -12,7 +12,7 @@ import (
 const (
 	ContractVersion = "2.0.0"
 	SchemaVersion   = 2
-	SchemaSHA256    = "50bbd9f1e6eaa6c83f08dcb84da3a98867c962fc8c4e1edd629da561fe5fe5a8"
+	SchemaSHA256    = "ae79717d127e2faa761ad83c8a51a08cae6fce00a04446d46dcc6d1a371818ce"
 )
 
 //go:embed neatlogs-telemetry.schema.json
