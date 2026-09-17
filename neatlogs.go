@@ -38,7 +38,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -519,15 +518,14 @@ func resolveUploadsEnabled(cfg Config) (bool, error) {
 	if cfg.EnableUploads {
 		return true, nil
 	}
-	raw := strings.TrimSpace(os.Getenv("NEATLOGS_UPLOADS_ENABLED"))
-	if raw == "" {
+	// Match the Python and TypeScript SDKs: true/1/yes (case-insensitive)
+	// enables uploads; anything else leaves them disabled.
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("NEATLOGS_UPLOADS_ENABLED"))) {
+	case "true", "1", "yes":
+		return true, nil
+	default:
 		return false, nil
 	}
-	enabled, err := strconv.ParseBool(raw)
-	if err != nil {
-		return false, fmt.Errorf("neatlogs: NEATLOGS_UPLOADS_ENABLED must be true or false")
-	}
-	return enabled, nil
 }
 
 func uploadsSignature(cfg Config) string {

@@ -465,20 +465,23 @@ func TestHTTPUploadAuthorityDoesNotStartAfterCancellation(t *testing.T) {
 	}
 }
 
-func TestUploadsRequireExplicitValidActivation(t *testing.T) {
-	t.Setenv("NEATLOGS_UPLOADS_ENABLED", "")
-	enabled, err := resolveUploadsEnabled(Config{})
-	if err != nil || enabled {
-		t.Fatalf("default activation = %v, %v; want false", enabled, err)
+func TestUploadsEnabledEnvParityWithOtherSDKs(t *testing.T) {
+	// Python and TypeScript treat true/1/yes (case-insensitive) as enabling
+	// uploads and every other value as disabled; Go must match so the same
+	// environment works across SDKs.
+	for _, value := range []string{"true", "TRUE", "True", "1", "yes", "YES", " yes "} {
+		t.Setenv("NEATLOGS_UPLOADS_ENABLED", value)
+		enabled, err := resolveUploadsEnabled(Config{})
+		if err != nil || !enabled {
+			t.Fatalf("NEATLOGS_UPLOADS_ENABLED=%q = %v, %v; want true", value, enabled, err)
+		}
 	}
-	t.Setenv("NEATLOGS_UPLOADS_ENABLED", "true")
-	enabled, err = resolveUploadsEnabled(Config{})
-	if err != nil || !enabled {
-		t.Fatalf("environment activation = %v, %v; want true", enabled, err)
-	}
-	t.Setenv("NEATLOGS_UPLOADS_ENABLED", "not-a-boolean")
-	if _, err := resolveUploadsEnabled(Config{}); err == nil {
-		t.Fatal("invalid upload activation unexpectedly accepted")
+	for _, value := range []string{"", "false", "0", "no", "t", "not-a-boolean", "enable"} {
+		t.Setenv("NEATLOGS_UPLOADS_ENABLED", value)
+		enabled, err := resolveUploadsEnabled(Config{})
+		if err != nil || enabled {
+			t.Fatalf("NEATLOGS_UPLOADS_ENABLED=%q = %v, %v; want false", value, enabled, err)
+		}
 	}
 }
 
