@@ -11,6 +11,10 @@ The inventory is limited to integrations documented for the Go SDK in
 propagation helpers documented under Google ADK. Unsupported provider clients
 and coding agents owned by separate repositories are intentionally excluded.
 
+These workflows analyze real published module contents, APIs, dependency
+graphs, and the relevant adapter source. They never initialize Neatlogs, call a
+live model provider, export traces, or query a Neatlogs backend.
+
 ## Pull requests
 
 The pull-request workflow is deterministic and does not receive external
