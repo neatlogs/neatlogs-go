@@ -72,3 +72,21 @@ func TestSpanLimitsDefaultRaised(t *testing.T) {
 		t.Fatalf("AttributeCountLimit = %d, want %d", got, defaultMaxSpanAttributes)
 	}
 }
+
+func TestSpanLimitsPreserveIndependentEnvironmentLimits(t *testing.T) {
+	t.Setenv("OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT", "")
+	t.Setenv("OTEL_ATTRIBUTE_COUNT_LIMIT", "")
+	t.Setenv("OTEL_SPAN_EVENT_COUNT_LIMIT", "7")
+	t.Setenv("OTEL_SPAN_LINK_COUNT_LIMIT", "8")
+	t.Setenv("OTEL_EVENT_ATTRIBUTE_COUNT_LIMIT", "9")
+	t.Setenv("OTEL_LINK_ATTRIBUTE_COUNT_LIMIT", "10")
+
+	limits := spanLimitsForCaptureEverything()
+	if limits.AttributeCountLimit != defaultMaxSpanAttributes {
+		t.Fatalf("AttributeCountLimit = %d, want %d", limits.AttributeCountLimit, defaultMaxSpanAttributes)
+	}
+	if limits.EventCountLimit != 7 || limits.LinkCountLimit != 8 ||
+		limits.AttributePerEventCountLimit != 9 || limits.AttributePerLinkCountLimit != 10 {
+		t.Fatalf("independent limits were overwritten: %#v", limits)
+	}
+}

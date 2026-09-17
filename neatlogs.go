@@ -418,13 +418,9 @@ func spanLimitsForCaptureEverything() sdktrace.SpanLimits {
 		strings.TrimSpace(os.Getenv("OTEL_ATTRIBUTE_COUNT_LIMIT")) != "" {
 		return sdktrace.NewSpanLimits()
 	}
-	return sdktrace.SpanLimits{
-		AttributeCountLimit:         defaultMaxSpanAttributes,
-		EventCountLimit:             128,
-		LinkCountLimit:              128,
-		AttributePerEventCountLimit: 128,
-		AttributePerLinkCountLimit:  128,
-	}
+	limits := sdktrace.NewSpanLimits()
+	limits.AttributeCountLimit = defaultMaxSpanAttributes
+	return limits
 }
 
 func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRuntime, *url.URL, bool, error) {
