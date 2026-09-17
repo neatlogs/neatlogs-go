@@ -1,0 +1,63 @@
+name: Discover Go integration releases
+
+on:
+  schedule:
+    - cron: "47 */12 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: compatibility-go-release-discovery
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Discover new module releases
+        id: discover
+        run: go run ./scripts/compatibility --report=compatibility-release-report.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: go-compatibility-release-report
+          path: compatibility-release-report.json
+      - name: Create or update release discovery issue
+        if: steps.discover.outputs.changes_found == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const title = '[compatibility] New Go integration releases detected';
+            const report = fs.readFileSync('compatibility-release-report.json', 'utf8');
+            const body = [
+              'The scheduled compatibility monitor found upstream module releases that have not been analyzed.',
+              '',
+              'Run the deterministic compatibility suite against the reported versions before updating `.compatibility/versions.lock.json`.',
+              '',
+              '```json',
+              report,
+              '```',
+            ].join('\n');
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner,
+              repo,
+              state: 'open',
+              creator: 'github-actions[bot]',
+              per_page: 100,
+            });
+            const existing = issues.find((issue) => issue.title === title);
+            if (existing) {
+              await github.rest.issues.update({ owner, repo, issue_number: existing.number, body });
+            } else {
+              await github.rest.issues.create({ owner, repo, title, body });
+            }

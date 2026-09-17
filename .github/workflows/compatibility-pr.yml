@@ -1,0 +1,32 @@
+name: Compatibility configuration
+
+on:
+  pull_request:
+    paths:
+      - ".compatibility/**"
+      - "scripts/compatibility/**"
+      - ".github/workflows/compatibility-*.yml"
+      - "go.mod"
+      - "go.sum"
+      - "go.work"
+      - "go.work.sum"
+      - "contrib/**/go.mod"
+      - "contrib/**/go.sum"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Validate compatibility inventory
+        run: go run ./scripts/compatibility --validate-only
+      - name: Test compatibility tooling
+        run: go test ./scripts/compatibility
+

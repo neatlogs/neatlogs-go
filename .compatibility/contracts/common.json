@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "required": {
+    "trace": ["trace_id", "span_id", "name", "kind", "start_time", "end_time", "status"],
+    "identity": ["service.name", "telemetry.sdk.language"],
+    "errors": ["error.type", "error.message"]
+  },
+  "invariants": [
+    "successful calls emit one completed root span",
+    "failed calls retain the original error and emit error attributes",
+    "disabled instrumentation does not mutate application behavior",
+    "attributes use stable semantic names rather than provider-specific display labels"
+  ]
+}

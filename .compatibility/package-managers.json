@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "ecosystem": "go",
+  "required": [
+    {"id": "module", "command": "go test ./...", "mode": "go.mod and go.sum"},
+    {"id": "workspace", "command": "go test ./...", "mode": "go.work with multiple modules"},
+    {"id": "vendor", "command": "go test -mod=vendor ./...", "mode": "vendored dependencies"},
+    {"id": "readonly", "command": "go test -mod=readonly ./...", "mode": "immutable module files"}
+  ],
+  "advisory": [
+    {"id": "direct-vcs", "command": "GOPROXY=direct go test ./...", "mode": "VCS fallback"}
+  ]
+}
