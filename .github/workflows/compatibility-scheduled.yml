@@ -25,10 +25,22 @@ jobs:
       - name: Discover new module releases
         id: discover
         run: go run ./scripts/compatibility --report=compatibility-release-report.json
+      - name: Build deterministic upstream evidence
+        if: steps.discover.outputs.changes_found == 'true'
+        run: go run ./scripts/compatibility/analyze
+      - name: Run advisory Gemini impact analysis
+        if: steps.discover.outputs.changes_found == 'true'
+        env:
+          COMPAT_GEMINI_API_KEY: ${{ secrets.COMPAT_GEMINI_API_KEY }}
+          COMPAT_GEMINI_MODEL: ${{ vars.COMPAT_GEMINI_MODEL || 'gemini-2.5-flash' }}
+        run: go run ./scripts/compatibility/analyze --llm-only
       - uses: actions/upload-artifact@v4
         with:
           name: go-compatibility-release-report
-          path: compatibility-release-report.json
+          path: |
+            compatibility-release-report.json
+            compatibility-evidence.json
+            compatibility-llm-analysis.json
       - name: Create or update release discovery issue
         if: steps.discover.outputs.changes_found == 'true'
         uses: actions/github-script@v7
@@ -39,6 +51,7 @@ jobs:
             const repo = context.repo.repo;
             const title = '[compatibility] New Go integration releases detected';
             const report = fs.readFileSync('compatibility-release-report.json', 'utf8');
+            const analysis = fs.readFileSync('compatibility-llm-analysis.json', 'utf8');
             const body = [
               'The scheduled compatibility monitor found upstream module releases that have not been analyzed.',
               '',
@@ -46,6 +59,12 @@ jobs:
               '',
               '```json',
               report,
+              '```',
+              '',
+              '### Advisory impact analysis',
+              '',
+              '```json',
+              analysis,
               '```',
             ].join('\n');
             const { data: issues } = await github.rest.issues.listForRepo({
@@ -61,3 +80,11 @@ jobs:
             } else {
               await github.rest.issues.create({ owner, repo, title, body });
             }
+      - name: Notify Slack of releases or workflow failure
+        if: always()
+        continue-on-error: true
+        env:
+          COMPAT_SLACK_WEBHOOK_URL: ${{ secrets.COMPAT_SLACK_WEBHOOK_URL }}
+          COMPAT_JOB_STATUS: ${{ job.status }}
+          COMPAT_CHANGES_FOUND: ${{ steps.discover.outputs.changes_found }}
+        run: go run ./scripts/compatibility/notify

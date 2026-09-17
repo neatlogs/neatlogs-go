@@ -28,5 +28,19 @@ jobs:
       - name: Validate compatibility inventory
         run: go run ./scripts/compatibility --validate-only
       - name: Test compatibility tooling
-        run: go test ./scripts/compatibility
-
+        run: go test ./scripts/compatibility/...
+  consumer-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [module, workspace, vendor, readonly]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify installed module consumer
+        run: bash scripts/compatibility/verify-consumer.sh ${{ matrix.mode }}
