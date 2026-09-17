@@ -131,10 +131,11 @@ type moduleEvidence struct {
 }
 
 type evidenceReport struct {
-	SchemaVersion int              `json:"schemaVersion"`
-	Ecosystem     string           `json:"ecosystem"`
-	GeneratedAt   string           `json:"generatedAt"`
-	Modules       []moduleEvidence `json:"modules"`
+	SchemaVersion  int              `json:"schemaVersion"`
+	Ecosystem      string           `json:"ecosystem"`
+	GeneratedAt    string           `json:"generatedAt"`
+	Modules        []moduleEvidence `json:"modules"`
+	UpstreamIssues []map[string]any `json:"upstreamIssues,omitempty"`
 }
 
 func readJSON(path string, value any) error {

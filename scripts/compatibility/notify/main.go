@@ -24,6 +24,11 @@ type analysisReport struct {
 	RiskLevel string `json:"riskLevel"`
 }
 
+type upstreamIssue struct {
+	Title string `json:"title"`
+	URL   string `json:"url"`
+}
+
 func optionalJSON(path string, value any) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -42,7 +47,7 @@ func workflowURL() string {
 	return server + "/" + repository + "/actions/runs/" + runID
 }
 
-func slackMessage(status string, report releaseReport, analysis analysisReport, runURL string) string {
+func slackMessage(status string, report releaseReport, analysis analysisReport, issue upstreamIssue, runURL string) string {
 	link := ""
 	if runURL != "" {
 		link = fmt.Sprintf(" <%s|Open workflow run>.", runURL)
@@ -70,7 +75,15 @@ func slackMessage(status string, report releaseReport, analysis analysisReport, 
 	if analysis.RiskLevel != "" {
 		risk = fmt.Sprintf(" Advisory risk: *%s*.", analysis.RiskLevel)
 	}
-	return fmt.Sprintf(":warning: *Go SDK compatibility review required:* %d upstream release(s). %s%s.%s%s", len(report.Changes), strings.Join(items, ", "), remaining, risk, link)
+	issueText := ""
+	if issue.URL != "" {
+		title := issue.Title
+		if title == "" {
+			title = issue.URL
+		}
+		issueText = fmt.Sprintf(" Reproduced upstream issue: <%s|%s>.", issue.URL, title)
+	}
+	return fmt.Sprintf(":warning: *Go SDK compatibility review required:* %d upstream release(s). %s%s.%s%s%s", len(report.Changes), strings.Join(items, ", "), remaining, risk, issueText, link)
 }
 
 func main() {
@@ -85,9 +98,15 @@ func main() {
 	}
 	var report releaseReport
 	var analysis analysisReport
+	var issue upstreamIssue
 	optionalJSON("compatibility-release-report.json", &report)
 	optionalJSON("compatibility-llm-analysis.json", &analysis)
-	payload, err := json.Marshal(map[string]string{"text": slackMessage(status, report, analysis, workflowURL())})
+	issuePath := os.Getenv("COMPAT_UPSTREAM_ISSUE_FILE")
+	if issuePath == "" {
+		issuePath = "compatibility-upstream-issue.json"
+	}
+	optionalJSON(issuePath, &issue)
+	payload, err := json.Marshal(map[string]string{"text": slackMessage(status, report, analysis, issue, workflowURL())})
 	if err != nil {
 		panic(err)
 	}
