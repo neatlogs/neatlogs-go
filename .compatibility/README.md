@@ -4,6 +4,13 @@ This directory defines the integrations, package-manager matrix, supported
 versions, and cross-integration contracts exercised by the compatibility
 workflows.
 
+## Scope source of truth
+
+The inventory is limited to integrations documented for the Go SDK in
+`neatlogs-docs`: explicit core helpers, Google GenAI, Google ADK, and the A2A
+propagation helpers documented under Google ADK. Unsupported provider clients
+and coding agents owned by separate repositories are intentionally excluded.
+
 ## Pull requests
 
 The pull-request workflow is deterministic and does not receive external

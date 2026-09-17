@@ -29,13 +29,6 @@
       "packages": ["github.com/a2aproject/a2a-go/v2"],
       "releaseMonitoring": true,
       "contracts": ["common", "agent", "tools"]
-    },
-    {
-      "id": "unsupported-provider-negative",
-      "displayName": "Unsupported OpenAI and Anthropic clients",
-      "packages": [],
-      "releaseMonitoring": false,
-      "contracts": ["negative"]
     }
   ]
 }
