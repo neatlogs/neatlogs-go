@@ -16,6 +16,7 @@ import (
 type integration struct {
 	ID                string   `json:"id"`
 	Packages          []string `json:"packages"`
+	DocumentationURLs []string `json:"documentationUrls"`
 	ReleaseMonitoring bool     `json:"releaseMonitoring"`
 }
 
@@ -72,6 +73,9 @@ func validateConfig(config integrationsFile) error {
 		seen[item.ID] = true
 		if item.ReleaseMonitoring && len(item.Packages) == 0 {
 			return fmt.Errorf("monitored integration %q has no modules", item.ID)
+		}
+		if len(item.DocumentationURLs) == 0 {
+			return fmt.Errorf("integration %q has no documentation URLs", item.ID)
 		}
 	}
 	return nil

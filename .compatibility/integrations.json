@@ -6,6 +6,7 @@
       "id": "core",
       "displayName": "Neatlogs core telemetry",
       "packages": [],
+      "documentationUrls": ["https://docs.neatlogs.com/"],
       "releaseMonitoring": false,
       "contracts": ["common"]
     },
@@ -13,6 +14,7 @@
       "id": "google-genai",
       "displayName": "Google Gen AI SDK",
       "packages": ["google.golang.org/genai"],
+      "documentationUrls": ["https://ai.google.dev/gemini-api/docs"],
       "releaseMonitoring": true,
       "contracts": ["common", "llm", "streaming", "tools"]
     },
@@ -20,6 +22,7 @@
       "id": "google-adk",
       "displayName": "Google Agent Development Kit",
       "packages": ["google.golang.org/adk", "google.golang.org/genai"],
+      "documentationUrls": ["https://google.github.io/adk-docs/"],
       "releaseMonitoring": true,
       "contracts": ["common", "agent", "llm", "tools"]
     },
@@ -27,6 +30,7 @@
       "id": "a2a",
       "displayName": "A2A Go SDK",
       "packages": ["github.com/a2aproject/a2a-go/v2"],
+      "documentationUrls": ["https://a2a-protocol.org/latest/"],
       "releaseMonitoring": true,
       "contracts": ["common", "agent", "tools"]
     }

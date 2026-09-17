@@ -11,8 +11,10 @@ The inventory is limited to integrations documented for the Go SDK in
 propagation helpers documented under Google ADK. Unsupported provider clients
 and coding agents owned by separate repositories are intentionally excluded.
 
-These workflows analyze real published module contents, APIs, dependency
-graphs, and the relevant adapter source. They never initialize Neatlogs, call a
+These workflows analyze real published module contents, exported APIs,
+dependency graphs, changed source excerpts, the relevant adapter source, and
+the official project documentation URLs declared for every integration.
+Documentation fetch failures are retained as evidence gaps. They never initialize Neatlogs, call a
 live model provider, export traces, or query a Neatlogs backend.
 
 ## Pull requests
@@ -26,8 +28,8 @@ verifies module, workspace, vendor, and read-only module-resolution modes.
 Twice a day, the scheduled workflow:
 
 1. compares the analyzed version lock with the Go module proxy;
-2. records module metadata, dependency, and archive-manifest changes as
-   deterministic evidence;
+2. records dependency, exported API, source-content, adapter-source, and
+   official project-documentation evidence;
 3. optionally asks Gemini for an advisory impact assessment;
 4. updates a GitHub issue and optionally alerts Slack when review is needed.
 
