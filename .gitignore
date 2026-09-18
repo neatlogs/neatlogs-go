@@ -32,3 +32,6 @@ spans_optimized.log
 .DS_Store
 .idea/
 .vscode/
+compatibility-release-report.json
+compatibility-evidence.json
+compatibility-llm-analysis.json

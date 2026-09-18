@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "requiredChecks": [
+    "published-module-resolves",
+    "sdk-modules-build-with-version",
+    "referenced-packages-exist",
+    "referenced-exported-symbols-remain-compatible",
+    "go-mod-constraints-resolve",
+    "adapter-method-signatures-remain-compatible",
+    "supported-module-lines-compile"
+  ],
+  "prohibitedChecks": [
+    "live-model-call",
+    "trace-export",
+    "backend-readback"
+  ]
+}

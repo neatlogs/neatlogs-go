@@ -1,0 +1,121 @@
+name: Discover Go integration releases
+
+on:
+  schedule:
+    - cron: "47 */12 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_issue_url:
+        description: "Optional public GitHub issue to exercise the full issue-evidence alert path"
+        required: false
+        type: string
+      upstream_issue_package:
+        description: "Module to isolate when exercising an upstream issue"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: compatibility-go-release-discovery
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Discover new module releases
+        id: discover
+        run: go run ./scripts/compatibility --report=compatibility-release-report.json
+      - name: Capture upstream issue evidence
+        if: inputs.upstream_issue_url != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_ISSUE_URL: ${{ inputs.upstream_issue_url }}
+        run: gh issue view "$UPSTREAM_ISSUE_URL" --json number,title,state,url,body,labels > compatibility-upstream-issue.json
+      - name: Isolate the issue module
+        if: inputs.upstream_issue_package != ''
+        env:
+          UPSTREAM_ISSUE_PACKAGE: ${{ inputs.upstream_issue_package }}
+        run: |
+          jq --arg package "$UPSTREAM_ISSUE_PACKAGE" '.changes = [.changes[] | select(.module == $package)]' compatibility-release-report.json > compatibility-release-report.tmp.json
+          mv compatibility-release-report.tmp.json compatibility-release-report.json
+          jq -e '.changes | length == 1' compatibility-release-report.json
+      - name: Build deterministic upstream evidence
+        if: steps.discover.outputs.changes_found == 'true'
+        run: go run ./scripts/compatibility/analyze
+      - name: Attach upstream issue evidence
+        if: steps.discover.outputs.changes_found == 'true' && inputs.upstream_issue_url != ''
+        run: |
+          jq --slurpfile issue compatibility-upstream-issue.json '.upstreamIssues = $issue' compatibility-evidence.json > compatibility-evidence.tmp.json
+          mv compatibility-evidence.tmp.json compatibility-evidence.json
+      - name: Run advisory Gemini impact analysis
+        if: steps.discover.outputs.changes_found == 'true'
+        env:
+          COMPAT_GEMINI_API_KEY: ${{ secrets.COMPAT_GEMINI_API_KEY }}
+          COMPAT_GEMINI_MODEL: ${{ vars.COMPAT_GEMINI_MODEL || 'gemini-2.5-flash' }}
+        run: go run ./scripts/compatibility/analyze --llm-only
+      - uses: actions/upload-artifact@v4
+        with:
+          name: go-compatibility-release-report
+          path: |
+            compatibility-release-report.json
+            compatibility-evidence.json
+            compatibility-llm-analysis.json
+            compatibility-upstream-issue.json
+          if-no-files-found: ignore
+      - name: Create or update release discovery issue
+        if: steps.discover.outputs.changes_found == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const title = '[compatibility] New Go integration releases detected';
+            const report = fs.readFileSync('compatibility-release-report.json', 'utf8');
+            const analysis = fs.readFileSync('compatibility-llm-analysis.json', 'utf8');
+            const body = [
+              'The scheduled compatibility monitor found upstream module releases that have not been analyzed.',
+              '',
+              'Run the deterministic compatibility suite against the reported versions before updating `.compatibility/versions.lock.json`.',
+              '',
+              '```json',
+              report,
+              '```',
+              '',
+              '### Advisory impact analysis',
+              '',
+              '```json',
+              analysis,
+              '```',
+            ].join('\n');
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner,
+              repo,
+              state: 'open',
+              creator: 'github-actions[bot]',
+              per_page: 100,
+            });
+            const existing = issues.find((issue) => issue.title === title);
+            if (existing) {
+              await github.rest.issues.update({ owner, repo, issue_number: existing.number, body });
+            } else {
+              await github.rest.issues.create({ owner, repo, title, body });
+            }
+      - name: Notify Slack of releases or workflow failure
+        if: always()
+        continue-on-error: true
+        env:
+          COMPAT_SLACK_WEBHOOK_URL: ${{ secrets.COMPAT_SLACK_WEBHOOK_URL }}
+          COMPAT_JOB_STATUS: ${{ job.status }}
+          COMPAT_CHANGES_FOUND: ${{ steps.discover.outputs.changes_found }}
+          COMPAT_UPSTREAM_ISSUE_FILE: compatibility-upstream-issue.json
+        run: go run ./scripts/compatibility/notify
