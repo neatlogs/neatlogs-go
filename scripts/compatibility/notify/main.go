@@ -81,7 +81,7 @@ func slackMessage(status string, report releaseReport, analysis analysisReport, 
 		if title == "" {
 			title = issue.URL
 		}
-		issueText = fmt.Sprintf(" Reproduced upstream issue: <%s|%s>.", issue.URL, title)
+		issueText = fmt.Sprintf(" Referenced upstream issue: <%s|%s>.", issue.URL, title)
 	}
 	return fmt.Sprintf(":warning: *Go SDK compatibility review required:* %d upstream release(s). %s%s.%s%s%s", len(report.Changes), strings.Join(items, ", "), remaining, risk, issueText, link)
 }
