@@ -331,3 +331,15 @@ func assertIntAttribute(t *testing.T, attributes []attribute.KeyValue, key strin
 	}
 	t.Fatalf("attribute %q not found", key)
 }
+
+func TestToolCallArgumentsJSONNormalizesNilToEmptyObject(t *testing.T) {
+	if got := toolCallArgumentsJSON(nil); got != `{}` {
+		t.Fatalf("toolCallArgumentsJSON(nil) = %s, want {}", got)
+	}
+	if got := toolCallArgumentsJSON(map[string]any{}); got != `{}` {
+		t.Fatalf("toolCallArgumentsJSON(empty) = %s, want {}", got)
+	}
+	if got := toolCallArgumentsJSON(map[string]any{"city": "Paris"}); got != `{"city":"Paris"}` {
+		t.Fatalf("toolCallArgumentsJSON(populated) = %s", got)
+	}
+}
