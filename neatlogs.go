@@ -62,6 +62,9 @@ const (
 	defaultMaxQueueSize       = 2048
 	defaultMaxExportBatchSize = 100
 	defaultBatchTimeout       = 5 * time.Second
+	// defaultMaxQueueBytes caps the estimated attribute bytes held by spans
+	// waiting for export. See deliveryQueue.
+	defaultMaxQueueBytes int64 = 128 << 20
 )
 
 // tracerName is the instrumentation scope used by this SDK's own wrappers.
