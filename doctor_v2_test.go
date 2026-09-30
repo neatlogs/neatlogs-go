@@ -487,6 +487,44 @@ func TestDoctorProbeRejectsWrongMaterializedInputOutput(t *testing.T) {
 	t.Fatal("probe_input_output check missing")
 }
 
+func TestDoctorProbeDiagnosesAgentInputWithoutExposingReadback(t *testing.T) {
+	root := "2222222222222222"
+	for _, tc := range []struct {
+		name, value, kind            string
+		plain, contains, matchesRoot bool
+	}{
+		{"plain prompt", "generated diagnostic input", "string", true, true, true},
+		{"enriched content", "private payload: generated diagnostic input", "string", false, true, false},
+		{"unrelated content", "private payload", "string", false, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			local := newDoctorV2Result("local")
+			local.Capture = &DoctorV2Capture{TraceID: "11111111111111111111111111111111", RootSpanID: &root, SpanCount: 4, SemanticDigest: "sha256:" + strings.Repeat("a", 64)}
+			fixture := doctorV3MaterializedTraceFixture()
+			fixture["spans"].([]any)[1].(map[string]any)["data"].(map[string]any)["input_value"] = tc.value
+			result := persistedDoctorProbeResult(local, fixture)
+			if result.Status != DoctorFail || result.FirstFailure == nil || *result.FirstFailure != "INPUT_OUTPUT_VALID_FAILED" {
+				t.Fatalf("unexpected result: %#v", result)
+			}
+			for _, check := range result.Checks {
+				if check.Name != "probe_input_output" {
+					continue
+				}
+				if check.Details["agent_input_kind"] != tc.kind || check.Details["agent_input_matches_plain_prompt"] != tc.plain ||
+					check.Details["agent_input_contains_fixed_prompt"] != tc.contains || check.Details["agent_input_matches_root"] != tc.matchesRoot {
+					t.Fatalf("unexpected diagnostic: %#v", check.Details)
+				}
+				encoded, err := json.Marshal(result)
+				if err != nil || strings.Contains(string(encoded), tc.value) {
+					t.Fatalf("Doctor result exposed readback payload: %s, %v", encoded, err)
+				}
+				return
+			}
+			t.Fatal("probe_input_output check missing")
+		})
+	}
+}
+
 func TestDoctorProbeReportsTerminalCorrelationRootsAndDuplicates(t *testing.T) {
 	root := "2222222222222222"
 	local := newDoctorV2Result("local")
