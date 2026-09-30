@@ -49,6 +49,7 @@ jobs:
           mv compatibility-release-report.tmp.json compatibility-release-report.json
           jq -e '.changes | length == 1' compatibility-release-report.json
       - name: Build deterministic upstream evidence
+        id: evidence
         if: steps.discover.outputs.changes_found == 'true'
         run: go run ./scripts/compatibility/analyze
       - name: Attach upstream issue evidence
@@ -57,6 +58,7 @@ jobs:
           jq --slurpfile issue compatibility-upstream-issue.json '.upstreamIssues = $issue' compatibility-evidence.json > compatibility-evidence.tmp.json
           mv compatibility-evidence.tmp.json compatibility-evidence.json
       - name: Run advisory Gemini impact analysis
+        id: gemini
         if: steps.discover.outputs.changes_found == 'true'
         env:
           COMPAT_GEMINI_API_KEY: ${{ secrets.COMPAT_GEMINI_API_KEY }}
@@ -72,6 +74,7 @@ jobs:
             compatibility-upstream-issue.json
           if-no-files-found: ignore
       - name: Create or update release discovery issue
+        id: review_issue
         if: steps.discover.outputs.changes_found == 'true'
         uses: actions/github-script@v7
         with:
@@ -82,16 +85,27 @@ jobs:
             const title = '[compatibility] New Go integration releases detected';
             const report = fs.readFileSync('compatibility-release-report.json', 'utf8');
             const analysis = fs.readFileSync('compatibility-llm-analysis.json', 'utf8');
+            const evidence = JSON.parse(fs.readFileSync('compatibility-evidence.json', 'utf8'));
+            const runURL = `${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const toolchainFindings = evidence.modules
+              .filter((item) => item.toolchainRequirement)
+              .map((item) => `- ${item.module} ${item.latestVersion}: ${item.toolchainRequirement}`);
             const body = [
-              'The scheduled compatibility monitor found upstream module releases that have not been analyzed.',
+              'The scheduled monitor found upstream module releases newer than the analyzed version lock. This is a review request, not a confirmed SDK regression.',
               '',
-              'Run the deterministic compatibility suite against the reported versions before updating `.compatibility/versions.lock.json`.',
+              `Evidence and workflow logs: ${runURL}`,
               '',
+              'The workflow compares published module contents, APIs, and documentation, then asks Gemini for an advisory assessment. It does not run the SDK against these newer versions or create a fix PR. Verify any reported impact with deterministic tests before updating `.compatibility/versions.lock.json`.',
+              '',
+              '### Go toolchain compatibility evidence',
+              ...(toolchainFindings.length ? toolchainFindings : ['No newer-Go requirement detected by the module download step.']),
+              '',
+              '### Releases',
               '```json',
               report,
               '```',
               '',
-              '### Advisory impact analysis',
+              '### Gemini advisory impact analysis (unverified)',
               '',
               '```json',
               analysis,
@@ -106,9 +120,11 @@ jobs:
             });
             const existing = issues.find((issue) => issue.title === title);
             if (existing) {
-              await github.rest.issues.update({ owner, repo, issue_number: existing.number, body });
+              const { data: updated } = await github.rest.issues.update({ owner, repo, issue_number: existing.number, body });
+              core.setOutput('issue_url', updated.html_url);
             } else {
-              await github.rest.issues.create({ owner, repo, title, body });
+              const { data: created } = await github.rest.issues.create({ owner, repo, title, body });
+              core.setOutput('issue_url', created.html_url);
             }
       - name: Notify Slack of releases or workflow failure
         if: always()
@@ -117,5 +133,10 @@ jobs:
           COMPAT_SLACK_WEBHOOK_URL: ${{ secrets.COMPAT_SLACK_WEBHOOK_URL }}
           COMPAT_JOB_STATUS: ${{ job.status }}
           COMPAT_CHANGES_FOUND: ${{ steps.discover.outputs.changes_found }}
+          COMPAT_DISCOVER_OUTCOME: ${{ steps.discover.outcome }}
+          COMPAT_EVIDENCE_OUTCOME: ${{ steps.evidence.outcome }}
+          COMPAT_GEMINI_OUTCOME: ${{ steps.gemini.outcome }}
+          COMPAT_ISSUE_OUTCOME: ${{ steps.review_issue.outcome }}
+          COMPAT_REVIEW_ISSUE_URL: ${{ steps.review_issue.outputs.issue_url }}
           COMPAT_UPSTREAM_ISSUE_FILE: compatibility-upstream-issue.json
         run: go run ./scripts/compatibility/notify

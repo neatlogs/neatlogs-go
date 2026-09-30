@@ -25,16 +25,23 @@ verifies module, workspace, vendor, and read-only module-resolution modes.
 
 ## Scheduled release monitoring
 
-Twice a day, the scheduled workflow:
+Twice a day (at 00:47 and 12:47 UTC), the scheduled workflow:
 
 1. compares the analyzed version lock with the Go module proxy;
 2. records dependency, exported API, source-content, adapter-source, and
    official project-documentation evidence;
 3. optionally asks Gemini for an advisory impact assessment;
-4. updates a GitHub issue and optionally alerts Slack when review is needed.
+4. updates a GitHub review issue and optionally alerts Slack when a release is
+   newer than the analyzed version lock. The same releases can trigger another
+   alert on later runs until the lock is updated after review.
 
-The Gemini assessment is advisory only. It cannot change a compatibility
-verdict or make a workflow pass.
+The alert means that review is needed, not that an SDK regression was found.
+The workflow does not run the SDK against the new upstream versions or create a
+fix pull request. A newer upstream Go requirement is recorded as deterministic
+toolchain evidence even when it exceeds the CI runner's Go version. The review
+issue links the workflow's evidence artifacts and Gemini analysis. The Gemini
+assessment is advisory and unverified; verify any suspected breakage with
+deterministic tests before updating the lock.
 
 Configure these GitHub Actions settings:
 
@@ -49,4 +56,6 @@ Configure these GitHub Actions settings:
 Organization-level secrets scoped only to the SDK repositories are preferred.
 The credentials are used only by the scheduled/default-branch workflow and are
 never passed to pull-request jobs. Slack failures are non-blocking; alerts are
-sent only for newly discovered releases or workflow failures.
+sent for releases newer than the analyzed lock or for workflow failures.
+Gemini failures are recorded as an unavailable advisory and do not prevent
+deterministic evidence or the review issue.

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -22,6 +23,14 @@ type releaseReport struct {
 
 type analysisReport struct {
 	RiskLevel string `json:"riskLevel"`
+	Skipped   bool   `json:"skipped"`
+}
+
+type evidenceReport struct {
+	Modules []struct {
+		Module               string `json:"module"`
+		ToolchainRequirement string `json:"toolchainRequirement"`
+	} `json:"modules"`
 }
 
 type upstreamIssue struct {
@@ -47,13 +56,29 @@ func workflowURL() string {
 	return server + "/" + repository + "/actions/runs/" + runID
 }
 
-func slackMessage(status string, report releaseReport, analysis analysisReport, issue upstreamIssue, runURL string) string {
+var requiredGoPattern = regexp.MustCompile(`requires go >= ([0-9]+(?:\.[0-9]+){1,2})`)
+
+func failedStage() string {
+	for _, step := range []struct{ env, label string }{
+		{"COMPAT_DISCOVER_OUTCOME", "release discovery"},
+		{"COMPAT_EVIDENCE_OUTCOME", "deterministic evidence collection"},
+		{"COMPAT_GEMINI_OUTCOME", "Gemini advisory analysis"},
+		{"COMPAT_ISSUE_OUTCOME", "review issue update"},
+	} {
+		if os.Getenv(step.env) == "failure" {
+			return step.label
+		}
+	}
+	return "an unknown step"
+}
+
+func slackMessage(status string, report releaseReport, evidence evidenceReport, analysis analysisReport, issue upstreamIssue, reviewIssueURL, runURL, failureStage string) string {
 	link := ""
 	if runURL != "" {
-		link = fmt.Sprintf(" <%s|Open workflow run>.", runURL)
+		link = fmt.Sprintf(" <%s|Evidence and workflow run>.", runURL)
 	}
 	if status != "success" {
-		return ":red_circle: *Go SDK compatibility workflow failed.*" + link
+		return fmt.Sprintf(":red_circle: *Go SDK compatibility monitor failed during %s.* No regression verdict is available; inspect the workflow logs for the error.%s", failureStage, link)
 	}
 	items := make([]string, 0)
 	limit := len(report.Changes)
@@ -73,7 +98,15 @@ func slackMessage(status string, report releaseReport, analysis analysisReport, 
 	}
 	risk := ""
 	if analysis.RiskLevel != "" {
-		risk = fmt.Sprintf(" Advisory risk: *%s*.", analysis.RiskLevel)
+		risk = fmt.Sprintf(" Gemini advisory risk: *%s* (unverified).", analysis.RiskLevel)
+	} else if analysis.Skipped {
+		risk = " Gemini analysis unavailable; deterministic evidence only."
+	}
+	toolchain := ""
+	for _, item := range evidence.Modules {
+		if match := requiredGoPattern.FindStringSubmatch(item.ToolchainRequirement); len(match) == 2 {
+			toolchain += fmt.Sprintf(" %s requires Go ≥%s; the current SDK CI toolchain cannot use it.", item.Module, match[1])
+		}
 	}
 	issueText := ""
 	if issue.URL != "" {
@@ -83,7 +116,11 @@ func slackMessage(status string, report releaseReport, analysis analysisReport, 
 		}
 		issueText = fmt.Sprintf(" Referenced upstream issue: <%s|%s>.", issue.URL, title)
 	}
-	return fmt.Sprintf(":warning: *Go SDK compatibility review required:* %d upstream release(s). %s%s.%s%s%s", len(report.Changes), strings.Join(items, ", "), remaining, risk, issueText, link)
+	reviewIssue := ""
+	if reviewIssueURL != "" {
+		reviewIssue = fmt.Sprintf(" <%s|Review issue>.", reviewIssueURL)
+	}
+	return fmt.Sprintf(":warning: *Go SDK release review needed (potential impact, no confirmed regression):* %d upstream release(s) newer than the analyzed lock. %s%s.%s%s%s%s%s", len(report.Changes), strings.Join(items, ", "), remaining, toolchain, risk, issueText, reviewIssue, link)
 }
 
 func main() {
@@ -97,16 +134,18 @@ func main() {
 		return
 	}
 	var report releaseReport
+	var evidence evidenceReport
 	var analysis analysisReport
 	var issue upstreamIssue
 	optionalJSON("compatibility-release-report.json", &report)
+	optionalJSON("compatibility-evidence.json", &evidence)
 	optionalJSON("compatibility-llm-analysis.json", &analysis)
 	issuePath := os.Getenv("COMPAT_UPSTREAM_ISSUE_FILE")
 	if issuePath == "" {
 		issuePath = "compatibility-upstream-issue.json"
 	}
 	optionalJSON(issuePath, &issue)
-	payload, err := json.Marshal(map[string]string{"text": slackMessage(status, report, analysis, issue, workflowURL())})
+	payload, err := json.Marshal(map[string]string{"text": slackMessage(status, report, evidence, analysis, issue, os.Getenv("COMPAT_REVIEW_ISSUE_URL"), workflowURL(), failedStage())})
 	if err != nil {
 		panic(err)
 	}
