@@ -788,7 +788,7 @@ func analyzeWithGemini(evidence evidenceReport, verification, covered json.RawMe
 		"The evidence contains actual go.mod dependency changes, exported Go API changes, changed source excerpts, and the current Neatlogs adapter source.",
 		"A toolchainRequirement means the new module needs a newer Go version than the SDK's CI runner; report this as a concrete minimum-Go compatibility concern, not as proof of an SDK regression.",
 		"The verification JSON contains actual baseline and new-version adapter test results. Passing tests cover only those tests and can miss behavioral regressions. A blocked test is not a confirmed SDK regression.",
-		"The covered-release JSON lists upstream module versions already represented by an automated draft PR. Do not propose another fix for a covered release. The workflow rotates uncovered modules across runs. At most one fix can be proposed per run; put other actionable findings in findings[] for later review.",
+		"The covered-release JSON lists upstream module versions already represented by an automated fix PR. Do not propose another fix for a covered release. The workflow rotates uncovered modules across runs. At most one fix can be proposed per run; put other actionable findings in findings[] for later review.",
 		"Identify concrete compatibility risks by relating upstream API/content changes to the adapter implementation. If a specific SDK behavior needs fixing, propose one small source-code fix for human review, even if existing tests pass. A high risk score alone is not a reason to propose a fix.",
 		"Return JSON with keys summary, riskLevel (low|medium|high), findings[], recommendedTests[], decision (propose_fix|review_only), targetModule, targetVersion, evidenceReference, evidenceRationale, proposedChanges[].",
 		"Use decision propose_fix only with an actionable fix. evidenceReference must be an actual changed upstream source path or current adapter source path in the evidence. proposedChanges entries contain path, oldText, newText. oldText must be an exact unique excerpt from the current adapter source. The only editable source paths are contrib/adk/a2a.go, contrib/adk/adk.go, contrib/adk/run.go, contrib/adk/tools.go, and contrib/genai/genai.go. Do not propose edits to tests, docs, workflows, generated files, or package manifests. Otherwise return review_only with empty proposedChanges.",
@@ -868,7 +868,7 @@ func main() {
 	evidencePath := flag.String("evidence", "compatibility-evidence.json", "evidence report path")
 	llmPath := flag.String("llm-output", "compatibility-llm-analysis.json", "LLM report path")
 	verificationPath := flag.String("verification", "compatibility-verification.json", "deterministic adapter test report path")
-	coveredPath := flag.String("covered", "compatibility-covered.json", "open automated draft PR coverage path")
+	coveredPath := flag.String("covered", "compatibility-covered.json", "automated fix PR coverage path")
 	llmOnly := flag.Bool("llm-only", false, "analyze an existing evidence report")
 	flag.Parse()
 

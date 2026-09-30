@@ -135,7 +135,7 @@ func validateCandidate(candidate analysis, releases releaseReport, evidence evid
 	for _, prior := range covered {
 		if prior.Module == candidate.TargetModule && prior.Latest == candidate.TargetVersion {
 			result.Status = "skipped"
-			result.Reason = "An open automated draft PR already covers this module release: " + prior.URL
+			result.Reason = "An automated fix PR already covers this module release: " + prior.URL
 			return result, nil, nil
 		}
 	}
@@ -265,7 +265,7 @@ func main() {
 	beforePath := flag.String("verification", "compatibility-verification.json", "original adapter test report path")
 	afterPath := flag.String("retest", "compatibility-proposal-verification.json", "post-patch adapter test report path")
 	outputPath := flag.String("output", "compatibility-proposal.json", "proposal status path")
-	coveredPath := flag.String("covered", "compatibility-covered.json", "open automated draft PR coverage path")
+	coveredPath := flag.String("covered", "compatibility-covered.json", "automated fix PR coverage path")
 	checkTests := flag.Bool("check-tests", false, "validate post-patch adapter tests")
 	flag.Parse()
 	if *checkTests {

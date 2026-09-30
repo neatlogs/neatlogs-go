@@ -53,6 +53,20 @@ type upstreamIssue struct {
 	URL   string `json:"url"`
 }
 
+type alertContext struct {
+	ReviewIssueURL      string
+	FixPRURL            string
+	FixPROutcome        string
+	PublishCheckOutcome string
+	PatchJobStatus      string
+	ProposalOutcome     string
+	RetestOutcome       string
+	IssueOutcome        string
+	FixIssueOutcome     string
+	RunURL              string
+	FailureStage        string
+}
+
 func optionalJSON(path string, value any) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -100,17 +114,21 @@ func conciseSlackText(value string) string {
 	return value
 }
 
-func slackMessage(status string, report releaseReport, evidence evidenceReport, verification verificationReport, analysis analysisReport, proposal proposalReport, issue upstreamIssue, reviewIssueURL, draftPRURL, draftPROutcome, runURL, failureStage string) string {
+func slackMessage(status string, report releaseReport, evidence evidenceReport, verification verificationReport, analysis analysisReport, proposal proposalReport, issue upstreamIssue, alert alertContext) string {
 	link := ""
-	if runURL != "" {
-		link = fmt.Sprintf(" <%s|Evidence and workflow run>.", runURL)
+	if alert.RunURL != "" {
+		link = fmt.Sprintf(" <%s|Evidence and workflow run>.", alert.RunURL)
 	}
-	if status != "success" {
+	if status != "success" && len(verification.Modules) == 0 {
 		reviewLink := ""
-		if reviewIssueURL != "" {
-			reviewLink = fmt.Sprintf(" <%s|Review issue>.", reviewIssueURL)
+		if alert.ReviewIssueURL != "" {
+			reviewLink = fmt.Sprintf(" <%s|Review issue>.", alert.ReviewIssueURL)
 		}
-		return fmt.Sprintf(":red_circle: *Go SDK compatibility monitor failed during %s.* No regression verdict is available; inspect the workflow logs for the error.%s%s", failureStage, reviewLink, link)
+		fixLink := ""
+		if alert.FixPRURL != "" {
+			fixLink = fmt.Sprintf(" <%s|Fix PR>.", alert.FixPRURL)
+		}
+		return fmt.Sprintf(":red_circle: *Go SDK compatibility monitor failed during %s.* No regression verdict is available; inspect the workflow logs for the error.%s%s%s", alert.FailureStage, reviewLink, fixLink, link)
 	}
 	items := make([]string, 0)
 	limit := len(report.Changes)
@@ -136,7 +154,7 @@ func slackMessage(status string, report releaseReport, evidence evidenceReport, 
 		}
 		risk = fmt.Sprintf(" Gemini advisory risk%s: *%s* (unverified).", scope, conciseSlackText(analysis.RiskLevel))
 	} else if analysis.Skipped {
-		risk = " Gemini analysis unavailable; deterministic evidence only."
+		risk = " Gemini advisory unavailable; deterministic evidence and tests remain available."
 	}
 	toolchain := ""
 	for _, item := range evidence.Modules {
@@ -146,13 +164,22 @@ func slackMessage(status string, report releaseReport, evidence evidenceReport, 
 	}
 	verificationItems := make([]string, 0, len(verification.Modules))
 	confirmedFailure := false
-	for _, item := range verification.Modules {
-		verificationItems = append(verificationItems, fmt.Sprintf("%s %s: *%s*", item.Module, item.Latest, item.Status))
+	for index, item := range verification.Modules {
+		if index < 8 {
+			verificationItems = append(verificationItems, fmt.Sprintf("%s %s: *%s*", item.Module, item.Latest, item.Status))
+		}
 		if item.Status == "fail" {
 			confirmedFailure = true
 		}
 	}
-	verificationText := " Deterministic adapter tests: " + strings.Join(verificationItems, "; ") + "."
+	verificationText := " Mapped adapter tests unavailable; inspect the run."
+	if len(verificationItems) > 0 {
+		verificationText = " Mapped adapter tests (recorded baseline vs latest; tested scope only): " + strings.Join(verificationItems, "; ")
+		if len(verification.Modules) > len(verificationItems) {
+			verificationText += fmt.Sprintf("; +%d more", len(verification.Modules)-len(verificationItems))
+		}
+		verificationText += "."
+	}
 	heading := ":warning: *Go SDK release review needed; no confirmed regression:*"
 	if confirmedFailure {
 		heading = ":rotating_light: *Go SDK regression in mapped adapter tests (baseline passed, latest failed):*"
@@ -166,18 +193,47 @@ func slackMessage(status string, report releaseReport, evidence evidenceReport, 
 		issueText = fmt.Sprintf(" Referenced upstream issue: <%s|%s>.", issue.URL, title)
 	}
 	reviewIssue := ""
-	if reviewIssueURL != "" {
-		reviewIssue = fmt.Sprintf(" <%s|Review issue>.", reviewIssueURL)
+	if alert.ReviewIssueURL != "" {
+		reviewIssue = fmt.Sprintf(" <%s|Review issue>.", alert.ReviewIssueURL)
 	}
-	fix := " No safe auto-fix PR produced."
-	if draftPRURL != "" {
-		fix = fmt.Sprintf(" Gemini-proposed SDK fix: <%s|draft PR for human review> (%s).", draftPRURL, proposal.Validation)
-	} else if proposal.Status == "validated" && draftPROutcome == "failure" {
-		fix = " SDK patch passed validation, but draft PR creation failed; inspect Actions permissions and run logs."
-	} else if proposal.Reason != "" {
-		fix = fmt.Sprintf(" No safe auto-fix PR produced: %s.", conciseSlackText(proposal.Reason))
+	fix := " No validated SDK fix proposal; no PR opened."
+	switch {
+	case alert.FixPRURL != "":
+		validation := "review validation evidence in the PR"
+		if proposal.Validation == "test_regression_resolved" {
+			validation = "mapped regression passed after the patch"
+		} else if proposal.Validation == "advisory_only_no_reproduction" {
+			validation = "suspected behavior unverified by mapped tests"
+		}
+		fix = fmt.Sprintf(" Gemini-proposed fix: <%s|PR opened for human code review> (%s); no automated approval or merge.", alert.FixPRURL, validation)
+	case proposal.Status == "validated" && alert.PublishCheckOutcome == "failure":
+		fix = " SDK patch passed isolated tests, but the publication check failed; no PR opened. Inspect the run."
+	case proposal.Status == "validated" && alert.FixPROutcome == "failure":
+		fix = " SDK patch passed validation, but PR creation failed; no PR opened. Inspect Actions permissions and the run."
+	case proposal.Status == "validated":
+		fix = " SDK patch passed validation, but no PR was opened; inspect the run."
+	case alert.PatchJobStatus == "failure":
+		fix = " Isolated SDK patch validation failed; no PR opened. Inspect the run."
+	case alert.ProposalOutcome == "failure":
+		fix = " SDK proposal validation tooling failed; no PR opened. Inspect the run."
+	case alert.RetestOutcome == "failure":
+		fix = " SDK patch retest tooling failed; no PR opened. Inspect the run."
+	case proposal.Status == "rejected":
+		fix = fmt.Sprintf(" Gemini fix rejected by validation; no PR opened: %s.", conciseSlackText(proposal.Reason))
+	case proposal.Status == "skipped" && proposal.Reason != "":
+		fix = fmt.Sprintf(" No SDK fix proposal: %s.", conciseSlackText(proposal.Reason))
 	}
-	return fmt.Sprintf("%s %d upstream release(s) newer than the analyzed lock. %s%s.%s%s%s%s%s%s%s", heading, len(report.Changes), strings.Join(items, ", "), remaining, verificationText, toolchain, risk, fix, issueText, reviewIssue, link)
+	issueFailure := ""
+	if alert.IssueOutcome == "failure" {
+		issueFailure = " Review issue update failed; inspect the run."
+	} else if alert.FixIssueOutcome == "failure" {
+		issueFailure = " Fix status update to the review issue failed; inspect the run."
+	}
+	monitorFailure := ""
+	if status != "success" {
+		monitorFailure = fmt.Sprintf(" Monitor also failed during %s; inspect the run.", alert.FailureStage)
+	}
+	return fmt.Sprintf("%s %d upstream release(s) newer than the analyzed lock. %s%s.%s%s%s%s%s%s%s%s%s", heading, len(report.Changes), strings.Join(items, ", "), remaining, verificationText, toolchain, risk, fix, issueText, reviewIssue, issueFailure, monitorFailure, link)
 }
 
 func main() {
@@ -187,7 +243,7 @@ func main() {
 		return
 	}
 	status := os.Getenv("COMPAT_JOB_STATUS")
-	if os.Getenv("COMPAT_VERIFY_OUTCOME") == "failure" || os.Getenv("COMPAT_PATCH_JOB_STATUS") == "failure" {
+	if os.Getenv("COMPAT_VERIFY_OUTCOME") == "failure" {
 		status = "failure"
 	}
 	if status == "success" && os.Getenv("COMPAT_CHANGES_FOUND") != "true" {
@@ -209,7 +265,15 @@ func main() {
 		issuePath = "compatibility-upstream-issue.json"
 	}
 	optionalJSON(issuePath, &issue)
-	payload, err := json.Marshal(map[string]string{"text": slackMessage(status, report, evidence, verification, analysis, proposal, issue, os.Getenv("COMPAT_REVIEW_ISSUE_URL"), os.Getenv("COMPAT_DRAFT_PR_URL"), os.Getenv("COMPAT_DRAFT_PR_OUTCOME"), workflowURL(), failedStage())})
+	alert := alertContext{
+		ReviewIssueURL: os.Getenv("COMPAT_REVIEW_ISSUE_URL"), FixPRURL: os.Getenv("COMPAT_FIX_PR_URL"),
+		FixPROutcome: os.Getenv("COMPAT_FIX_PR_OUTCOME"), PublishCheckOutcome: os.Getenv("COMPAT_PUBLISH_CHECK_OUTCOME"),
+		PatchJobStatus: os.Getenv("COMPAT_PATCH_JOB_STATUS"), IssueOutcome: os.Getenv("COMPAT_ISSUE_OUTCOME"),
+		ProposalOutcome: os.Getenv("COMPAT_PROPOSAL_OUTCOME"), RetestOutcome: os.Getenv("COMPAT_RETEST_OUTCOME"),
+		FixIssueOutcome: os.Getenv("COMPAT_FIX_ISSUE_OUTCOME"),
+		RunURL:          workflowURL(), FailureStage: failedStage(),
+	}
+	payload, err := json.Marshal(map[string]string{"text": slackMessage(status, report, evidence, verification, analysis, proposal, issue, alert)})
 	if err != nil {
 		panic(err)
 	}

@@ -36,7 +36,7 @@ Twice a day (at 00:47 and 12:47 UTC), the scheduled workflow:
    one small SDK source fix tied to a cited evidence path;
 5. validates any proposed patch in a separate read-only job with no Gemini or
    write credentials, rerunning affected adapter suites at baseline and latest;
-6. opens or reuses a draft fix PR for human review when the bounded patch
+6. opens or reuses a regular fix PR for human code review when the bounded patch
    passes validation, then updates the review issue and Slack;
 7. alerts Slack when a release is
    newer than the analyzed version lock. The same releases can trigger another
@@ -47,14 +47,14 @@ the mapped adapter suite passed at the baseline and failed at the new version;
 it is a regression in that tested scope. A newer upstream Go requirement is
 blocked toolchain evidence, not an SDK test failure. Gemini can propose a fix
 when concrete upstream and adapter evidence suggests a behavioral problem even
-if mapped tests pass. In that case the draft PR explicitly says that the
+if mapped tests pass. In that case the PR explicitly says that the
 suspected regression has not been reproduced and needs a focused test. A risk
 score alone never opens a PR. Proposed edits are limited to two allowlisted Go
 adapter source files and are applied by exact text replacement; workflow files,
 tests, documentation, and manifests cannot be edited by the model. No automated
 PR is merged. The review issue links the run, evidence, test results, Gemini
-analysis, and any draft PR. Additional candidate findings remain for later
-runs; an existing automated draft PR prevents duplicate proposals for its
+analysis, and any fix PR. Additional candidate findings remain for later
+runs; an existing automated fix PR prevents duplicate proposals for its
 release, including one closed by a reviewer.
 
 Configure these GitHub Actions settings:
@@ -68,7 +68,7 @@ Configure these GitHub Actions settings:
   Incoming Webhook. Without it, Slack notification is skipped.
 - Secret `COMPAT_PR_TOKEN` (optional): a narrowly scoped GitHub App or PAT token
   with repository contents and pull-request write access. The publish job uses
-  it only for branch and draft PR creation; without it, that step uses the
+  it only for branch and PR creation; without it, that step uses the
   workflow `GITHUB_TOKEN`.
 
 Organization-level secrets scoped only to the SDK repositories are preferred.
@@ -82,6 +82,6 @@ The `publish` job needs repository Actions settings that allow GitHub Actions
 to create pull requests, plus `contents: write` and `pull-requests: write`
 permissions for its `GITHUB_TOKEN`, or the optional `COMPAT_PR_TOKEN` described
 above. If repository policy blocks PR creation, the workflow reports the failed
-publication in the issue, Slack, and run logs. Draft PRs made with the default
+publication in the issue, Slack, and run logs. PRs made with the default
 `GITHUB_TOKEN` may require human approval before pull-request checks run;
 a GitHub App or PAT token can allow those checks to trigger automatically.
