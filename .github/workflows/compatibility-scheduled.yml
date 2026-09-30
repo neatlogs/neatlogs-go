@@ -25,6 +25,7 @@ concurrency:
 jobs:
   discover:
     runs-on: ubuntu-latest
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v6
@@ -57,6 +58,11 @@ jobs:
         run: |
           jq --slurpfile issue compatibility-upstream-issue.json '.upstreamIssues = $issue' compatibility-evidence.json > compatibility-evidence.tmp.json
           mv compatibility-evidence.tmp.json compatibility-evidence.json
+      - name: Test adapters against baseline and new releases
+        id: verify
+        if: steps.discover.outputs.changes_found == 'true'
+        continue-on-error: true
+        run: go run ./scripts/compatibility/verify
       - name: Run advisory Gemini impact analysis
         id: gemini
         if: steps.discover.outputs.changes_found == 'true'
@@ -65,17 +71,19 @@ jobs:
           COMPAT_GEMINI_MODEL: ${{ vars.COMPAT_GEMINI_MODEL || 'gemini-2.5-flash' }}
         run: go run ./scripts/compatibility/analyze --llm-only
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: go-compatibility-release-report
           path: |
             compatibility-release-report.json
             compatibility-evidence.json
+            compatibility-verification.json
             compatibility-llm-analysis.json
             compatibility-upstream-issue.json
           if-no-files-found: ignore
       - name: Create or update release discovery issue
         id: review_issue
-        if: steps.discover.outputs.changes_found == 'true'
+        if: always() && steps.discover.outputs.changes_found == 'true' && steps.evidence.outcome == 'success'
         uses: actions/github-script@v7
         with:
           script: |
@@ -84,18 +92,32 @@ jobs:
             const repo = context.repo.repo;
             const title = '[compatibility] New Go integration releases detected';
             const report = fs.readFileSync('compatibility-release-report.json', 'utf8');
-            const analysis = fs.readFileSync('compatibility-llm-analysis.json', 'utf8');
+            const analysis = fs.existsSync('compatibility-llm-analysis.json')
+              ? fs.readFileSync('compatibility-llm-analysis.json', 'utf8')
+              : JSON.stringify({ skipped: true, reason: 'Gemini analysis did not complete; inspect the workflow run' }, null, 2);
             const evidence = JSON.parse(fs.readFileSync('compatibility-evidence.json', 'utf8'));
+            const verification = fs.existsSync('compatibility-verification.json')
+              ? JSON.parse(fs.readFileSync('compatibility-verification.json', 'utf8'))
+              : { modules: JSON.parse(report).changes.map((item) => ({ module: item.module, latest: item.latest, status: 'not_tested', detail: 'Adapter test tooling did not complete; inspect the workflow run', suites: [] })) };
             const runURL = `${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${context.runId}`;
             const toolchainFindings = evidence.modules
               .filter((item) => item.toolchainRequirement)
               .map((item) => `- ${item.module} ${item.latestVersion}: ${item.toolchainRequirement}`);
+            const verificationFindings = verification.modules.flatMap((item) => [
+              `- **${item.status}** ${item.module} ${item.latest}${item.detail ? ` — ${item.detail}` : ''}`,
+              ...item.suites.map((suite) => `  - ${suite.integration}: ${suite.status} (baseline ${suite.baseline.status}, latest ${suite.latest.status})${suite.detail ? ` — ${suite.detail}` : ''}`),
+            ]);
             const body = [
               'The scheduled monitor found upstream module releases newer than the analyzed version lock. This is a review request, not a confirmed SDK regression.',
               '',
               `Evidence and workflow logs: ${runURL}`,
               '',
-              'The workflow compares published module contents, APIs, and documentation, then asks Gemini for an advisory assessment. It does not run the SDK against these newer versions or create a fix PR. Verify any reported impact with deterministic tests before updating `.compatibility/versions.lock.json`.',
+              'The workflow compares published module contents, APIs, and documentation. It also runs the mapped adapter test suites against the analyzed baseline and each new published version, then asks Gemini for a separate advisory assessment. A failed latest-version suite is attributed to the release only when its baseline suite passes. This workflow does not create a fix PR. Review test failures and evidence before updating `.compatibility/versions.lock.json`.',
+              '',
+              '### Deterministic adapter test results',
+              ...verificationFindings,
+              '',
+              'Full test output is in the workflow artifact `go-compatibility-release-report` (`compatibility-verification.json`).',
               '',
               '### Go toolchain compatibility evidence',
               ...(toolchainFindings.length ? toolchainFindings : ['No newer-Go requirement detected by the module download step.']),
@@ -135,8 +157,16 @@ jobs:
           COMPAT_CHANGES_FOUND: ${{ steps.discover.outputs.changes_found }}
           COMPAT_DISCOVER_OUTCOME: ${{ steps.discover.outcome }}
           COMPAT_EVIDENCE_OUTCOME: ${{ steps.evidence.outcome }}
+          COMPAT_VERIFY_OUTCOME: ${{ steps.verify.outcome }}
           COMPAT_GEMINI_OUTCOME: ${{ steps.gemini.outcome }}
           COMPAT_ISSUE_OUTCOME: ${{ steps.review_issue.outcome }}
           COMPAT_REVIEW_ISSUE_URL: ${{ steps.review_issue.outputs.issue_url }}
           COMPAT_UPSTREAM_ISSUE_FILE: compatibility-upstream-issue.json
         run: go run ./scripts/compatibility/notify
+      - name: Fail run on deterministic compatibility regression
+        if: always() && steps.discover.outputs.changes_found == 'true'
+        env:
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+        run: |
+          if [ "$VERIFY_OUTCOME" != success ]; then exit 1; fi
+          jq -e '[.modules[] | select(.status == "fail")] | length == 0' compatibility-verification.json

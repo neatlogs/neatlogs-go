@@ -33,6 +33,14 @@ type evidenceReport struct {
 	} `json:"modules"`
 }
 
+type verificationReport struct {
+	Modules []struct {
+		Module string `json:"module"`
+		Latest string `json:"latest"`
+		Status string `json:"status"`
+	} `json:"modules"`
+}
+
 type upstreamIssue struct {
 	Title string `json:"title"`
 	URL   string `json:"url"`
@@ -62,6 +70,7 @@ func failedStage() string {
 	for _, step := range []struct{ env, label string }{
 		{"COMPAT_DISCOVER_OUTCOME", "release discovery"},
 		{"COMPAT_EVIDENCE_OUTCOME", "deterministic evidence collection"},
+		{"COMPAT_VERIFY_OUTCOME", "adapter version tests"},
 		{"COMPAT_GEMINI_OUTCOME", "Gemini advisory analysis"},
 		{"COMPAT_ISSUE_OUTCOME", "review issue update"},
 	} {
@@ -72,13 +81,17 @@ func failedStage() string {
 	return "an unknown step"
 }
 
-func slackMessage(status string, report releaseReport, evidence evidenceReport, analysis analysisReport, issue upstreamIssue, reviewIssueURL, runURL, failureStage string) string {
+func slackMessage(status string, report releaseReport, evidence evidenceReport, verification verificationReport, analysis analysisReport, issue upstreamIssue, reviewIssueURL, runURL, failureStage string) string {
 	link := ""
 	if runURL != "" {
 		link = fmt.Sprintf(" <%s|Evidence and workflow run>.", runURL)
 	}
 	if status != "success" {
-		return fmt.Sprintf(":red_circle: *Go SDK compatibility monitor failed during %s.* No regression verdict is available; inspect the workflow logs for the error.%s", failureStage, link)
+		reviewLink := ""
+		if reviewIssueURL != "" {
+			reviewLink = fmt.Sprintf(" <%s|Review issue>.", reviewIssueURL)
+		}
+		return fmt.Sprintf(":red_circle: *Go SDK compatibility monitor failed during %s.* No regression verdict is available; inspect the workflow logs for the error.%s%s", failureStage, reviewLink, link)
 	}
 	items := make([]string, 0)
 	limit := len(report.Changes)
@@ -108,6 +121,19 @@ func slackMessage(status string, report releaseReport, evidence evidenceReport, 
 			toolchain += fmt.Sprintf(" %s requires Go ≥%s; the current SDK CI toolchain cannot use it.", item.Module, match[1])
 		}
 	}
+	verificationItems := make([]string, 0, len(verification.Modules))
+	confirmedFailure := false
+	for _, item := range verification.Modules {
+		verificationItems = append(verificationItems, fmt.Sprintf("%s %s: *%s*", item.Module, item.Latest, item.Status))
+		if item.Status == "fail" {
+			confirmedFailure = true
+		}
+	}
+	verificationText := " Deterministic adapter tests: " + strings.Join(verificationItems, "; ") + "."
+	heading := ":warning: *Go SDK release review needed; no confirmed regression:*"
+	if confirmedFailure {
+		heading = ":rotating_light: *Go SDK regression in mapped adapter tests (baseline passed, latest failed):*"
+	}
 	issueText := ""
 	if issue.URL != "" {
 		title := issue.Title
@@ -120,7 +146,7 @@ func slackMessage(status string, report releaseReport, evidence evidenceReport, 
 	if reviewIssueURL != "" {
 		reviewIssue = fmt.Sprintf(" <%s|Review issue>.", reviewIssueURL)
 	}
-	return fmt.Sprintf(":warning: *Go SDK release review needed (potential impact, no confirmed regression):* %d upstream release(s) newer than the analyzed lock. %s%s.%s%s%s%s%s", len(report.Changes), strings.Join(items, ", "), remaining, toolchain, risk, issueText, reviewIssue, link)
+	return fmt.Sprintf("%s %d upstream release(s) newer than the analyzed lock. %s%s.%s%s%s%s%s%s", heading, len(report.Changes), strings.Join(items, ", "), remaining, verificationText, toolchain, risk, issueText, reviewIssue, link)
 }
 
 func main() {
@@ -130,22 +156,27 @@ func main() {
 		return
 	}
 	status := os.Getenv("COMPAT_JOB_STATUS")
+	if os.Getenv("COMPAT_VERIFY_OUTCOME") == "failure" {
+		status = "failure"
+	}
 	if status == "success" && os.Getenv("COMPAT_CHANGES_FOUND") != "true" {
 		return
 	}
 	var report releaseReport
 	var evidence evidenceReport
+	var verification verificationReport
 	var analysis analysisReport
 	var issue upstreamIssue
 	optionalJSON("compatibility-release-report.json", &report)
 	optionalJSON("compatibility-evidence.json", &evidence)
+	optionalJSON("compatibility-verification.json", &verification)
 	optionalJSON("compatibility-llm-analysis.json", &analysis)
 	issuePath := os.Getenv("COMPAT_UPSTREAM_ISSUE_FILE")
 	if issuePath == "" {
 		issuePath = "compatibility-upstream-issue.json"
 	}
 	optionalJSON(issuePath, &issue)
-	payload, err := json.Marshal(map[string]string{"text": slackMessage(status, report, evidence, analysis, issue, os.Getenv("COMPAT_REVIEW_ISSUE_URL"), workflowURL(), failedStage())})
+	payload, err := json.Marshal(map[string]string{"text": slackMessage(status, report, evidence, verification, analysis, issue, os.Getenv("COMPAT_REVIEW_ISSUE_URL"), workflowURL(), failedStage())})
 	if err != nil {
 		panic(err)
 	}

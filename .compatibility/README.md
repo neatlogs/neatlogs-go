@@ -30,18 +30,19 @@ Twice a day (at 00:47 and 12:47 UTC), the scheduled workflow:
 1. compares the analyzed version lock with the Go module proxy;
 2. records dependency, exported API, source-content, adapter-source, and
    official project-documentation evidence;
-3. optionally asks Gemini for an advisory impact assessment;
-4. updates a GitHub review issue and optionally alerts Slack when a release is
+3. runs the affected adapter package tests against the recorded baseline and
+   the newly published module version in isolated temporary module files;
+4. optionally asks Gemini for a separate advisory impact assessment;
+5. updates a GitHub review issue and optionally alerts Slack when a release is
    newer than the analyzed version lock. The same releases can trigger another
    alert on later runs until the lock is updated after review.
 
-The alert means that review is needed, not that an SDK regression was found.
-The workflow does not run the SDK against the new upstream versions or create a
-fix pull request. A newer upstream Go requirement is recorded as deterministic
-toolchain evidence even when it exceeds the CI runner's Go version. The review
-issue links the workflow's evidence artifacts and Gemini analysis. The Gemini
-assessment is advisory and unverified; verify any suspected breakage with
-deterministic tests before updating the lock.
+The alert reports each module as pass, fail, blocked, or not tested. A fail means
+the mapped adapter suite passed at the baseline and failed at the new version;
+it is a regression in that tested scope. A newer upstream Go requirement is
+blocked toolchain evidence, not an SDK test failure. The workflow does not
+create a fix pull request. The review issue links the run and its evidence,
+test results, and Gemini analysis. Gemini remains advisory and unverified.
 
 Configure these GitHub Actions settings:
 
@@ -58,4 +59,4 @@ The credentials are used only by the scheduled/default-branch workflow and are
 never passed to pull-request jobs. Slack failures are non-blocking; alerts are
 sent for releases newer than the analyzed lock or for workflow failures.
 Gemini failures are recorded as an unavailable advisory and do not prevent
-deterministic evidence or the review issue.
+deterministic evidence, adapter tests, or the review issue.
