@@ -35,6 +35,32 @@ func TestDownloadKeepsVerifiedArtifactsWhenGoVersionIsTooOld(t *testing.T) {
 	}
 }
 
+func TestGeminiSelectsNextUncoveredTestableModule(t *testing.T) {
+	evidence := evidenceReport{Modules: []moduleEvidence{
+		{Module: "example.com/blocked", LatestVersion: "v2", ToolchainRequirement: "requires go >= 1.26"},
+		{Module: "example.com/covered", LatestVersion: "v2"},
+		{Module: "example.com/next", LatestVersion: "v3"},
+	}}
+	verification := json.RawMessage(`{"modules":[{"module":"example.com/covered","status":"fail"},{"module":"example.com/next","status":"pass"}]}`)
+	covered := json.RawMessage(`[{"module":"example.com/covered","latest":"v2"}]`)
+	selected, _, module := selectedGeminiEvidence(evidence, verification, covered, 0)
+	if module != "example.com/next" || len(selected.Modules) != 1 || selected.Modules[0].Module != module {
+		t.Fatalf("selectedGeminiEvidence() = %q, %#v", module, selected.Modules)
+	}
+}
+
+func TestGeminiRotatesUncoveredModulesAcrossRuns(t *testing.T) {
+	evidence := evidenceReport{Modules: []moduleEvidence{{Module: "example.com/first", LatestVersion: "v2"}, {Module: "example.com/second", LatestVersion: "v3"}, {Module: "example.com/third", LatestVersion: "v4"}}}
+	verification := json.RawMessage(`{"modules":[{"module":"example.com/first","status":"fail"},{"module":"example.com/second","status":"pass"},{"module":"example.com/third","status":"pass"}]}`)
+	want := []string{"example.com/first", "example.com/second", "example.com/third", "example.com/first"}
+	for run, expected := range want {
+		_, _, got := selectedGeminiEvidence(evidence, verification, json.RawMessage(`[]`), run)
+		if got != expected {
+			t.Fatalf("run %d selected %q, want %q", run, got, expected)
+		}
+	}
+}
+
 func TestArchivePathDropsModuleAndVersionRoot(t *testing.T) {
 	got := normalizedArchivePath("github.com/a2aproject/a2a-go/v2@v2.6.0/client/client.go")
 	if got != "client/client.go" {

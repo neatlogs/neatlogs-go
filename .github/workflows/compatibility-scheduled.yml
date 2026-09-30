@@ -17,6 +17,7 @@ on:
 permissions:
   contents: read
   issues: write
+  pull-requests: read
 
 concurrency:
   group: compatibility-go-release-discovery
@@ -26,8 +27,18 @@ jobs:
   discover:
     runs-on: ubuntu-latest
     timeout-minutes: 35
+    outputs:
+      changes_found: ${{ steps.discover.outputs.changes_found }}
+      discover_outcome: ${{ steps.discover.outcome }}
+      evidence_outcome: ${{ steps.evidence.outcome }}
+      verify_outcome: ${{ steps.verify.outcome }}
+      gemini_outcome: ${{ steps.gemini.outcome }}
+      issue_outcome: ${{ steps.review_issue.outcome }}
+      review_issue_url: ${{ steps.review_issue.outputs.issue_url }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
@@ -63,6 +74,23 @@ jobs:
         if: steps.discover.outputs.changes_found == 'true'
         continue-on-error: true
         run: go run ./scripts/compatibility/verify
+      - name: Find releases already reviewed by an automated draft PR
+        if: steps.discover.outputs.changes_found == 'true'
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const crypto = require('crypto');
+            const changes = JSON.parse(fs.readFileSync('compatibility-release-report.json', 'utf8')).changes;
+            const { data: pulls } = await github.rest.pulls.list({ ...context.repo, state: 'all', per_page: 100 });
+            const covered = changes.flatMap((item) => {
+              const hash = crypto.createHash('sha256').update(`${item.module}@${item.latest}`).digest('hex').slice(0, 12);
+              const branch = `compat/gemini-go-${hash}`;
+              const pull = pulls.find((entry) => entry.head.ref === branch && entry.head.repo?.full_name === `${context.repo.owner}/${context.repo.repo}`);
+              return pull ? [{ module: item.module, latest: item.latest, url: pull.html_url }] : [];
+            });
+            fs.writeFileSync('compatibility-covered.json', JSON.stringify(covered, null, 2));
       - name: Run advisory Gemini impact analysis
         id: gemini
         if: steps.discover.outputs.changes_found == 'true'
@@ -79,6 +107,7 @@ jobs:
             compatibility-release-report.json
             compatibility-evidence.json
             compatibility-verification.json
+            compatibility-covered.json
             compatibility-llm-analysis.json
             compatibility-upstream-issue.json
           if-no-files-found: ignore
@@ -94,8 +123,22 @@ jobs:
             const title = '[compatibility] New Go integration releases detected';
             const report = fs.readFileSync('compatibility-release-report.json', 'utf8');
             const analysis = fs.existsSync('compatibility-llm-analysis.json')
-              ? fs.readFileSync('compatibility-llm-analysis.json', 'utf8')
-              : JSON.stringify({ skipped: true, reason: 'Gemini analysis did not complete; inspect the workflow run' }, null, 2);
+              ? JSON.parse(fs.readFileSync('compatibility-llm-analysis.json', 'utf8'))
+              : { skipped: true, reason: 'Gemini analysis did not complete; inspect the workflow run' };
+            const analysisSummary = JSON.stringify({
+              scopeModule: analysis.scopeModule,
+              summary: String(analysis.summary || '').slice(0, 2000),
+              riskLevel: analysis.riskLevel,
+              decision: analysis.decision,
+              targetModule: analysis.targetModule,
+              targetVersion: analysis.targetVersion,
+              evidenceReference: analysis.evidenceReference,
+              evidenceRationale: String(analysis.evidenceRationale || '').slice(0, 2000),
+              findings: Array.isArray(analysis.findings) ? analysis.findings.slice(0, 5) : [],
+              skipped: analysis.skipped,
+              reason: analysis.reason,
+              note: 'Proposed source changes are omitted here; see the run artifact and any draft PR diff.',
+            }, null, 2).slice(0, 12000);
             const evidence = JSON.parse(fs.readFileSync('compatibility-evidence.json', 'utf8'));
             const verification = fs.existsSync('compatibility-verification.json')
               ? JSON.parse(fs.readFileSync('compatibility-verification.json', 'utf8'))
@@ -109,11 +152,13 @@ jobs:
               ...item.suites.map((suite) => `  - ${suite.integration}: ${suite.status} (baseline ${suite.baseline.status}, latest ${suite.latest.status})${suite.detail ? ` — ${suite.detail}` : ''}`),
             ]);
             const body = [
-              'The scheduled monitor found upstream module releases newer than the analyzed version lock. This is a review request, not a confirmed SDK regression.',
+              verification.modules.some((item) => item.status === 'fail')
+                ? 'The scheduled monitor found upstream releases and a regression in a mapped adapter test suite: the recorded baseline passed, but the new version failed. Human review is required.'
+                : 'The scheduled monitor found upstream releases newer than the analyzed version lock. No regression was confirmed in the mapped adapter tests; review is still needed for blocked or untested behavior.',
               '',
               `Evidence and workflow logs: ${runURL}`,
               '',
-              'The workflow compares published module contents, APIs, and documentation. It also runs the mapped adapter test suites against the analyzed baseline and each new published version, then asks Gemini for a separate advisory assessment. A failed latest-version suite is attributed to the release only when its baseline suite passes. This workflow does not create a fix PR. Review test failures and evidence before updating `.compatibility/versions.lock.json`.',
+              'The workflow compares published module contents, APIs, and documentation. It runs mapped adapter suites at the analyzed baseline and new version. Gemini may propose one bounded SDK source fix per run for a separate read-only validation job; a validated candidate can open a draft PR for human review. Other findings remain deferred in this issue. A failed latest-version suite is attributed to the release only when its baseline passes. Review the evidence before updating `.compatibility/versions.lock.json`.',
               '',
               '### Deterministic adapter test results',
               ...verificationFindings,
@@ -131,7 +176,7 @@ jobs:
               '### Gemini advisory impact analysis (unverified)',
               '',
               '```json',
-              analysis,
+              analysisSummary,
               '```',
             ].join('\n');
             const { data: issues } = await github.rest.issues.listForRepo({
@@ -150,7 +195,7 @@ jobs:
               core.setOutput('issue_url', created.html_url);
             }
       - name: Notify Slack of releases or workflow failure
-        if: always()
+        if: always() && steps.discover.outputs.changes_found != 'true'
         continue-on-error: true
         env:
           COMPAT_SLACK_WEBHOOK_URL: ${{ secrets.COMPAT_SLACK_WEBHOOK_URL }}
@@ -164,10 +209,226 @@ jobs:
           COMPAT_REVIEW_ISSUE_URL: ${{ steps.review_issue.outputs.issue_url }}
           COMPAT_UPSTREAM_ISSUE_FILE: compatibility-upstream-issue.json
         run: go run ./scripts/compatibility/notify
-      - name: Fail run on deterministic compatibility regression
-        if: always() && steps.discover.outputs.changes_found == 'true'
+
+  validate_patch:
+    needs: discover
+    if: always() && needs.discover.outputs.changes_found == 'true' && needs.discover.outputs.evidence_outcome == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    outputs:
+      validated: ${{ steps.retest.outputs.validated }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: go-compatibility-release-report
+      - name: Validate and apply bounded Gemini source proposal
+        id: propose
+        continue-on-error: true
+        run: |
+          go run ./scripts/compatibility/propose
+          if jq -e '.status == "proposed"' compatibility-proposal.json >/dev/null; then
+            echo 'candidate=true' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Retest proposed adapter fix without credentials
+        id: retest
+        if: steps.propose.outputs.candidate == 'true'
+        continue-on-error: true
+        run: |
+          go run ./scripts/compatibility/verify --output=compatibility-proposal-verification.json
+          go run ./scripts/compatibility/propose --check-tests
+          git diff --check
+          if jq -e '.status == "validated"' compatibility-proposal.json >/dev/null; then
+            echo 'validated=true' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: go-compatibility-patch-validation
+          path: |
+            compatibility-proposal.json
+            compatibility-proposal-verification.json
+            contrib/adk/a2a.go
+            contrib/adk/adk.go
+            contrib/adk/run.go
+            contrib/adk/tools.go
+            contrib/genai/genai.go
+          if-no-files-found: ignore
+
+  publish:
+    needs: [discover, validate_patch]
+    if: always() && needs.discover.outputs.changes_found == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/download-artifact@v4
+        id: discovery_artifact
+        continue-on-error: true
+        with:
+          name: go-compatibility-release-report
+          path: compatibility-discovery
+      - uses: actions/download-artifact@v4
+        id: validation_artifact
+        continue-on-error: true
+        with:
+          name: go-compatibility-patch-validation
+          path: compatibility-validation
+      - name: Independently validate the proposal before publication
+        id: publish_check
+        if: needs.validate_patch.outputs.validated == 'true'
+        continue-on-error: true
+        run: |
+          go run ./scripts/compatibility/propose \
+            --analysis=compatibility-discovery/compatibility-llm-analysis.json \
+            --release-report=compatibility-discovery/compatibility-release-report.json \
+            --evidence=compatibility-discovery/compatibility-evidence.json \
+            --covered=compatibility-discovery/compatibility-covered.json \
+            --output=compatibility-proposal.json
+          jq -S '{targetModule,targetVersion,evidenceReference,evidenceRationale,paths}' compatibility-proposal.json > compatibility-proposal-identity.json
+          jq -S '{targetModule,targetVersion,evidenceReference,evidenceRationale,paths}' compatibility-validation/compatibility-proposal.json > compatibility-validated-identity.json
+          cmp compatibility-proposal-identity.json compatibility-validated-identity.json
+          go run ./scripts/compatibility/propose --check-tests \
+            --output=compatibility-proposal.json \
+            --verification=compatibility-discovery/compatibility-verification.json \
+            --retest=compatibility-validation/compatibility-proposal-verification.json
+          jq -e '.status == "validated"' compatibility-proposal.json >/dev/null
+          git diff --check
+          echo 'ready=true' >> "$GITHUB_OUTPUT"
+      - name: Open or reuse a draft fix PR
+        id: draft_pr
+        if: steps.publish_check.outputs.ready == 'true'
+        continue-on-error: true
+        uses: actions/github-script@v7
         env:
-          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          REVIEW_ISSUE_URL: ${{ needs.discover.outputs.review_issue_url }}
+        with:
+          github-token: ${{ secrets.COMPAT_PR_TOKEN || github.token }}
+          script: |
+            const fs = require('fs');
+            const crypto = require('crypto');
+            const cp = require('child_process');
+            const proposal = JSON.parse(fs.readFileSync('compatibility-proposal.json', 'utf8'));
+            const validated = JSON.parse(fs.readFileSync('compatibility-validation/compatibility-proposal.json', 'utf8'));
+            if (proposal.status !== 'validated' || validated.status !== 'validated') throw new Error('Proposal was not validated');
+            if (context.ref !== `refs/heads/${context.payload.repository.default_branch}`) throw new Error('Draft PR creation requires a default-branch run');
+            if (cp.execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim() !== context.sha) throw new Error('Checkout differs from workflow base SHA');
+            const allow = new Set(['contrib/adk/a2a.go', 'contrib/adk/adk.go', 'contrib/adk/run.go', 'contrib/adk/tools.go', 'contrib/genai/genai.go']);
+            if (!proposal.paths.length || proposal.paths.length > 2 || proposal.paths.some((path) => !allow.has(path))) throw new Error('Invalid proposal paths');
+            for (const path of proposal.paths) {
+              const local = fs.readFileSync(path);
+              const tested = fs.readFileSync(`compatibility-validation/${path}`);
+              if (!local.equals(tested)) throw new Error(`Validated source differs from publisher patch: ${path}`);
+            }
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const hash = crypto.createHash('sha256').update(`${proposal.targetModule}@${proposal.targetVersion}`).digest('hex').slice(0, 12);
+            const branch = `compat/gemini-go-${hash}`;
+            const { data: pulls } = await github.rest.pulls.list({ owner, repo, state: 'all', head: `${owner}:${branch}`, per_page: 100 });
+            if (pulls.some((pull) => pull.state === 'open')) {
+              core.setOutput('pr_url', pulls.find((pull) => pull.state === 'open').html_url);
+              return;
+            }
+            if (pulls.length) throw new Error('A reviewer closed or merged the earlier auto-fix PR; refusing to reopen it');
+            let existingRef;
+            try {
+              ({ data: existingRef } = await github.rest.git.getRef({ owner, repo, ref: `heads/${branch}` }));
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            if (existingRef) {
+              const { data: existingCommit } = await github.rest.git.getCommit({ owner, repo, commit_sha: existingRef.object.sha });
+              if (existingCommit.parents.length !== 1 || !existingCommit.message.startsWith('[compatibility] Propose Go SDK fix')) throw new Error('Existing auto-fix branch is not an untouched generated commit');
+              const { data: comparison } = await github.rest.repos.compareCommits({ owner, repo, base: existingCommit.parents[0].sha, head: existingRef.object.sha });
+              if (comparison.files.length !== proposal.paths.length || comparison.files.some((file) => !proposal.paths.includes(file.filename))) throw new Error('Existing auto-fix branch contains different paths');
+              for (const path of proposal.paths) {
+                const { data: remote } = await github.rest.repos.getContent({ owner, repo, path, ref: branch });
+                if (remote.type !== 'file' || !Buffer.from(remote.content, 'base64').equals(fs.readFileSync(path))) throw new Error(`Existing branch differs from validated patch: ${path}`);
+              }
+            } else {
+              const { data: base } = await github.rest.git.getCommit({ owner, repo, commit_sha: context.sha });
+              const { data: tree } = await github.rest.git.createTree({ owner, repo, base_tree: base.tree.sha, tree: proposal.paths.map((path) => ({ path, mode: '100644', type: 'blob', content: fs.readFileSync(path, 'utf8') })) });
+              const { data: commit } = await github.rest.git.createCommit({ owner, repo, parents: [context.sha], tree: tree.sha, message: `[compatibility] Propose Go SDK fix for ${proposal.targetModule}@${proposal.targetVersion}` });
+              await github.rest.git.createRef({ owner, repo, ref: `refs/heads/${branch}`, sha: commit.sha });
+            }
+            const runURL = `${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const validation = proposal.validation === 'test_regression_resolved'
+              ? 'A baseline-pass/latest-fail adapter test was resolved by this patch.'
+              : 'Mapped adapter suites passed before and after this patch; the suspected behavioral regression has not been reproduced. Human review and a focused regression test are required.';
+            const body = `Gemini-proposed SDK source fix for ${proposal.targetModule}@${proposal.targetVersion}. This is a draft for human review; it will not be merged automatically.\n\nEvidence: ${proposal.evidenceReference}\n\nRationale: ${proposal.evidenceRationale}\n\nValidation: ${validation}\n\nReview issue: ${process.env.REVIEW_ISSUE_URL || 'unavailable'}\nWorkflow and artifacts: ${runURL}`;
+            const { data: pull } = await github.rest.pulls.create({ owner, repo, head: branch, base: context.payload.repository.default_branch, title: `[compatibility] Proposed Go SDK fix for ${proposal.targetModule}@${proposal.targetVersion}`, body, draft: true });
+            core.setOutput('pr_url', pull.html_url);
+      - name: Add auto-fix status to review issue
+        if: always() && needs.discover.outputs.review_issue_url != ''
+        continue-on-error: true
+        uses: actions/github-script@v7
+        env:
+          REVIEW_ISSUE_URL: ${{ needs.discover.outputs.review_issue_url }}
+          DRAFT_PR_URL: ${{ steps.draft_pr.outputs.pr_url }}
+          DRAFT_PR_OUTCOME: ${{ steps.draft_pr.outcome }}
+        with:
+          script: |
+            const fs = require('fs');
+            const number = Number(process.env.REVIEW_ISSUE_URL.split('/').pop());
+            const { data: issue } = await github.rest.issues.get({ ...context.repo, issue_number: number });
+            const marker = '<!-- go-automated-fix-status -->';
+            const proposal = fs.existsSync('compatibility-validation/compatibility-proposal.json')
+              ? JSON.parse(fs.readFileSync('compatibility-validation/compatibility-proposal.json', 'utf8'))
+              : { status: 'not produced', reason: 'Patch validation did not complete' };
+            const status = process.env.DRAFT_PR_URL
+              ? `Draft PR for human review: ${process.env.DRAFT_PR_URL}`
+              : proposal.status === 'validated' && process.env.DRAFT_PR_OUTCOME === 'failure'
+                ? 'Validated patch, but draft PR creation failed. Inspect this workflow run and repository Actions permissions.'
+                : `No safe auto-fix PR produced: ${proposal.status}. ${proposal.reason || ''}`;
+            const body = `${issue.body.split(marker)[0].trimEnd()}\n\n${marker}\n### Automated SDK fix\n${status}\n\nAt most one candidate is attempted per run; other actionable findings remain in the Gemini analysis for later review.`;
+            await github.rest.issues.update({ ...context.repo, issue_number: number, body });
+      - name: Notify Slack of release results and fix proposal
+        if: always()
+        continue-on-error: true
+        env:
+          COMPAT_SLACK_WEBHOOK_URL: ${{ secrets.COMPAT_SLACK_WEBHOOK_URL }}
+          COMPAT_JOB_STATUS: ${{ needs.discover.result }}
+          COMPAT_CHANGES_FOUND: ${{ needs.discover.outputs.changes_found }}
+          COMPAT_DISCOVER_OUTCOME: ${{ needs.discover.outputs.discover_outcome }}
+          COMPAT_EVIDENCE_OUTCOME: ${{ needs.discover.outputs.evidence_outcome }}
+          COMPAT_VERIFY_OUTCOME: ${{ needs.discover.outputs.verify_outcome }}
+          COMPAT_GEMINI_OUTCOME: ${{ needs.discover.outputs.gemini_outcome }}
+          COMPAT_ISSUE_OUTCOME: ${{ needs.discover.outputs.issue_outcome }}
+          COMPAT_REVIEW_ISSUE_URL: ${{ needs.discover.outputs.review_issue_url }}
+          COMPAT_DRAFT_PR_URL: ${{ steps.draft_pr.outputs.pr_url }}
+          COMPAT_DRAFT_PR_OUTCOME: ${{ steps.draft_pr.outcome }}
+          COMPAT_PATCH_JOB_STATUS: ${{ needs.validate_patch.result }}
+          COMPAT_UPSTREAM_ISSUE_FILE: compatibility-discovery/compatibility-upstream-issue.json
+        run: |
+          for file in compatibility-release-report.json compatibility-evidence.json compatibility-verification.json compatibility-llm-analysis.json; do
+            if [ -f "compatibility-discovery/$file" ]; then cp "compatibility-discovery/$file" "$file"; fi
+          done
+          if [ -f compatibility-validation/compatibility-proposal.json ]; then cp compatibility-validation/compatibility-proposal.json compatibility-proposal.json; fi
+          go run ./scripts/compatibility/notify
+      - name: Fail run on deterministic regression or publication failure
+        if: always()
+        env:
+          VERIFY_OUTCOME: ${{ needs.discover.outputs.verify_outcome }}
+          VALIDATED: ${{ needs.validate_patch.outputs.validated }}
+          PR_OUTCOME: ${{ steps.draft_pr.outcome }}
         run: |
           if [ "$VERIFY_OUTCOME" != success ]; then exit 1; fi
-          jq -e '[.modules[] | select(.status == "fail")] | length == 0' compatibility-verification.json
+          if [ "$VALIDATED" = true ] && [ "$PR_OUTCOME" != success ]; then exit 1; fi
+          jq -e '[.modules[] | select(.status == "fail")] | length == 0' compatibility-discovery/compatibility-verification.json

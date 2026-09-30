@@ -22,8 +22,15 @@ type releaseReport struct {
 }
 
 type analysisReport struct {
-	RiskLevel string `json:"riskLevel"`
-	Skipped   bool   `json:"skipped"`
+	RiskLevel   string `json:"riskLevel"`
+	Skipped     bool   `json:"skipped"`
+	ScopeModule string `json:"scopeModule"`
+}
+
+type proposalReport struct {
+	Status     string `json:"status"`
+	Reason     string `json:"reason"`
+	Validation string `json:"validation"`
 }
 
 type evidenceReport struct {
@@ -78,10 +85,22 @@ func failedStage() string {
 			return step.label
 		}
 	}
+	if os.Getenv("COMPAT_PATCH_JOB_STATUS") == "failure" {
+		return "isolated SDK patch validation"
+	}
 	return "an unknown step"
 }
 
-func slackMessage(status string, report releaseReport, evidence evidenceReport, verification verificationReport, analysis analysisReport, issue upstreamIssue, reviewIssueURL, runURL, failureStage string) string {
+func conciseSlackText(value string) string {
+	value = strings.NewReplacer("<", "", ">", "", "\n", " ", "\r", " ").Replace(value)
+	characters := []rune(value)
+	if len(characters) > 240 {
+		return string(characters[:240]) + "…"
+	}
+	return value
+}
+
+func slackMessage(status string, report releaseReport, evidence evidenceReport, verification verificationReport, analysis analysisReport, proposal proposalReport, issue upstreamIssue, reviewIssueURL, draftPRURL, draftPROutcome, runURL, failureStage string) string {
 	link := ""
 	if runURL != "" {
 		link = fmt.Sprintf(" <%s|Evidence and workflow run>.", runURL)
@@ -111,7 +130,11 @@ func slackMessage(status string, report releaseReport, evidence evidenceReport, 
 	}
 	risk := ""
 	if analysis.RiskLevel != "" {
-		risk = fmt.Sprintf(" Gemini advisory risk: *%s* (unverified).", analysis.RiskLevel)
+		scope := ""
+		if analysis.ScopeModule != "" {
+			scope = " for " + conciseSlackText(analysis.ScopeModule)
+		}
+		risk = fmt.Sprintf(" Gemini advisory risk%s: *%s* (unverified).", scope, conciseSlackText(analysis.RiskLevel))
 	} else if analysis.Skipped {
 		risk = " Gemini analysis unavailable; deterministic evidence only."
 	}
@@ -146,7 +169,15 @@ func slackMessage(status string, report releaseReport, evidence evidenceReport, 
 	if reviewIssueURL != "" {
 		reviewIssue = fmt.Sprintf(" <%s|Review issue>.", reviewIssueURL)
 	}
-	return fmt.Sprintf("%s %d upstream release(s) newer than the analyzed lock. %s%s.%s%s%s%s%s%s", heading, len(report.Changes), strings.Join(items, ", "), remaining, verificationText, toolchain, risk, issueText, reviewIssue, link)
+	fix := " No safe auto-fix PR produced."
+	if draftPRURL != "" {
+		fix = fmt.Sprintf(" Gemini-proposed SDK fix: <%s|draft PR for human review> (%s).", draftPRURL, proposal.Validation)
+	} else if proposal.Status == "validated" && draftPROutcome == "failure" {
+		fix = " SDK patch passed validation, but draft PR creation failed; inspect Actions permissions and run logs."
+	} else if proposal.Reason != "" {
+		fix = fmt.Sprintf(" No safe auto-fix PR produced: %s.", conciseSlackText(proposal.Reason))
+	}
+	return fmt.Sprintf("%s %d upstream release(s) newer than the analyzed lock. %s%s.%s%s%s%s%s%s%s", heading, len(report.Changes), strings.Join(items, ", "), remaining, verificationText, toolchain, risk, fix, issueText, reviewIssue, link)
 }
 
 func main() {
@@ -156,7 +187,7 @@ func main() {
 		return
 	}
 	status := os.Getenv("COMPAT_JOB_STATUS")
-	if os.Getenv("COMPAT_VERIFY_OUTCOME") == "failure" {
+	if os.Getenv("COMPAT_VERIFY_OUTCOME") == "failure" || os.Getenv("COMPAT_PATCH_JOB_STATUS") == "failure" {
 		status = "failure"
 	}
 	if status == "success" && os.Getenv("COMPAT_CHANGES_FOUND") != "true" {
@@ -166,17 +197,19 @@ func main() {
 	var evidence evidenceReport
 	var verification verificationReport
 	var analysis analysisReport
+	var proposal proposalReport
 	var issue upstreamIssue
 	optionalJSON("compatibility-release-report.json", &report)
 	optionalJSON("compatibility-evidence.json", &evidence)
 	optionalJSON("compatibility-verification.json", &verification)
 	optionalJSON("compatibility-llm-analysis.json", &analysis)
+	optionalJSON("compatibility-proposal.json", &proposal)
 	issuePath := os.Getenv("COMPAT_UPSTREAM_ISSUE_FILE")
 	if issuePath == "" {
 		issuePath = "compatibility-upstream-issue.json"
 	}
 	optionalJSON(issuePath, &issue)
-	payload, err := json.Marshal(map[string]string{"text": slackMessage(status, report, evidence, verification, analysis, issue, os.Getenv("COMPAT_REVIEW_ISSUE_URL"), workflowURL(), failedStage())})
+	payload, err := json.Marshal(map[string]string{"text": slackMessage(status, report, evidence, verification, analysis, proposal, issue, os.Getenv("COMPAT_REVIEW_ISSUE_URL"), os.Getenv("COMPAT_DRAFT_PR_URL"), os.Getenv("COMPAT_DRAFT_PR_OUTCOME"), workflowURL(), failedStage())})
 	if err != nil {
 		panic(err)
 	}

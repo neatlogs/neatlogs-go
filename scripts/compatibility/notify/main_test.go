@@ -18,9 +18,12 @@ func TestSlackReleaseMessage(t *testing.T) {
 			Latest string `json:"latest"`
 			Status string `json:"status"`
 		}{{Module: "example.com/sdk", Latest: "v2", Status: "blocked"}}},
-		analysisReport{RiskLevel: "high"},
+		analysisReport{RiskLevel: "high", ScopeModule: "example.com/sdk"},
+		proposalReport{Status: "skipped", Reason: "Gemini did not produce an actionable SDK fix"},
 		upstreamIssue{Title: "empty tool arguments disappear", URL: "https://github.com/example/sdk/issues/3"},
 		"https://example.test/issues/7",
+		"",
+		"",
 		"https://example.test/run",
 		"",
 	)
@@ -32,7 +35,7 @@ func TestSlackReleaseMessage(t *testing.T) {
 }
 
 func TestSlackFailureMessage(t *testing.T) {
-	message := slackMessage("failure", releaseReport{}, evidenceReport{}, verificationReport{}, analysisReport{}, upstreamIssue{}, "", "https://example.test/run", "deterministic evidence collection")
+	message := slackMessage("failure", releaseReport{}, evidenceReport{}, verificationReport{}, analysisReport{}, proposalReport{}, upstreamIssue{}, "", "", "", "https://example.test/run", "deterministic evidence collection")
 	if !strings.Contains(message, "failed during deterministic evidence collection") || !strings.Contains(message, "https://example.test/run") {
 		t.Fatalf("unexpected failure message: %q", message)
 	}
@@ -44,8 +47,8 @@ func TestSlackReportsDeterministicFailureSeparatelyFromGemini(t *testing.T) {
 		Latest string `json:"latest"`
 		Status string `json:"status"`
 	}{{Module: "example.com/sdk", Latest: "v2", Status: "fail"}}}
-	message := slackMessage("success", releaseReport{Changes: []releaseChange{{Module: "example.com/sdk", Latest: "v2"}}}, evidenceReport{}, verification, analysisReport{RiskLevel: "low"}, upstreamIssue{}, "", "", "")
-	if !strings.Contains(message, "regression in mapped adapter tests") || !strings.Contains(message, "Gemini advisory risk: *low* (unverified)") {
+	message := slackMessage("success", releaseReport{Changes: []releaseChange{{Module: "example.com/sdk", Latest: "v2"}}}, evidenceReport{}, verification, analysisReport{RiskLevel: "low", ScopeModule: "example.com/sdk"}, proposalReport{}, upstreamIssue{}, "", "", "", "", "")
+	if !strings.Contains(message, "regression in mapped adapter tests") || !strings.Contains(message, "Gemini advisory risk for example.com/sdk: *low* (unverified)") {
 		t.Fatalf("unexpected message: %q", message)
 	}
 }
