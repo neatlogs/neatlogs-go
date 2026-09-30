@@ -66,6 +66,7 @@ jobs:
       - name: Run advisory Gemini impact analysis
         id: gemini
         if: steps.discover.outputs.changes_found == 'true'
+        continue-on-error: true
         env:
           COMPAT_GEMINI_API_KEY: ${{ secrets.COMPAT_GEMINI_API_KEY }}
           COMPAT_GEMINI_MODEL: ${{ vars.COMPAT_GEMINI_MODEL || 'gemini-2.5-flash' }}
