@@ -307,6 +307,7 @@ func persistedDoctorProbeResultWithDiagnostics(result DoctorV2Result, traceData 
 	}
 	attributesValid := len(byName) == len(expected)
 	inputOutputValid := true
+	inputOutputMismatches := make([]string, 0)
 	metadataValid := true
 	// The v3 read path intentionally returns the UI-facing simplified view.
 	// It may preserve normalized JSON or render the same deterministic semantic
@@ -333,11 +334,13 @@ func persistedDoctorProbeResultWithDiagnostics(result DoctorV2Result, traceData 
 			outputs: []any{map[string]any{"value": float64(2)}, "Value: 2"},
 		},
 	}
-	for name, kind := range expected {
+	for _, name := range []string{"doctor.probe.root", "doctor.probe.agent", "doctor.probe.llm", "doctor.probe.tool"} {
+		kind := expected[name]
 		match := byName[name]
 		if match == nil {
 			attributesValid = false
 			inputOutputValid = false
+			inputOutputMismatches = append(inputOutputMismatches, name+".span_missing")
 			metadataValid = false
 			continue
 		}
@@ -346,9 +349,13 @@ func persistedDoctorProbeResultWithDiagnostics(result DoctorV2Result, traceData 
 		}
 		data := doctorObject(match["data"])
 		io := expectedIO[name]
-		if !doctorMatchesMaterializedValue(data["input_value"], io.inputs) ||
-			!doctorMatchesMaterializedValue(data["output_value"], io.outputs) {
+		if !doctorMatchesMaterializedValue(data["input_value"], io.inputs) {
 			inputOutputValid = false
+			inputOutputMismatches = append(inputOutputMismatches, name+".input_value")
+		}
+		if !doctorMatchesMaterializedValue(data["output_value"], io.outputs) {
+			inputOutputValid = false
+			inputOutputMismatches = append(inputOutputMismatches, name+".output_value")
 		}
 		metadata := doctorObject(match["span_metadata"])
 		spanType := strings.ToUpper(strings.ReplaceAll(strings.ReplaceAll(kind, "agent_action", "agent"), "tool_call", "tool"))
@@ -419,6 +426,11 @@ func persistedDoctorProbeResultWithDiagnostics(result DoctorV2Result, traceData 
 			check := failV2(validation.name, validation.passCode+"_FAILED", validation.message, validation.remediation)
 			if validation.name == "probe_finalization" && diagnosticDetails != nil {
 				check.Details = diagnosticDetails
+			}
+			if validation.name == "probe_input_output" {
+				// Only names of the generated Doctor fixture fields leave this
+				// check. Never include materialized input/output or credentials.
+				check.Details = map[string]any{"mismatched_fields": inputOutputMismatches}
 			}
 			result.Checks = append(result.Checks, check)
 		}

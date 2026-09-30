@@ -470,6 +470,21 @@ func TestDoctorProbeRejectsWrongMaterializedInputOutput(t *testing.T) {
 	if result.Status != DoctorFail || result.Probe == nil || result.Probe.InputOutputValid || result.FirstFailure == nil || *result.FirstFailure != "INPUT_OUTPUT_VALID_FAILED" {
 		t.Fatalf("wrong materialized output passed: %#v", result)
 	}
+	for _, check := range result.Checks {
+		if check.Name != "probe_input_output" {
+			continue
+		}
+		fields, ok := check.Details["mismatched_fields"].([]string)
+		if !ok || !reflect.DeepEqual(fields, []string{"doctor.probe.llm.output_value"}) {
+			t.Fatalf("mismatch details = %#v", check.Details)
+		}
+		encoded, err := json.Marshal(result)
+		if err != nil || strings.Contains(string(encoded), "wrong output") {
+			t.Fatalf("Doctor result exposed readback payload: %s, %v", encoded, err)
+		}
+		return
+	}
+	t.Fatal("probe_input_output check missing")
 }
 
 func TestDoctorProbeReportsTerminalCorrelationRootsAndDuplicates(t *testing.T) {
