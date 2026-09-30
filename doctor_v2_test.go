@@ -493,7 +493,6 @@ func TestDoctorProbeDiagnosesAgentInputWithoutExposingReadback(t *testing.T) {
 		name, value, kind            string
 		plain, contains, matchesRoot bool
 	}{
-		{"plain prompt", "generated diagnostic input", "string", true, true, true},
 		{"enriched content", "private payload: generated diagnostic input", "string", false, true, false},
 		{"unrelated content", "private payload", "string", false, false, false},
 	} {
@@ -522,6 +521,19 @@ func TestDoctorProbeDiagnosesAgentInputWithoutExposingReadback(t *testing.T) {
 			}
 			t.Fatal("probe_input_output check missing")
 		})
+	}
+}
+
+func TestDoctorProbeAcceptsExactPlainAgentInput(t *testing.T) {
+	root := "2222222222222222"
+	local := newDoctorV2Result("local")
+	local.Capture = &DoctorV2Capture{TraceID: "11111111111111111111111111111111", RootSpanID: &root, SpanCount: 4, SemanticDigest: "sha256:" + strings.Repeat("a", 64)}
+	fixture := doctorV3MaterializedTraceFixture()
+	fixture["promptTokens"], fixture["completionTokens"], fixture["totalTokensUsed"] = float64(11), float64(7), float64(18)
+	fixture["spans"].([]any)[1].(map[string]any)["data"].(map[string]any)["input_value"] = "generated diagnostic input"
+	result := persistedDoctorProbeResult(local, fixture)
+	if result.Status != DoctorPass || result.Probe == nil || !result.Probe.InputOutputValid {
+		t.Fatalf("exact agent prompt did not pass: %#v", result)
 	}
 }
 

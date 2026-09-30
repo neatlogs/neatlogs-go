@@ -320,7 +320,7 @@ func persistedDoctorProbeResultWithDiagnostics(result DoctorV2Result, traceData 
 			outputs: []any{map[string]any{"result": map[string]any{"value": float64(2)}}, "Value: 2"},
 		},
 		"doctor.probe.agent": {
-			inputs:  []any{map[string]any{"prompt": "generated diagnostic input"}, "Prompt: generated diagnostic input"},
+			inputs:  []any{map[string]any{"prompt": "generated diagnostic input"}, "Prompt: generated diagnostic input", "generated diagnostic input"},
 			outputs: []any{map[string]any{"text": "generated diagnostic output"}, "Text: generated diagnostic output"},
 		},
 		"doctor.probe.llm": {
