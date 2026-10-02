@@ -307,6 +307,8 @@ func persistedDoctorProbeResultWithDiagnostics(result DoctorV2Result, traceData 
 	}
 	attributesValid := len(byName) == len(expected)
 	inputOutputValid := true
+	inputOutputMismatches := make([]string, 0)
+	var agentInputDiagnostic map[string]any
 	metadataValid := true
 	// The v3 read path intentionally returns the UI-facing simplified view.
 	// It may preserve normalized JSON or render the same deterministic semantic
@@ -318,7 +320,7 @@ func persistedDoctorProbeResultWithDiagnostics(result DoctorV2Result, traceData 
 			outputs: []any{map[string]any{"result": map[string]any{"value": float64(2)}}, "Value: 2"},
 		},
 		"doctor.probe.agent": {
-			inputs:  []any{map[string]any{"prompt": "generated diagnostic input"}, "Prompt: generated diagnostic input"},
+			inputs:  []any{map[string]any{"prompt": "generated diagnostic input"}, "Prompt: generated diagnostic input", "generated diagnostic input"},
 			outputs: []any{map[string]any{"text": "generated diagnostic output"}, "Text: generated diagnostic output"},
 		},
 		"doctor.probe.llm": {
@@ -333,11 +335,13 @@ func persistedDoctorProbeResultWithDiagnostics(result DoctorV2Result, traceData 
 			outputs: []any{map[string]any{"value": float64(2)}, "Value: 2"},
 		},
 	}
-	for name, kind := range expected {
+	for _, name := range []string{"doctor.probe.root", "doctor.probe.agent", "doctor.probe.llm", "doctor.probe.tool"} {
+		kind := expected[name]
 		match := byName[name]
 		if match == nil {
 			attributesValid = false
 			inputOutputValid = false
+			inputOutputMismatches = append(inputOutputMismatches, name+".span_missing")
 			metadataValid = false
 			continue
 		}
@@ -346,9 +350,45 @@ func persistedDoctorProbeResultWithDiagnostics(result DoctorV2Result, traceData 
 		}
 		data := doctorObject(match["data"])
 		io := expectedIO[name]
-		if !doctorMatchesMaterializedValue(data["input_value"], io.inputs) ||
-			!doctorMatchesMaterializedValue(data["output_value"], io.outputs) {
+		if !doctorMatchesMaterializedValue(data["input_value"], io.inputs) {
 			inputOutputValid = false
+			inputOutputMismatches = append(inputOutputMismatches, name+".input_value")
+			if name == "doctor.probe.agent" {
+				// Report only the shape and comparisons against fixed generated
+				// values. The backend may render arbitrary trace content here.
+				actual := doctorJSONValue(data["input_value"])
+				kind := "other"
+				if _, present := data["input_value"]; !present {
+					kind = "missing"
+				} else {
+					switch actual.(type) {
+					case nil:
+						kind = "null"
+					case string:
+						kind = "string"
+					case map[string]any:
+						kind = "object"
+					case []any:
+						kind = "array"
+					}
+				}
+				containsPrompt := false
+				if text, ok := actual.(string); ok {
+					containsPrompt = strings.Contains(text, "generated diagnostic input")
+				}
+				rootData := doctorObject(doctorObject(byName["doctor.probe.root"])["data"])
+				_, rootPresent := rootData["input_value"]
+				agentInputDiagnostic = map[string]any{
+					"agent_input_kind":                  kind,
+					"agent_input_matches_plain_prompt":  doctorValuesEqual(actual, "generated diagnostic input"),
+					"agent_input_contains_fixed_prompt": containsPrompt,
+					"agent_input_matches_root":          rootPresent && doctorValuesEqual(actual, doctorJSONValue(rootData["input_value"])),
+				}
+			}
+		}
+		if !doctorMatchesMaterializedValue(data["output_value"], io.outputs) {
+			inputOutputValid = false
+			inputOutputMismatches = append(inputOutputMismatches, name+".output_value")
 		}
 		metadata := doctorObject(match["span_metadata"])
 		spanType := strings.ToUpper(strings.ReplaceAll(strings.ReplaceAll(kind, "agent_action", "agent"), "tool_call", "tool"))
@@ -419,6 +459,14 @@ func persistedDoctorProbeResultWithDiagnostics(result DoctorV2Result, traceData 
 			check := failV2(validation.name, validation.passCode+"_FAILED", validation.message, validation.remediation)
 			if validation.name == "probe_finalization" && diagnosticDetails != nil {
 				check.Details = diagnosticDetails
+			}
+			if validation.name == "probe_input_output" {
+				// Only fixed field names, value kinds, and boolean comparisons
+				// leave this check. Never include readback content or credentials.
+				check.Details = map[string]any{"mismatched_fields": inputOutputMismatches}
+				for key, value := range agentInputDiagnostic {
+					check.Details[key] = value
+				}
 			}
 			result.Checks = append(result.Checks, check)
 		}
