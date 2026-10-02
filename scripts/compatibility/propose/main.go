@@ -159,14 +159,15 @@ func validateCandidate(candidate analysis, releases releaseReport, evidence evid
 	if !matchedEvidence || len(candidate.EvidenceRationale) < 20 || len(candidate.EvidenceRationale) > 2000 {
 		return result, nil, errors.New("proposal lacks a cited source path and concise evidence rationale")
 	}
-	if len(candidate.ProposedChanges) == 0 || len(candidate.ProposedChanges) > 2 {
-		return result, nil, errors.New("proposal must change one or two allowlisted SDK source files")
+	if len(candidate.ProposedChanges) == 0 || len(candidate.ProposedChanges) > 8 {
+		return result, nil, errors.New("proposal must contain one to eight bounded source replacements")
 	}
 	modified := make(map[string][]byte)
+	originals := make(map[string][]byte)
 	totalChangeBytes := 0
 	for _, change := range candidate.ProposedChanges {
-		if !allowedPath(candidate.TargetModule, change.Path) || modified[change.Path] != nil {
-			return result, nil, errors.New("proposal contains a duplicate or disallowed source path")
+		if !allowedPath(candidate.TargetModule, change.Path) {
+			return result, nil, errors.New("proposal contains a disallowed source path")
 		}
 		if change.OldText == "" || change.NewText == "" || change.OldText == change.NewText || len(change.OldText) > 8000 || len(change.NewText) > 8000 {
 			return result, nil, errors.New("proposal replacement is empty, unchanged, or too large")
@@ -175,28 +176,37 @@ func validateCandidate(candidate analysis, releases releaseReport, evidence evid
 		if totalChangeBytes > 16000 {
 			return result, nil, errors.New("proposal exceeds the 16 KB total replacement limit")
 		}
-		path := filepath.Join(root, change.Path)
-		file, err := os.Lstat(path)
-		if err != nil || !file.Mode().IsRegular() || file.Mode()&os.ModeSymlink != 0 {
-			return result, nil, fmt.Errorf("proposal source %q is not a regular file", change.Path)
+		current, seen := modified[change.Path]
+		if !seen {
+			if len(modified) >= 2 {
+				return result, nil, errors.New("proposal may change at most two allowlisted SDK source files")
+			}
+			path := filepath.Join(root, change.Path)
+			file, err := os.Lstat(path)
+			if err != nil || !file.Mode().IsRegular() || file.Mode()&os.ModeSymlink != 0 {
+				return result, nil, fmt.Errorf("proposal source %q is not a regular file", change.Path)
+			}
+			current, err = os.ReadFile(path)
+			if err != nil {
+				return result, nil, err
+			}
+			originals[change.Path] = current
+			result.Paths = append(result.Paths, change.Path)
 		}
-		original, err := os.ReadFile(path)
-		if err != nil {
-			return result, nil, err
-		}
-		if bytes.Count(original, []byte(change.OldText)) != 1 {
+		if bytes.Count(current, []byte(change.OldText)) != 1 {
 			return result, nil, fmt.Errorf("oldText must occur exactly once in %s", change.Path)
 		}
-		patched := bytes.Replace(original, []byte(change.OldText), []byte(change.NewText), 1)
+		modified[change.Path] = bytes.Replace(current, []byte(change.OldText), []byte(change.NewText), 1)
+	}
+	for path, patched := range modified {
 		formatted, err := format.Source(patched)
 		if err != nil {
-			return result, nil, fmt.Errorf("proposal does not parse as Go in %s: %w", change.Path, err)
+			return result, nil, fmt.Errorf("proposal does not parse as Go in %s: %w", path, err)
 		}
-		if bytes.Equal(original, formatted) || len(formatted) > len(original)+12000 {
-			return result, nil, fmt.Errorf("proposal has no bounded source change in %s", change.Path)
+		if bytes.Equal(originals[path], formatted) || len(formatted) > len(originals[path])+12000 {
+			return result, nil, fmt.Errorf("proposal has no bounded source change in %s", path)
 		}
-		modified[change.Path] = formatted
-		result.Paths = append(result.Paths, change.Path)
+		modified[path] = formatted
 	}
 	result.Status = "proposed"
 	result.Reason = "Allowlisted SDK source patch awaits isolated adapter tests"

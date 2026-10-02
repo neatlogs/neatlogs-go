@@ -65,6 +65,53 @@ func TestCandidateAlreadyCoveredSkipsWithoutOverwriting(t *testing.T) {
 	}
 }
 
+func TestValidateCandidateAppliesFourBoundedEditsToOneFile(t *testing.T) {
+	candidate, releases, evidence, root := fixtureCandidate(t)
+	path := candidate.ProposedChanges[0].Path
+	content := "package genai\nfunc first() int { return 1 }\nfunc second() int { return 2 }\nfunc third() int { return 3 }\nfunc fourth() int { return 4 }\n"
+	if err := os.WriteFile(filepath.Join(root, path), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	candidate.ProposedChanges = []candidateChange{
+		{Path: path, OldText: "return 1", NewText: "return 11"},
+		{Path: path, OldText: "return 2", NewText: "return 22"},
+		{Path: path, OldText: "return 3", NewText: "return 33"},
+		{Path: path, OldText: "return 4", NewText: "return 44"},
+	}
+	proposal, files, err := validateCandidate(candidate, releases, evidence, nil, root)
+	if err != nil || proposal.Status != "proposed" || len(proposal.Paths) != 1 || proposal.Paths[0] != path {
+		t.Fatalf("four-hunk proposal = %#v, %v", proposal, err)
+	}
+	for _, expected := range []string{"return 11", "return 22", "return 33", "return 44"} {
+		if !strings.Contains(string(files[path]), expected) {
+			t.Fatalf("patched source missing %q: %s", expected, files[path])
+		}
+	}
+	for len(candidate.ProposedChanges) <= 8 {
+		candidate.ProposedChanges = append(candidate.ProposedChanges, candidate.ProposedChanges[0])
+	}
+	if _, _, err := validateCandidate(candidate, releases, evidence, nil, root); err == nil || !strings.Contains(err.Error(), "one to eight") {
+		t.Fatalf("more than eight hunks should be rejected: %v", err)
+	}
+}
+
+func TestValidateCandidateRejectsThirdSourceFile(t *testing.T) {
+	candidate, releases, evidence, root := fixtureCandidate(t)
+	for _, path := range []string{"contrib/adk/adk.go", "contrib/adk/run.go"} {
+		full := filepath.Join(root, path)
+		if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte("package adk\nfunc value() int { return 1 }\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		candidate.ProposedChanges = append(candidate.ProposedChanges, candidateChange{Path: path, OldText: "return 1", NewText: "return 2"})
+	}
+	if _, _, err := validateCandidate(candidate, releases, evidence, nil, root); err == nil || !strings.Contains(err.Error(), "at most two") {
+		t.Fatalf("third source file should be rejected: %v", err)
+	}
+}
+
 func TestValidateRetestRequiresBothVersionSuitesPass(t *testing.T) {
 	proposal := proposalReport{Status: "proposed", TargetModule: "example.com/sdk", TargetVersion: "v2"}
 	before := verificationReport{}

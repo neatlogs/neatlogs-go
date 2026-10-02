@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -32,7 +33,89 @@ func TestSlackReleaseMessage(t *testing.T) {
 		upstreamIssue{Title: "empty tool arguments disappear", URL: "https://github.com/example/sdk/issues/3"},
 		alertContext{ReviewIssueURL: "https://example.test/issues/7", RunURL: "https://example.test/run"},
 	)
-	for _, expected := range []string{"1 upstream release", "example.com/sdk v1 → v2", "Go ≥1.26.0", "no confirmed regression", "blocked", "Gemini advisory risk", "high", "No SDK fix proposal", "empty tool arguments disappear", "github.com/example/sdk/issues/3", "https://example.test/issues/7", "https://example.test/run"} {
+	for _, expected := range []string{"1 upstream release", "example.com/sdk v1 → v2", "Go ≥1.26.0", "verification incomplete: toolchain blocked; no regression established", "blocked", "Gemini advisory risk", "high", "No SDK fix proposal", "empty tool arguments disappear", "github.com/example/sdk/issues/3", "https://example.test/issues/7", "https://example.test/run"} {
+		if !strings.Contains(message, expected) {
+			t.Fatalf("message %q does not contain %q", message, expected)
+		}
+	}
+}
+
+func verificationWithStatuses(statuses ...string) verificationReport {
+	result := verificationReport{}
+	for _, status := range statuses {
+		result.Modules = append(result.Modules, struct {
+			Module string `json:"module"`
+			Latest string `json:"latest"`
+			Status string `json:"status"`
+		}{Module: "example.com/sdk", Latest: "v2", Status: status})
+	}
+	return result
+}
+
+func TestSlackSendsOnlyActionableResults(t *testing.T) {
+	releases := releaseReport{Changes: []releaseChange{{Module: "example.com/sdk", Latest: "v2"}}}
+	for _, tc := range []struct {
+		name         string
+		status       string
+		verification verificationReport
+		analysis     analysisReport
+		proposal     proposalReport
+		alert        alertContext
+		want         bool
+	}{
+		{name: "routine pass", status: "success", verification: verificationWithStatuses("pass"), proposal: proposalReport{Status: "skipped"}},
+		{name: "unverified rejected suggestion", status: "success", verification: verificationWithStatuses("pass"), analysis: analysisReport{RiskLevel: "high"}, proposal: proposalReport{Status: "rejected", Reason: "cosmetic patch"}},
+		{name: "blocked release with rejected suggestion", status: "success", verification: verificationWithStatuses("blocked", "pass", "pass"), proposal: proposalReport{Status: "rejected"}, want: true},
+		{name: "baseline-pass latest-fail", status: "success", verification: verificationWithStatuses("fail"), want: true},
+		{name: "not tested", status: "success", verification: verificationWithStatuses("not_tested"), want: true},
+		{name: "missing verification", status: "success", want: true},
+		{name: "generated PR", status: "success", verification: verificationWithStatuses("pass"), alert: alertContext{FixPRURL: "https://example.test/pr/8"}, want: true},
+		{name: "PR creation failed", status: "success", verification: verificationWithStatuses("pass"), alert: alertContext{FixPROutcome: "failure"}, want: true},
+		{name: "patch validation tooling failed", status: "success", verification: verificationWithStatuses("pass"), alert: alertContext{ProposalOutcome: "failure"}, want: true},
+		{name: "Gemini request failed", status: "success", verification: verificationWithStatuses("pass"), analysis: analysisReport{Skipped: true, Reason: "Gemini request failed; inspect the workflow run"}, want: true},
+		{name: "Gemini step failed", status: "success", verification: verificationWithStatuses("pass"), alert: alertContext{GeminiOutcome: "failure"}, want: true},
+		{name: "covered release", status: "success", verification: verificationWithStatuses("pass"), analysis: analysisReport{Skipped: true, Reason: "No uncovered release is testable with this runner"}},
+		{name: "monitor failed", status: "failure", verification: verificationWithStatuses("pass"), want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldSendSlack(tc.status, releases, tc.verification, tc.analysis, tc.proposal, tc.alert); got != tc.want {
+				t.Fatalf("shouldSendSlack() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSlackNamesGeminiStepFailure(t *testing.T) {
+	message := slackMessage("success", releaseReport{}, evidenceReport{}, verificationWithStatuses("pass"), analysisReport{}, proposalReport{}, upstreamIssue{}, alertContext{GeminiOutcome: "failure"})
+	if !strings.Contains(message, "Gemini advisory analysis failed") {
+		t.Fatalf("Gemini failure missing from Slack message: %q", message)
+	}
+}
+
+func TestSlackOct2GoResultLeadsWithToolchainBlock(t *testing.T) {
+	var releases releaseReport
+	var evidence evidenceReport
+	var verification verificationReport
+	for _, item := range []struct {
+		text  string
+		value any
+	}{
+		{`{"changes":[{"module":"github.com/a2aproject/a2a-go/v2","previouslyAnalyzed":"v2.3.1","latest":"v2.6.0"},{"module":"google.golang.org/adk","previouslyAnalyzed":"v1.4.0","latest":"v1.7.0"},{"module":"google.golang.org/genai","previouslyAnalyzed":"v1.61.0","latest":"v1.72.0"}]}`, &releases},
+		{`{"modules":[{"module":"github.com/a2aproject/a2a-go/v2","toolchainRequirement":"github.com/a2aproject/a2a-go/v2@v2.6.0 requires go >= 1.26.0 (running go 1.25.0)"}]}`, &evidence},
+		{`{"modules":[{"module":"github.com/a2aproject/a2a-go/v2","latest":"v2.6.0","status":"blocked"},{"module":"google.golang.org/adk","latest":"v1.7.0","status":"pass"},{"module":"google.golang.org/genai","latest":"v1.72.0","status":"pass"}]}`, &verification},
+	} {
+		if err := json.Unmarshal([]byte(item.text), item.value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	analysis := analysisReport{RiskLevel: "high", ScopeModule: "google.golang.org/adk"}
+	proposal := proposalReport{Status: "rejected", Reason: "proposal must change one or two allowlisted SDK source files"}
+	alert := alertContext{ReviewIssueURL: "https://github.com/neatlogs/neatlogs-go/issues/29", RunURL: "https://github.com/neatlogs/neatlogs-go/actions/runs/36974183035"}
+	if !shouldSendSlack("success", releases, verification, analysis, proposal, alert) {
+		t.Fatal("toolchain block should notify even when the Gemini suggestion is unverified")
+	}
+	message := slackMessage("success", releases, evidence, verification, analysis, proposal, upstreamIssue{}, alert)
+	for _, expected := range []string{"verification incomplete: toolchain blocked; no regression established", "a2a-go/v2 requires Go ≥1.26.0", "google.golang.org/adk v1.7.0: *pass*", "google.golang.org/genai v1.72.0: *pass*", "fix rejected by validation", "issues/29", "actions/runs/36974183035"} {
 		if !strings.Contains(message, expected) {
 			t.Fatalf("message %q does not contain %q", message, expected)
 		}
