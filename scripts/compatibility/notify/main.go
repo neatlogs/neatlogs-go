@@ -24,6 +24,7 @@ type releaseReport struct {
 type analysisReport struct {
 	RiskLevel   string `json:"riskLevel"`
 	Skipped     bool   `json:"skipped"`
+	Reason      string `json:"reason"`
 	ScopeModule string `json:"scopeModule"`
 }
 
@@ -61,6 +62,7 @@ type alertContext struct {
 	PatchJobStatus      string
 	ProposalOutcome     string
 	RetestOutcome       string
+	GeminiOutcome       string
 	IssueOutcome        string
 	FixIssueOutcome     string
 	RunURL              string
@@ -114,6 +116,31 @@ func conciseSlackText(value string) string {
 	return value
 }
 
+// A newly published version is recorded in the issue and artifact. Slack is
+// reserved for an outcome that requires a person to act or investigate.
+func shouldSendSlack(status string, report releaseReport, verification verificationReport, analysis analysisReport, proposal proposalReport, alert alertContext) bool {
+	if status != "success" || alert.IssueOutcome == "failure" || alert.FixIssueOutcome == "failure" || alert.GeminiOutcome == "failure" ||
+		alert.PatchJobStatus == "failure" || alert.ProposalOutcome == "failure" || alert.RetestOutcome == "failure" ||
+		alert.PublishCheckOutcome == "failure" || alert.FixPROutcome == "failure" {
+		return true
+	}
+	if len(report.Changes) == 0 {
+		return false
+	}
+	if len(verification.Modules) == 0 {
+		return true
+	}
+	for _, module := range verification.Modules {
+		if module.Status != "pass" {
+			return true
+		}
+	}
+	if alert.FixPRURL != "" || proposal.Status == "validated" {
+		return true
+	}
+	return analysis.Skipped && analysis.Reason != "No uncovered release is testable with this runner"
+}
+
 func slackMessage(status string, report releaseReport, evidence evidenceReport, verification verificationReport, analysis analysisReport, proposal proposalReport, issue upstreamIssue, alert alertContext) string {
 	link := ""
 	if alert.RunURL != "" {
@@ -147,7 +174,9 @@ func slackMessage(status string, report releaseReport, evidence evidenceReport, 
 		remaining = fmt.Sprintf(", +%d more", len(report.Changes)-limit)
 	}
 	risk := ""
-	if analysis.RiskLevel != "" {
+	if alert.GeminiOutcome == "failure" {
+		risk = " Gemini advisory analysis failed; inspect the run."
+	} else if analysis.RiskLevel != "" {
 		scope := ""
 		if analysis.ScopeModule != "" {
 			scope = " for " + conciseSlackText(analysis.ScopeModule)
@@ -164,12 +193,18 @@ func slackMessage(status string, report releaseReport, evidence evidenceReport, 
 	}
 	verificationItems := make([]string, 0, len(verification.Modules))
 	confirmedFailure := false
+	blocked := false
+	notTested := false
 	for index, item := range verification.Modules {
 		if index < 8 {
 			verificationItems = append(verificationItems, fmt.Sprintf("%s %s: *%s*", item.Module, item.Latest, item.Status))
 		}
 		if item.Status == "fail" {
 			confirmedFailure = true
+		} else if item.Status == "blocked" {
+			blocked = true
+		} else if item.Status != "pass" {
+			notTested = true
 		}
 	}
 	verificationText := " Mapped adapter tests unavailable; inspect the run."
@@ -180,9 +215,16 @@ func slackMessage(status string, report releaseReport, evidence evidenceReport, 
 		}
 		verificationText += "."
 	}
-	heading := ":warning: *Go SDK release review needed; no confirmed regression:*"
-	if confirmedFailure {
+	heading := ":warning: *Go SDK compatibility automation needs attention:*"
+	switch {
+	case confirmedFailure:
 		heading = ":rotating_light: *Go SDK regression in mapped adapter tests (baseline passed, latest failed):*"
+	case blocked && toolchain != "":
+		heading = ":warning: *Go SDK verification incomplete: toolchain blocked; no regression established:*"
+	case blocked || notTested || len(verification.Modules) == 0:
+		heading = ":warning: *Go SDK verification incomplete; no regression established:*"
+	case alert.FixPRURL != "":
+		heading = ":large_green_circle: *Go SDK fix PR opened for human review:*"
 	}
 	issueText := ""
 	if issue.URL != "" {
@@ -270,8 +312,13 @@ func main() {
 		FixPROutcome: os.Getenv("COMPAT_FIX_PR_OUTCOME"), PublishCheckOutcome: os.Getenv("COMPAT_PUBLISH_CHECK_OUTCOME"),
 		PatchJobStatus: os.Getenv("COMPAT_PATCH_JOB_STATUS"), IssueOutcome: os.Getenv("COMPAT_ISSUE_OUTCOME"),
 		ProposalOutcome: os.Getenv("COMPAT_PROPOSAL_OUTCOME"), RetestOutcome: os.Getenv("COMPAT_RETEST_OUTCOME"),
+		GeminiOutcome:   os.Getenv("COMPAT_GEMINI_OUTCOME"),
 		FixIssueOutcome: os.Getenv("COMPAT_FIX_ISSUE_OUTCOME"),
 		RunURL:          workflowURL(), FailureStage: failedStage(),
+	}
+	if !shouldSendSlack(status, report, verification, analysis, proposal, alert) {
+		fmt.Println("Slack compatibility alert skipped: no actionable outcome; results are in the issue and run artifact")
+		return
 	}
 	payload, err := json.Marshal(map[string]string{"text": slackMessage(status, report, evidence, verification, analysis, proposal, issue, alert)})
 	if err != nil {
