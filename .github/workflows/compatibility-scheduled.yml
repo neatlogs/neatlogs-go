@@ -393,6 +393,15 @@ jobs:
               const tested = fs.readFileSync(`compatibility-validation/${path}`);
               if (!local.equals(tested)) throw new Error(`Validated source differs from publisher patch: ${path}`);
             }
+            const releaseReport = JSON.parse(fs.readFileSync('compatibility-discovery/compatibility-release-report.json', 'utf8'));
+            const release = releaseReport.changes.find((item) => item.module === proposal.targetModule && item.latest === proposal.targetVersion);
+            const lockPath = '.compatibility/versions.lock.json';
+            const lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+            if (lock.schemaVersion !== 1 || lock.ecosystem !== 'go' || !lock.packages || typeof lock.packages !== 'object') throw new Error('Analyzed Go version lock is invalid; no fix PR opened');
+            if (!release || !Object.hasOwn(lock.packages, proposal.targetModule) || lock.packages[proposal.targetModule] !== release.previouslyAnalyzed) throw new Error('Version lock no longer matches the analyzed baseline; no fix PR opened');
+            lock.packages[proposal.targetModule] = proposal.targetVersion;
+            const expectedFiles = new Map(proposal.paths.map((path) => [path, fs.readFileSync(path)]));
+            expectedFiles.set(lockPath, Buffer.from(JSON.stringify(lock, null, 2) + '\n'));
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const hash = crypto.createHash('sha256').update(`${proposal.targetModule}@${proposal.targetVersion}`).digest('hex').slice(0, 12);
@@ -403,7 +412,7 @@ jobs:
             if (pulls.length && !openPull) throw new Error('A reviewer closed or merged the earlier auto-fix PR; refusing to reopen it');
             const recovery = openPull ? 'review the existing PR and branch' : 'review and remove the orphan branch before retrying';
             const { data: base } = await github.rest.git.getCommit({ owner, repo, commit_sha: context.sha });
-            const { data: expectedTree } = await github.rest.git.createTree({ owner, repo, base_tree: base.tree.sha, tree: proposal.paths.map((path) => ({ path, mode: '100644', type: 'blob', content: fs.readFileSync(path, 'utf8') })) });
+            const { data: expectedTree } = await github.rest.git.createTree({ owner, repo, base_tree: base.tree.sha, tree: [...expectedFiles].map(([path, content]) => ({ path, mode: '100644', type: 'blob', content: content.toString('utf8') })) });
             let existingRef;
             try {
               ({ data: existingRef } = await github.rest.git.getRef({ owner, repo, ref: `heads/${branch}` }));
@@ -416,10 +425,10 @@ jobs:
               if (existingCommit.parents[0].sha !== context.sha) throw new Error(`Generated branch ${branch} is based on an older default-branch commit; ${recovery}. No new PR was opened.`);
               if (existingCommit.tree.sha !== expectedTree.sha) throw new Error(`Generated branch ${branch} differs from the current validated patch tree; ${recovery}. No new PR was opened.`);
               const { data: comparison } = await github.rest.repos.compareCommits({ owner, repo, base: existingCommit.parents[0].sha, head: existingRef.object.sha });
-              if (comparison.files.length !== proposal.paths.length || comparison.files.some((file) => !proposal.paths.includes(file.filename))) throw new Error(`Generated branch ${branch} contains different source paths; ${recovery}. No new PR was opened.`);
-              for (const path of proposal.paths) {
+              if (comparison.files.length !== expectedFiles.size || comparison.files.some((file) => !expectedFiles.has(file.filename))) throw new Error(`Generated branch ${branch} contains different source paths; ${recovery}. No new PR was opened.`);
+              for (const [path, expected] of expectedFiles) {
                 const { data: remote } = await github.rest.repos.getContent({ owner, repo, path, ref: branch });
-                if (remote.type !== 'file' || !Buffer.from(remote.content, 'base64').equals(fs.readFileSync(path))) throw new Error(`Generated branch ${branch} differs from validated source at ${path}; ${recovery}. No new PR was opened.`);
+                if (remote.type !== 'file' || !Buffer.from(remote.content, 'base64').equals(expected)) throw new Error(`Generated branch ${branch} differs from validated source at ${path}; ${recovery}. No new PR was opened.`);
               }
             } else {
               if (openPull) throw new Error('Existing draft PR branch is missing; refusing to mark it ready');
@@ -437,7 +446,7 @@ jobs:
             const validation = proposal.validation === 'test_regression_resolved'
               ? 'A baseline-pass/latest-fail adapter test was resolved by this patch.'
               : 'Mapped adapter suites passed before and after this patch; the suspected behavioral regression has not been reproduced. Human review and a focused regression test are required.';
-            const body = `Gemini-proposed SDK source fix for ${proposal.targetModule}@${proposal.targetVersion}. Review the code and evidence before merging; this workflow does not approve or merge PRs.\n\nEvidence: ${proposal.evidenceReference}\n\nRationale: ${proposal.evidenceRationale}\n\nValidation: ${validation}\n\nReview issue: ${process.env.REVIEW_ISSUE_URL || 'unavailable'}\nWorkflow and artifacts: ${runURL}`;
+            const body = `Gemini-proposed SDK source fix for ${proposal.targetModule}@${proposal.targetVersion}. Review the code and evidence before merging; this workflow does not approve or merge PRs. This PR also advances the analyzed version lock for only this module from ${release.previouslyAnalyzed} to ${proposal.targetVersion}.\n\nEvidence: ${proposal.evidenceReference}\n\nRationale: ${proposal.evidenceRationale}\n\nValidation: ${validation}\n\nReview issue: ${process.env.REVIEW_ISSUE_URL || 'unavailable'}\nWorkflow and artifacts: ${runURL}`;
             const { data: pull } = await github.rest.pulls.create({ owner, repo, head: branch, base: context.payload.repository.default_branch, title: `[compatibility] Proposed Go SDK fix for ${proposal.targetModule}@${proposal.targetVersion}`, body, draft: false });
             core.setOutput('pr_url', pull.html_url);
       - name: Add auto-fix status to review issue
