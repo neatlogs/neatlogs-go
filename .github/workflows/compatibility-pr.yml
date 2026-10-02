@@ -10,8 +10,7 @@ on:
       - "go.sum"
       - "go.work"
       - "go.work.sum"
-      - "contrib/**/go.mod"
-      - "contrib/**/go.sum"
+      - "contrib/**"
 
 permissions:
   contents: read
