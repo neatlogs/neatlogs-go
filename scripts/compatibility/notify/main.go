@@ -55,18 +55,19 @@ type upstreamIssue struct {
 }
 
 type alertContext struct {
-	ReviewIssueURL      string
-	FixPRURL            string
-	FixPROutcome        string
-	PublishCheckOutcome string
-	PatchJobStatus      string
-	ProposalOutcome     string
-	RetestOutcome       string
-	GeminiOutcome       string
-	IssueOutcome        string
-	FixIssueOutcome     string
-	RunURL              string
-	FailureStage        string
+	ReviewIssueURL          string
+	UnchangedToolchainBlock bool
+	FixPRURL                string
+	FixPROutcome            string
+	PublishCheckOutcome     string
+	PatchJobStatus          string
+	ProposalOutcome         string
+	RetestOutcome           string
+	GeminiOutcome           string
+	IssueOutcome            string
+	FixIssueOutcome         string
+	RunURL                  string
+	FailureStage            string
 }
 
 func optionalJSON(path string, value any) {
@@ -118,7 +119,7 @@ func conciseSlackText(value string) string {
 
 // A newly published version is recorded in the issue and artifact. Slack is
 // reserved for an outcome that requires a person to act or investigate.
-func shouldSendSlack(status string, report releaseReport, verification verificationReport, analysis analysisReport, proposal proposalReport, alert alertContext) bool {
+func shouldSendSlack(status string, report releaseReport, evidence evidenceReport, verification verificationReport, analysis analysisReport, proposal proposalReport, alert alertContext) bool {
 	if status != "success" || alert.IssueOutcome == "failure" || alert.FixIssueOutcome == "failure" || alert.GeminiOutcome == "failure" ||
 		alert.PatchJobStatus == "failure" || alert.ProposalOutcome == "failure" || alert.RetestOutcome == "failure" ||
 		alert.PublishCheckOutcome == "failure" || alert.FixPROutcome == "failure" {
@@ -130,13 +131,35 @@ func shouldSendSlack(status string, report releaseReport, verification verificat
 	if len(verification.Modules) == 0 {
 		return true
 	}
+	if alert.FixPRURL != "" || proposal.Status == "validated" {
+		return true
+	}
+	// The review issue retains unchanged toolchain-only findings. A repeated
+	// schedule should not page Slack again for the same blocked release.
+	if alert.UnchangedToolchainBlock {
+		toolchainBlocked := make(map[string]bool)
+		for _, module := range evidence.Modules {
+			toolchainBlocked[module.Module] = module.ToolchainRequirement != ""
+		}
+		unchangedToolchainOnly := false
+		for _, module := range verification.Modules {
+			if module.Status == "blocked" && toolchainBlocked[module.Module] {
+				unchangedToolchainOnly = true
+				continue
+			}
+			if module.Status != "pass" {
+				unchangedToolchainOnly = false
+				break
+			}
+		}
+		if unchangedToolchainOnly {
+			return false
+		}
+	}
 	for _, module := range verification.Modules {
 		if module.Status != "pass" {
 			return true
 		}
-	}
-	if alert.FixPRURL != "" || proposal.Status == "validated" {
-		return true
 	}
 	return analysis.Skipped && analysis.Reason != "No uncovered release is testable with this runner"
 }
@@ -308,7 +331,7 @@ func main() {
 	}
 	optionalJSON(issuePath, &issue)
 	alert := alertContext{
-		ReviewIssueURL: os.Getenv("COMPAT_REVIEW_ISSUE_URL"), FixPRURL: os.Getenv("COMPAT_FIX_PR_URL"),
+		ReviewIssueURL: os.Getenv("COMPAT_REVIEW_ISSUE_URL"), UnchangedToolchainBlock: os.Getenv("COMPAT_UNCHANGED_TOOLCHAIN_BLOCK") == "true", FixPRURL: os.Getenv("COMPAT_FIX_PR_URL"),
 		FixPROutcome: os.Getenv("COMPAT_FIX_PR_OUTCOME"), PublishCheckOutcome: os.Getenv("COMPAT_PUBLISH_CHECK_OUTCOME"),
 		PatchJobStatus: os.Getenv("COMPAT_PATCH_JOB_STATUS"), IssueOutcome: os.Getenv("COMPAT_ISSUE_OUTCOME"),
 		ProposalOutcome: os.Getenv("COMPAT_PROPOSAL_OUTCOME"), RetestOutcome: os.Getenv("COMPAT_RETEST_OUTCOME"),
@@ -316,7 +339,7 @@ func main() {
 		FixIssueOutcome: os.Getenv("COMPAT_FIX_ISSUE_OUTCOME"),
 		RunURL:          workflowURL(), FailureStage: failedStage(),
 	}
-	if !shouldSendSlack(status, report, verification, analysis, proposal, alert) {
+	if !shouldSendSlack(status, report, evidence, verification, analysis, proposal, alert) {
 		fmt.Println("Slack compatibility alert skipped: no actionable outcome; results are in the issue and run artifact")
 		return
 	}

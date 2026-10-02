@@ -52,11 +52,19 @@ func verificationWithStatuses(statuses ...string) verificationReport {
 	return result
 }
 
+func evidenceWithToolchainBlock() evidenceReport {
+	return evidenceReport{Modules: []struct {
+		Module               string `json:"module"`
+		ToolchainRequirement string `json:"toolchainRequirement"`
+	}{{Module: "example.com/sdk", ToolchainRequirement: "requires go >= 1.26.0"}}}
+}
+
 func TestSlackSendsOnlyActionableResults(t *testing.T) {
 	releases := releaseReport{Changes: []releaseChange{{Module: "example.com/sdk", Latest: "v2"}}}
 	for _, tc := range []struct {
 		name         string
 		status       string
+		evidence     evidenceReport
 		verification verificationReport
 		analysis     analysisReport
 		proposal     proposalReport
@@ -66,6 +74,13 @@ func TestSlackSendsOnlyActionableResults(t *testing.T) {
 		{name: "routine pass", status: "success", verification: verificationWithStatuses("pass"), proposal: proposalReport{Status: "skipped"}},
 		{name: "unverified rejected suggestion", status: "success", verification: verificationWithStatuses("pass"), analysis: analysisReport{RiskLevel: "high"}, proposal: proposalReport{Status: "rejected", Reason: "cosmetic patch"}},
 		{name: "blocked release with rejected suggestion", status: "success", verification: verificationWithStatuses("blocked", "pass", "pass"), proposal: proposalReport{Status: "rejected"}, want: true},
+		{name: "unchanged toolchain blocker", status: "success", evidence: evidenceWithToolchainBlock(), verification: verificationWithStatuses("blocked", "pass", "pass"), proposal: proposalReport{Status: "rejected"}, alert: alertContext{UnchangedToolchainBlock: true}},
+		{name: "changed toolchain blocker", status: "success", verification: verificationWithStatuses("blocked", "pass", "pass"), alert: alertContext{UnchangedToolchainBlock: false}, want: true},
+		{name: "new PR despite unchanged toolchain blocker", status: "success", evidence: evidenceWithToolchainBlock(), verification: verificationWithStatuses("blocked", "pass", "pass"), alert: alertContext{UnchangedToolchainBlock: true, FixPRURL: "https://example.test/pr/8"}, want: true},
+		{name: "workflow failure despite unchanged toolchain blocker", status: "failure", evidence: evidenceWithToolchainBlock(), verification: verificationWithStatuses("blocked", "pass", "pass"), alert: alertContext{UnchangedToolchainBlock: true}, want: true},
+		{name: "automation failure despite unchanged toolchain blocker", status: "success", evidence: evidenceWithToolchainBlock(), verification: verificationWithStatuses("blocked", "pass", "pass"), alert: alertContext{UnchangedToolchainBlock: true, FixIssueOutcome: "failure"}, want: true},
+		{name: "non-toolchain block cannot be suppressed", status: "success", verification: verificationWithStatuses("blocked"), alert: alertContext{UnchangedToolchainBlock: true}, want: true},
+		{name: "regression cannot be suppressed", status: "success", evidence: evidenceWithToolchainBlock(), verification: verificationWithStatuses("fail"), alert: alertContext{UnchangedToolchainBlock: true}, want: true},
 		{name: "baseline-pass latest-fail", status: "success", verification: verificationWithStatuses("fail"), want: true},
 		{name: "not tested", status: "success", verification: verificationWithStatuses("not_tested"), want: true},
 		{name: "missing verification", status: "success", want: true},
@@ -78,7 +93,7 @@ func TestSlackSendsOnlyActionableResults(t *testing.T) {
 		{name: "monitor failed", status: "failure", verification: verificationWithStatuses("pass"), want: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := shouldSendSlack(tc.status, releases, tc.verification, tc.analysis, tc.proposal, tc.alert); got != tc.want {
+			if got := shouldSendSlack(tc.status, releases, tc.evidence, tc.verification, tc.analysis, tc.proposal, tc.alert); got != tc.want {
 				t.Fatalf("shouldSendSlack() = %v, want %v", got, tc.want)
 			}
 		})
@@ -111,7 +126,7 @@ func TestSlackOct2GoResultLeadsWithToolchainBlock(t *testing.T) {
 	analysis := analysisReport{RiskLevel: "high", ScopeModule: "google.golang.org/adk"}
 	proposal := proposalReport{Status: "rejected", Reason: "proposal must change one or two allowlisted SDK source files"}
 	alert := alertContext{ReviewIssueURL: "https://github.com/neatlogs/neatlogs-go/issues/29", RunURL: "https://github.com/neatlogs/neatlogs-go/actions/runs/36974183035"}
-	if !shouldSendSlack("success", releases, verification, analysis, proposal, alert) {
+	if !shouldSendSlack("success", releases, evidence, verification, analysis, proposal, alert) {
 		t.Fatal("toolchain block should notify even when the Gemini suggestion is unverified")
 	}
 	message := slackMessage("success", releases, evidence, verification, analysis, proposal, upstreamIssue{}, alert)
