@@ -157,10 +157,10 @@ func (c *responseCapture) addToolCall(span trace.Span, call *genai.FunctionCall)
 	}
 	key := strings.TrimSpace(call.ID)
 	if key == "" {
-		key = strings.TrimSpace(call.Name) + ":" + boundedJSON(call.Args)
+		key = strings.TrimSpace(call.Name) + ":" + toolCallArgumentsJSON(call.Args)
 	}
 	if index, exists := c.toolCallKeys[key]; exists {
-		args := boundedJSON(call.Args)
+		args := toolCallArgumentsJSON(call.Args)
 		span.SetAttributes(attribute.String(fmt.Sprintf("%s%d.arguments", toolCallPrefix, index), args))
 		c.toolCalls[index] = call.Name + "(" + args + ")"
 		return
@@ -171,7 +171,7 @@ func (c *responseCapture) addToolCall(span trace.Span, call *genai.FunctionCall)
 	}
 	index := len(c.toolCalls)
 	c.toolCallKeys[key] = index
-	args := boundedJSON(call.Args)
+	args := toolCallArgumentsJSON(call.Args)
 	span.SetAttributes(
 		attribute.String(fmt.Sprintf("%s%d.name", toolCallPrefix, index), call.Name),
 		attribute.String(fmt.Sprintf("%s%d.arguments", toolCallPrefix, index), args),
@@ -328,6 +328,13 @@ func mustJSON(v any) string {
 		return `{"neatlogs_serialization_error":true}`
 	}
 	return string(b)
+}
+
+func toolCallArgumentsJSON(args map[string]any) string {
+	if args == nil {
+		return `{}`
+	}
+	return boundedJSON(args)
 }
 
 func boundedJSON(v any) string {
