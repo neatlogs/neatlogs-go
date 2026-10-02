@@ -74,6 +74,7 @@ func (e *normalizingExporter) ExportSpans(ctx context.Context, spans []trace.Rea
 		}
 		stub := tracetest.SpanStubFromReadOnlySpan(s)
 		stub.Attributes = e.mapper.Normalize(stub.Attributes)
+		stub.Attributes = computeOperationalMetrics(stub, stub.Attributes)
 		stubs = append(stubs, stub)
 		if err := ctx.Err(); err != nil {
 			e.discardAndRecord(spans, nil)
