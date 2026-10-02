@@ -470,6 +470,71 @@ func TestDoctorProbeRejectsWrongMaterializedInputOutput(t *testing.T) {
 	if result.Status != DoctorFail || result.Probe == nil || result.Probe.InputOutputValid || result.FirstFailure == nil || *result.FirstFailure != "INPUT_OUTPUT_VALID_FAILED" {
 		t.Fatalf("wrong materialized output passed: %#v", result)
 	}
+	for _, check := range result.Checks {
+		if check.Name != "probe_input_output" {
+			continue
+		}
+		fields, ok := check.Details["mismatched_fields"].([]string)
+		if !ok || !reflect.DeepEqual(fields, []string{"doctor.probe.llm.output_value"}) {
+			t.Fatalf("mismatch details = %#v", check.Details)
+		}
+		encoded, err := json.Marshal(result)
+		if err != nil || strings.Contains(string(encoded), "wrong output") {
+			t.Fatalf("Doctor result exposed readback payload: %s, %v", encoded, err)
+		}
+		return
+	}
+	t.Fatal("probe_input_output check missing")
+}
+
+func TestDoctorProbeDiagnosesAgentInputWithoutExposingReadback(t *testing.T) {
+	root := "2222222222222222"
+	for _, tc := range []struct {
+		name, value, kind            string
+		plain, contains, matchesRoot bool
+	}{
+		{"enriched content", "private payload: generated diagnostic input", "string", false, true, false},
+		{"unrelated content", "private payload", "string", false, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			local := newDoctorV2Result("local")
+			local.Capture = &DoctorV2Capture{TraceID: "11111111111111111111111111111111", RootSpanID: &root, SpanCount: 4, SemanticDigest: "sha256:" + strings.Repeat("a", 64)}
+			fixture := doctorV3MaterializedTraceFixture()
+			fixture["spans"].([]any)[1].(map[string]any)["data"].(map[string]any)["input_value"] = tc.value
+			result := persistedDoctorProbeResult(local, fixture)
+			if result.Status != DoctorFail || result.FirstFailure == nil || *result.FirstFailure != "INPUT_OUTPUT_VALID_FAILED" {
+				t.Fatalf("unexpected result: %#v", result)
+			}
+			for _, check := range result.Checks {
+				if check.Name != "probe_input_output" {
+					continue
+				}
+				if check.Details["agent_input_kind"] != tc.kind || check.Details["agent_input_matches_plain_prompt"] != tc.plain ||
+					check.Details["agent_input_contains_fixed_prompt"] != tc.contains || check.Details["agent_input_matches_root"] != tc.matchesRoot {
+					t.Fatalf("unexpected diagnostic: %#v", check.Details)
+				}
+				encoded, err := json.Marshal(result)
+				if err != nil || strings.Contains(string(encoded), tc.value) {
+					t.Fatalf("Doctor result exposed readback payload: %s, %v", encoded, err)
+				}
+				return
+			}
+			t.Fatal("probe_input_output check missing")
+		})
+	}
+}
+
+func TestDoctorProbeAcceptsExactPlainAgentInput(t *testing.T) {
+	root := "2222222222222222"
+	local := newDoctorV2Result("local")
+	local.Capture = &DoctorV2Capture{TraceID: "11111111111111111111111111111111", RootSpanID: &root, SpanCount: 4, SemanticDigest: "sha256:" + strings.Repeat("a", 64)}
+	fixture := doctorV3MaterializedTraceFixture()
+	fixture["promptTokens"], fixture["completionTokens"], fixture["totalTokensUsed"] = float64(11), float64(7), float64(18)
+	fixture["spans"].([]any)[1].(map[string]any)["data"].(map[string]any)["input_value"] = "generated diagnostic input"
+	result := persistedDoctorProbeResult(local, fixture)
+	if result.Status != DoctorPass || result.Probe == nil || !result.Probe.InputOutputValid {
+		t.Fatalf("exact agent prompt did not pass: %#v", result)
+	}
 }
 
 func TestDoctorProbeReportsTerminalCorrelationRootsAndDuplicates(t *testing.T) {
