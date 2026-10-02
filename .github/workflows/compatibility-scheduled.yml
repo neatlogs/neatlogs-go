@@ -16,8 +16,6 @@ on:
 
 permissions:
   contents: read
-  issues: write
-  pull-requests: read
 
 concurrency:
   group: compatibility-go-release-discovery
@@ -31,10 +29,6 @@ jobs:
       changes_found: ${{ steps.discover.outputs.changes_found }}
       discover_outcome: ${{ steps.discover.outcome }}
       evidence_outcome: ${{ steps.evidence.outcome }}
-      verify_outcome: ${{ steps.verify.outcome }}
-      gemini_outcome: ${{ steps.gemini.outcome }}
-      issue_outcome: ${{ steps.review_issue.outcome }}
-      review_issue_url: ${{ steps.review_issue.outputs.issue_url }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -69,13 +63,88 @@ jobs:
         run: |
           jq --slurpfile issue compatibility-upstream-issue.json '.upstreamIssues = $issue' compatibility-evidence.json > compatibility-evidence.tmp.json
           mv compatibility-evidence.tmp.json compatibility-evidence.json
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.discover.outputs.changes_found == 'true'
+        with:
+          name: go-compatibility-evidence
+          path: |
+            compatibility-release-report.json
+            compatibility-evidence.json
+            compatibility-upstream-issue.json
+          if-no-files-found: ignore
+      - name: Notify Slack of releases or workflow failure
+        if: always() && steps.discover.outputs.changes_found != 'true'
+        continue-on-error: true
+        env:
+          COMPAT_SLACK_WEBHOOK_URL: ${{ secrets.COMPAT_SLACK_WEBHOOK_URL }}
+          COMPAT_JOB_STATUS: ${{ job.status }}
+          COMPAT_CHANGES_FOUND: ${{ steps.discover.outputs.changes_found }}
+          COMPAT_DISCOVER_OUTCOME: ${{ steps.discover.outcome }}
+          COMPAT_EVIDENCE_OUTCOME: ${{ steps.evidence.outcome }}
+          COMPAT_UPSTREAM_ISSUE_FILE: compatibility-upstream-issue.json
+        run: go run ./scripts/compatibility/notify
+
+  verify:
+    needs: discover
+    if: always() && needs.discover.outputs.changes_found == 'true' && needs.discover.outputs.evidence_outcome == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    outputs:
+      verify_outcome: ${{ steps.verify.outcome }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: go-compatibility-evidence
       - name: Test adapters against baseline and new releases
         id: verify
-        if: steps.discover.outputs.changes_found == 'true'
         continue-on-error: true
         run: go run ./scripts/compatibility/verify
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: go-compatibility-verification
+          path: compatibility-verification.json
+          if-no-files-found: ignore
+
+  analyze:
+    needs: [discover, verify]
+    if: always() && needs.discover.outputs.changes_found == 'true' && needs.discover.outputs.evidence_outcome == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    outputs:
+      gemini_outcome: ${{ steps.gemini.outcome }}
+      issue_outcome: ${{ steps.review_issue.outcome }}
+      review_issue_url: ${{ steps.review_issue.outputs.issue_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: go-compatibility-evidence
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: go-compatibility-verification
       - name: Find releases already reviewed by an automated fix PR
-        if: steps.discover.outputs.changes_found == 'true'
+        if: needs.discover.outputs.changes_found == 'true'
         continue-on-error: true
         uses: actions/github-script@v7
         with:
@@ -93,7 +162,7 @@ jobs:
             fs.writeFileSync('compatibility-covered.json', JSON.stringify(covered, null, 2));
       - name: Run advisory Gemini impact analysis
         id: gemini
-        if: steps.discover.outputs.changes_found == 'true'
+        if: needs.discover.outputs.changes_found == 'true'
         continue-on-error: true
         env:
           COMPAT_GEMINI_API_KEY: ${{ secrets.COMPAT_GEMINI_API_KEY }}
@@ -113,7 +182,7 @@ jobs:
           if-no-files-found: ignore
       - name: Create or update release discovery issue
         id: review_issue
-        if: always() && steps.discover.outputs.changes_found == 'true' && steps.evidence.outcome == 'success'
+        if: always() && needs.discover.outputs.changes_found == 'true' && needs.discover.outputs.evidence_outcome == 'success'
         uses: actions/github-script@v7
         with:
           script: |
@@ -194,24 +263,9 @@ jobs:
               const { data: created } = await github.rest.issues.create({ owner, repo, title, body });
               core.setOutput('issue_url', created.html_url);
             }
-      - name: Notify Slack of releases or workflow failure
-        if: always() && steps.discover.outputs.changes_found != 'true'
-        continue-on-error: true
-        env:
-          COMPAT_SLACK_WEBHOOK_URL: ${{ secrets.COMPAT_SLACK_WEBHOOK_URL }}
-          COMPAT_JOB_STATUS: ${{ job.status }}
-          COMPAT_CHANGES_FOUND: ${{ steps.discover.outputs.changes_found }}
-          COMPAT_DISCOVER_OUTCOME: ${{ steps.discover.outcome }}
-          COMPAT_EVIDENCE_OUTCOME: ${{ steps.evidence.outcome }}
-          COMPAT_VERIFY_OUTCOME: ${{ steps.verify.outcome }}
-          COMPAT_GEMINI_OUTCOME: ${{ steps.gemini.outcome }}
-          COMPAT_ISSUE_OUTCOME: ${{ steps.review_issue.outcome }}
-          COMPAT_REVIEW_ISSUE_URL: ${{ steps.review_issue.outputs.issue_url }}
-          COMPAT_UPSTREAM_ISSUE_FILE: compatibility-upstream-issue.json
-        run: go run ./scripts/compatibility/notify
 
   validate_patch:
-    needs: discover
+    needs: [discover, analyze]
     if: always() && needs.discover.outputs.changes_found == 'true' && needs.discover.outputs.evidence_outcome == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 35
@@ -228,7 +282,7 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-          cache: true
+          cache: false
       - uses: actions/download-artifact@v4
         with:
           name: go-compatibility-release-report
@@ -266,7 +320,7 @@ jobs:
           if-no-files-found: ignore
 
   publish:
-    needs: [discover, validate_patch]
+    needs: [discover, verify, analyze, validate_patch]
     if: always() && needs.discover.outputs.changes_found == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -320,7 +374,7 @@ jobs:
         continue-on-error: true
         uses: actions/github-script@v7
         env:
-          REVIEW_ISSUE_URL: ${{ needs.discover.outputs.review_issue_url }}
+          REVIEW_ISSUE_URL: ${{ needs.analyze.outputs.review_issue_url }}
         with:
           github-token: ${{ secrets.COMPAT_PR_TOKEN || github.token }}
           script: |
@@ -385,11 +439,11 @@ jobs:
             core.setOutput('pr_url', pull.html_url);
       - name: Add auto-fix status to review issue
         id: fix_issue
-        if: always() && needs.discover.outputs.review_issue_url != ''
+        if: always() && needs.analyze.outputs.review_issue_url != ''
         continue-on-error: true
         uses: actions/github-script@v7
         env:
-          REVIEW_ISSUE_URL: ${{ needs.discover.outputs.review_issue_url }}
+          REVIEW_ISSUE_URL: ${{ needs.analyze.outputs.review_issue_url }}
           FIX_PR_URL: ${{ steps.fix_pr.outputs.pr_url }}
           FIX_PR_OUTCOME: ${{ steps.fix_pr.outcome }}
           PUBLISH_CHECK_OUTCOME: ${{ steps.publish_check.outcome }}
@@ -420,15 +474,15 @@ jobs:
         continue-on-error: true
         env:
           COMPAT_SLACK_WEBHOOK_URL: ${{ secrets.COMPAT_SLACK_WEBHOOK_URL }}
-          COMPAT_JOB_STATUS: ${{ needs.discover.result }}
+          COMPAT_JOB_STATUS: ${{ needs.discover.result == 'success' && needs.verify.result == 'success' && needs.analyze.result == 'success' && 'success' || 'failure' }}
           COMPAT_CHANGES_FOUND: ${{ needs.discover.outputs.changes_found }}
           COMPAT_DISCOVER_OUTCOME: ${{ needs.discover.outputs.discover_outcome }}
           COMPAT_EVIDENCE_OUTCOME: ${{ needs.discover.outputs.evidence_outcome }}
-          COMPAT_VERIFY_OUTCOME: ${{ needs.discover.outputs.verify_outcome }}
-          COMPAT_GEMINI_OUTCOME: ${{ needs.discover.outputs.gemini_outcome }}
-          COMPAT_ISSUE_OUTCOME: ${{ needs.discover.outputs.issue_outcome }}
+          COMPAT_VERIFY_OUTCOME: ${{ needs.verify.outputs.verify_outcome }}
+          COMPAT_GEMINI_OUTCOME: ${{ needs.analyze.outputs.gemini_outcome }}
+          COMPAT_ISSUE_OUTCOME: ${{ needs.analyze.outputs.issue_outcome }}
           COMPAT_FIX_ISSUE_OUTCOME: ${{ steps.fix_issue.outcome }}
-          COMPAT_REVIEW_ISSUE_URL: ${{ needs.discover.outputs.review_issue_url }}
+          COMPAT_REVIEW_ISSUE_URL: ${{ needs.analyze.outputs.review_issue_url }}
           COMPAT_FIX_PR_URL: ${{ steps.fix_pr.outputs.pr_url }}
           COMPAT_FIX_PR_OUTCOME: ${{ steps.fix_pr.outcome }}
           COMPAT_PUBLISH_CHECK_OUTCOME: ${{ steps.publish_check.outcome }}
@@ -445,7 +499,7 @@ jobs:
       - name: Fail run on deterministic regression or publication failure
         if: always()
         env:
-          VERIFY_OUTCOME: ${{ needs.discover.outputs.verify_outcome }}
+          VERIFY_OUTCOME: ${{ needs.verify.outputs.verify_outcome }}
           VALIDATED: ${{ needs.validate_patch.outputs.validated }}
           PR_OUTCOME: ${{ steps.fix_pr.outcome }}
         run: |
