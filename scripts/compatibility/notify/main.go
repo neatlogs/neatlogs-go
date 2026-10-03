@@ -165,140 +165,135 @@ func shouldSendSlack(status string, report releaseReport, evidence evidenceRepor
 }
 
 func slackMessage(status string, report releaseReport, evidence evidenceReport, verification verificationReport, analysis analysisReport, proposal proposalReport, issue upstreamIssue, alert alertContext) string {
-	link := ""
-	if alert.RunURL != "" {
-		link = fmt.Sprintf(" <%s|Evidence and workflow run>.", alert.RunURL)
+	links := make([]string, 0, 3)
+	if alert.ReviewIssueURL != "" {
+		links = append(links, fmt.Sprintf("<%s|Review issue>", alert.ReviewIssueURL))
 	}
-	if status != "success" && len(verification.Modules) == 0 {
-		reviewLink := ""
-		if alert.ReviewIssueURL != "" {
-			reviewLink = fmt.Sprintf(" <%s|Review issue>.", alert.ReviewIssueURL)
-		}
-		fixLink := ""
-		if alert.FixPRURL != "" {
-			fixLink = fmt.Sprintf(" <%s|Fix PR>.", alert.FixPRURL)
-		}
-		return fmt.Sprintf(":red_circle: *Go SDK compatibility monitor failed during %s.* No regression verdict is available; inspect the workflow logs for the error.%s%s%s", alert.FailureStage, reviewLink, fixLink, link)
-	}
-	items := make([]string, 0)
-	limit := len(report.Changes)
-	if limit > 8 {
-		limit = 8
-	}
-	for _, item := range report.Changes[:limit] {
-		previous := item.PreviouslyAnalyzed
-		if previous == "" {
-			previous = "untracked"
-		}
-		items = append(items, fmt.Sprintf("%s %s → %s", item.Module, previous, item.Latest))
-	}
-	remaining := ""
-	if len(report.Changes) > limit {
-		remaining = fmt.Sprintf(", +%d more", len(report.Changes)-limit)
-	}
-	risk := ""
-	if alert.GeminiOutcome == "failure" {
-		risk = " Gemini advisory analysis failed; inspect the run."
-	} else if analysis.RiskLevel != "" {
-		scope := ""
-		if analysis.ScopeModule != "" {
-			scope = " for " + conciseSlackText(analysis.ScopeModule)
-		}
-		risk = fmt.Sprintf(" Gemini advisory risk%s: *%s* (unverified).", scope, conciseSlackText(analysis.RiskLevel))
-	} else if analysis.Skipped {
-		risk = " Gemini advisory unavailable; deterministic evidence and tests remain available."
-	}
-	toolchain := ""
-	for _, item := range evidence.Modules {
-		if match := requiredGoPattern.FindStringSubmatch(item.ToolchainRequirement); len(match) == 2 {
-			toolchain += fmt.Sprintf(" %s requires Go ≥%s; the current SDK CI toolchain cannot use it.", item.Module, match[1])
-		}
-	}
-	verificationItems := make([]string, 0, len(verification.Modules))
-	confirmedFailure := false
-	blocked := false
-	notTested := false
-	for index, item := range verification.Modules {
-		if index < 8 {
-			verificationItems = append(verificationItems, fmt.Sprintf("%s %s: *%s*", item.Module, item.Latest, item.Status))
-		}
-		if item.Status == "fail" {
-			confirmedFailure = true
-		} else if item.Status == "blocked" {
-			blocked = true
-		} else if item.Status != "pass" {
-			notTested = true
-		}
-	}
-	verificationText := " Mapped adapter tests unavailable; inspect the run."
-	if len(verificationItems) > 0 {
-		verificationText = " Mapped adapter tests (recorded baseline vs latest; tested scope only): " + strings.Join(verificationItems, "; ")
-		if len(verification.Modules) > len(verificationItems) {
-			verificationText += fmt.Sprintf("; +%d more", len(verification.Modules)-len(verificationItems))
-		}
-		verificationText += "."
-	}
-	heading := ":warning: *Go SDK compatibility automation needs attention:*"
-	switch {
-	case confirmedFailure:
-		heading = ":rotating_light: *Go SDK regression in mapped adapter tests (baseline passed, latest failed):*"
-	case blocked && toolchain != "":
-		heading = ":warning: *Go SDK verification incomplete: toolchain blocked; no regression established:*"
-	case blocked || notTested || len(verification.Modules) == 0:
-		heading = ":warning: *Go SDK verification incomplete; no regression established:*"
-	case alert.FixPRURL != "":
-		heading = ":large_green_circle: *Go SDK fix PR opened for human review:*"
-	}
-	issueText := ""
 	if issue.URL != "" {
 		title := issue.Title
 		if title == "" {
-			title = issue.URL
+			title = "Upstream issue"
 		}
-		issueText = fmt.Sprintf(" Referenced upstream issue: <%s|%s>.", issue.URL, title)
+		links = append(links, fmt.Sprintf("<%s|%s>", issue.URL, conciseSlackText(title)))
 	}
-	reviewIssue := ""
-	if alert.ReviewIssueURL != "" {
-		reviewIssue = fmt.Sprintf(" <%s|Review issue>.", alert.ReviewIssueURL)
+	if alert.RunURL != "" {
+		links = append(links, fmt.Sprintf("<%s|Workflow evidence>", alert.RunURL))
 	}
-	fix := " No validated SDK fix proposal; no PR opened."
+	linkText := ""
+	if len(links) > 0 {
+		linkText = "\nDetails: " + strings.Join(links, " · ")
+	}
+	if status != "success" && len(verification.Modules) == 0 {
+		fixText := "none"
+		if alert.FixPRURL != "" {
+			fixText = fmt.Sprintf("<%s|open for review>", alert.FixPRURL)
+		}
+		return fmt.Sprintf(":red_circle: *Go SDK: compatibility monitor failed — inspect workflow.*\nChecked: incomplete | Regression: no verdict | Fix PR: %s\nAction: Investigate failure during %s.%s", fixText, alert.FailureStage, linkText)
+	}
+	toolchainBlocks := make([]string, 0)
+	for _, item := range evidence.Modules {
+		if match := requiredGoPattern.FindStringSubmatch(item.ToolchainRequirement); len(match) == 2 {
+			toolchainBlocks = append(toolchainBlocks, fmt.Sprintf("%s requires Go ≥%s", item.Module, match[1]))
+		}
+	}
+	passed, failed, blocked, notTested := 0, 0, 0, 0
+	for _, item := range verification.Modules {
+		switch item.Status {
+		case "pass":
+			passed++
+		case "fail":
+			failed++
+		case "blocked":
+			blocked++
+		default:
+			notTested++
+		}
+	}
+	releaseLabel := "release"
+	if len(report.Changes) != 1 {
+		releaseLabel += "s"
+	}
+	checked := fmt.Sprintf("%d newer %s; mapped adapter checks: %d passed, %d failed, %d blocked, %d not tested", len(report.Changes), releaseLabel, passed, failed, blocked, notTested)
+	if len(verification.Modules) == 0 {
+		checked = fmt.Sprintf("%d newer %s; mapped adapter checks unavailable", len(report.Changes), releaseLabel)
+	}
+	regression := "none found in tested scope"
+	if failed > 0 {
+		candidateLabel := "candidate"
+		if failed != 1 {
+			candidateLabel += "s"
+		}
+		regression = fmt.Sprintf("%d %s (baseline passed, latest failed)", failed, candidateLabel)
+	} else if len(verification.Modules) == 0 {
+		regression = "no verdict"
+	} else if blocked+notTested > 0 {
+		regression += "; some releases untested"
+	}
+	fixPR := "none — no validated SDK fix"
+	if alert.FixPRURL != "" {
+		fixPR = fmt.Sprintf("<%s|open for human review>", alert.FixPRURL)
+	} else if proposal.Status == "rejected" {
+		fixPR = "none — proposed fix rejected by validation"
+	} else if proposal.Status == "validated" && alert.FixPROutcome == "failure" {
+		fixPR = "none — PR creation failed"
+	} else if proposal.Status == "validated" && alert.PublishCheckOutcome == "failure" {
+		fixPR = "none — publication check failed"
+	} else if proposal.Status == "validated" {
+		fixPR = "none — validated fix was not published"
+	} else if alert.PatchJobStatus == "failure" {
+		fixPR = "none — patch validation failed"
+	} else if alert.ProposalOutcome == "failure" {
+		fixPR = "none — proposal tooling failed"
+	} else if alert.RetestOutcome == "failure" {
+		fixPR = "none — patch retest failed"
+	} else if proposal.Status == "skipped" {
+		fixPR = "none — no actionable SDK fix"
+	}
+	heading := ":warning: *Go SDK: compatibility check needs attention — inspect results.*"
+	action := "Review the incomplete compatibility check."
 	switch {
+	case failed > 0:
+		heading = ":rotating_light: *Go SDK: candidate regression in mapped adapter tests — review fix.*"
+		action = "Review the baseline-pass/latest-fail evidence and SDK fix."
 	case alert.FixPRURL != "":
-		validation := "review validation evidence in the PR"
+		heading = ":large_green_circle: *Go SDK: fix PR opened — review the code.*"
+		action = "Review and approve the PR manually."
 		if proposal.Validation == "test_regression_resolved" {
-			validation = "mapped regression passed after the patch"
-		} else if proposal.Validation == "advisory_only_no_reproduction" {
-			validation = "suspected behavior unverified by mapped tests"
+			action += " The mapped regression passed after the patch."
 		}
-		fix = fmt.Sprintf(" Gemini-proposed fix: <%s|PR opened for human code review> (%s); no automated approval or merge.", alert.FixPRURL, validation)
-	case proposal.Status == "validated" && alert.PublishCheckOutcome == "failure":
-		fix = " SDK patch passed isolated tests, but the publication check failed; no PR opened. Inspect the run."
-	case proposal.Status == "validated" && alert.FixPROutcome == "failure":
-		fix = " SDK patch passed validation, but PR creation failed; no PR opened. Inspect Actions permissions and the run."
-	case proposal.Status == "validated":
-		fix = " SDK patch passed validation, but no PR was opened; inspect the run."
-	case alert.PatchJobStatus == "failure":
-		fix = " Isolated SDK patch validation failed; no PR opened. Inspect the run."
-	case alert.ProposalOutcome == "failure":
-		fix = " SDK proposal validation tooling failed; no PR opened. Inspect the run."
-	case alert.RetestOutcome == "failure":
-		fix = " SDK patch retest tooling failed; no PR opened. Inspect the run."
-	case proposal.Status == "rejected":
-		fix = fmt.Sprintf(" Gemini fix rejected by validation; no PR opened: %s.", conciseSlackText(proposal.Reason))
-	case proposal.Status == "skipped" && proposal.Reason != "":
-		fix = fmt.Sprintf(" No SDK fix proposal: %s.", conciseSlackText(proposal.Reason))
+	case blocked > 0 && len(toolchainBlocks) > 0:
+		heading = ":warning: *Go SDK: release blocked by Go toolchain — review Go version support.*"
+		action = strings.Join(toolchainBlocks, "; ") + ". Decide whether to upgrade SDK CI to test it."
+	case blocked > 0 || notTested > 0 || len(verification.Modules) == 0:
+		heading = ":warning: *Go SDK: verification incomplete — investigate untested releases.*"
+		action = "Investigate blocked or untested adapter checks."
+	case alert.GeminiOutcome == "failure" || analysis.Skipped && analysis.Reason != "No uncovered release is testable with this runner":
+		heading = ":warning: *Go SDK: Gemini analysis failed — inspect workflow.*"
+		action = "Inspect Gemini analysis; mapped adapter checks passed."
+	case status != "success" || alert.IssueOutcome == "failure" || alert.FixIssueOutcome == "failure" || alert.PatchJobStatus == "failure" || alert.ProposalOutcome == "failure" || alert.RetestOutcome == "failure" || alert.PublishCheckOutcome == "failure" || alert.FixPROutcome == "failure":
+		heading = ":red_circle: *Go SDK: compatibility automation failed — inspect workflow.*"
+		action = "Inspect workflow failure; mapped adapter checks passed."
 	}
-	issueFailure := ""
+	if proposal.Status == "rejected" && proposal.Reason != "" {
+		action += " Proposed fix rejected: " + conciseSlackText(proposal.Reason) + "."
+	} else if proposal.Status == "skipped" && proposal.Reason != "" && failed > 0 {
+		action += " No fix proposal: " + conciseSlackText(proposal.Reason) + "."
+	}
 	if alert.IssueOutcome == "failure" {
-		issueFailure = " Review issue update failed; inspect the run."
+		action += " Review issue update failed."
 	} else if alert.FixIssueOutcome == "failure" {
-		issueFailure = " Fix status update to the review issue failed; inspect the run."
+		action += " Fix status update to the review issue failed."
 	}
-	monitorFailure := ""
+	if alert.GeminiOutcome == "failure" && (blocked > 0 || failed > 0 || notTested > 0) {
+		action += " Gemini advisory analysis also failed."
+	}
+	if alert.PatchJobStatus == "failure" || alert.ProposalOutcome == "failure" || alert.RetestOutcome == "failure" || alert.PublishCheckOutcome == "failure" || alert.FixPROutcome == "failure" {
+		action += " Inspect failed fix automation in the workflow."
+	}
 	if status != "success" {
-		monitorFailure = fmt.Sprintf(" Monitor also failed during %s; inspect the run.", alert.FailureStage)
+		action += fmt.Sprintf(" Monitor also failed during %s.", alert.FailureStage)
 	}
-	return fmt.Sprintf("%s %d upstream release(s) newer than the analyzed lock. %s%s.%s%s%s%s%s%s%s%s%s", heading, len(report.Changes), strings.Join(items, ", "), remaining, verificationText, toolchain, risk, fix, issueText, reviewIssue, issueFailure, monitorFailure, link)
+	return fmt.Sprintf("%s\nChecked: %s | Regression: %s | Fix PR: %s\nAction: %s%s", heading, checked, regression, fixPR, action, linkText)
 }
 
 func main() {

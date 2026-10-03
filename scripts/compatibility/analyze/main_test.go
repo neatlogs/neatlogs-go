@@ -82,7 +82,7 @@ func BeforeTool(ctx tool.Context) { _ = ctx; _ = wrapper.field }
 		t.Fatal(err)
 	}
 	prompt := geminiPrompt(module.Module, json.RawMessage(`{"modules":[]}`), json.RawMessage(`[]`), evidenceJSON)
-	if !strings.Contains(prompt, want[0]) || !strings.Contains(prompt, "identical types") || !strings.Contains(prompt, "Use review_only") {
+	if !strings.Contains(prompt, want[0]) || !strings.Contains(prompt, "identical types") || !strings.Contains(prompt, "Use review_only") || !strings.Contains(prompt, "Only propose a source-code fix when a mapped adapter suite passed at the recorded baseline and failed at the new version") {
 		t.Fatalf("Gemini prompt omitted alias evidence or decision guidance: %s", prompt)
 	}
 	proposal := func() map[string]any {
