@@ -58,8 +58,10 @@ type evidenceReport struct {
 }
 
 type suiteResult struct {
-	Status   string `json:"status"`
-	Baseline struct {
+	Integration string `json:"integration"`
+	Package     string `json:"package"`
+	Status      string `json:"status"`
+	Baseline    struct {
 		Status string `json:"status"`
 	} `json:"baseline"`
 	Latest struct {
@@ -237,9 +239,43 @@ func validateRetest(proposal proposalReport, before, after verificationReport) p
 		proposal.Status, proposal.Reason = "rejected", "Target module has no completed post-patch adapter tests"
 		return proposal
 	}
+	// A passing mapped suite cannot prove that an advisory-only patch fixes an
+	// SDK regression. Keep the finding in the review issue until a failing
+	// baseline-pass/latest-fail case is reproduced.
+	if original.Status != "fail" {
+		proposal.Status, proposal.Reason = "rejected", "No reproduced baseline-pass/latest-fail adapter regression; advisory findings remain review-only"
+		return proposal
+	}
+	reproduced := make([]suiteResult, 0)
+	for _, suite := range original.Suites {
+		if suite.Integration != "" && suite.Package != "" && suite.Status == "fail" && suite.Baseline.Status == "pass" && suite.Latest.Status == "fail" {
+			reproduced = append(reproduced, suite)
+		}
+	}
+	if len(reproduced) == 0 {
+		proposal.Status, proposal.Reason = "rejected", "Target module has no baseline-pass/latest-fail adapter suite evidence"
+		return proposal
+	}
+	if updated.Status != "pass" {
+		proposal.Status, proposal.Reason = "rejected", "Patched target module did not pass mapped adapter tests"
+		return proposal
+	}
 	for _, suite := range updated.Suites {
-		if suite.Baseline.Status != "pass" || suite.Latest.Status != "pass" {
+		if suite.Status != "pass" || suite.Baseline.Status != "pass" || suite.Latest.Status != "pass" {
 			proposal.Status, proposal.Reason = "rejected", "Patched adapter must pass tests at both baseline and new module versions"
+			return proposal
+		}
+	}
+	for _, prior := range reproduced {
+		resolved := false
+		for _, suite := range updated.Suites {
+			if suite.Integration == prior.Integration && suite.Package == prior.Package && suite.Status == "pass" && suite.Baseline.Status == "pass" && suite.Latest.Status == "pass" {
+				resolved = true
+				break
+			}
+		}
+		if !resolved {
+			proposal.Status, proposal.Reason = "rejected", "Patched adapter did not pass the same suite that failed at the latest version"
 			return proposal
 		}
 	}
@@ -259,12 +295,8 @@ func validateRetest(proposal proposalReport, before, after verificationReport) p
 		}
 	}
 	proposal.Status = "validated"
-	proposal.Reason = "Patched adapter tests passed at baseline and new module versions"
-	if original.Status == "fail" {
-		proposal.Validation = "test_regression_resolved"
-	} else {
-		proposal.Validation = "advisory_only_no_reproduction"
-	}
+	proposal.Reason = "Baseline-pass/latest-fail mapped adapter tests passed after the patch"
+	proposal.Validation = "test_regression_resolved"
 	return proposal
 }
 
