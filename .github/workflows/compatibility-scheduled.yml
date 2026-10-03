@@ -206,6 +206,7 @@ jobs:
               evidenceReference: analysis.evidenceReference,
               evidenceRationale: String(analysis.evidenceRationale || '').slice(0, 2000),
               findings: Array.isArray(analysis.findings) ? analysis.findings.slice(0, 5) : [],
+              recommendedTests: Array.isArray(analysis.recommendedTests) ? analysis.recommendedTests.slice(0, 5) : [],
               skipped: analysis.skipped,
               reason: analysis.reason,
               note: 'Proposed source changes are omitted here; see the run artifact and any fix PR diff.',
@@ -242,7 +243,7 @@ jobs:
             ]);
             const body = [
               verification.modules.some((item) => item.status === 'fail')
-                ? 'The scheduled monitor found upstream releases and a regression in a mapped adapter test suite: the recorded baseline passed, but the new version failed. Human review is required.'
+                ? 'The scheduled monitor found a candidate regression in a mapped adapter test suite: the recorded baseline passed, but the new version failed. Human review is required.'
                 : 'The scheduled monitor found upstream releases newer than the analyzed version lock. No regression was confirmed in the mapped adapter tests; review is still needed for blocked or untested behavior.',
               '',
               `Evidence and workflow logs: ${runURL}`,
