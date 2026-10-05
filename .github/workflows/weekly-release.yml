@@ -1,0 +1,155 @@
+name: Weekly Go module release
+
+on:
+  schedule:
+    - cron: '31 8 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: weekly-go-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Plan the three module releases
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/release/weekly.py > "$RUNNER_TEMP/release-plan.json"
+          cat "$RUNNER_TEMP/release-plan.json"
+          for field in action root.release root.version adk.release adk.version genai.release genai.version; do
+            key=${field//./_}
+            echo "$key=$(jq -r ".$field" "$RUNNER_TEMP/release-plan.json")" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Check release App configuration
+        if: steps.plan.outputs.action == 'publish'
+        shell: bash
+        env:
+          RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+        run: |
+          test -n "$RELEASE_APP_ID" || { echo 'RELEASE_APP_ID is missing' >&2; exit 1; }
+          test -n "$RELEASE_APP_PRIVATE_KEY" || { echo 'RELEASE_APP_PRIVATE_KEY is missing' >&2; exit 1; }
+
+      - name: Create a repository-scoped release token
+        if: steps.plan.outputs.action == 'publish'
+        id: release-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+
+      - name: Validate and tag the root module first
+        if: steps.plan.outputs.root_release == 'true'
+        shell: bash
+        env:
+          RELEASE_TOKEN: ${{ steps.release-token.outputs.token }}
+          ROOT_VERSION: ${{ steps.plan.outputs.root_version }}
+        run: |
+          set -euo pipefail
+          GOWORK=off go test -mod=readonly ./...
+          GOWORK=off go vet ./...
+          go build ./cmd/neatlogs
+          git remote set-url origin "https://x-access-token:${RELEASE_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git tag -a "$ROOT_VERSION" -m "Release root module $ROOT_VERSION"
+          git push origin "refs/tags/${ROOT_VERSION}"
+
+      - name: Update and test each contrib module
+        if: steps.plan.outputs.adk_release == 'true' || steps.plan.outputs.genai_release == 'true'
+        shell: bash
+        env:
+          ROOT_VERSION: ${{ steps.plan.outputs.root_version }}
+          ADK_RELEASE: ${{ steps.plan.outputs.adk_release }}
+          GENAI_RELEASE: ${{ steps.plan.outputs.genai_release }}
+        run: |
+          set -euo pipefail
+          for module in adk genai; do
+            if [[ "$module" == adk && "$ADK_RELEASE" != true ]] ||
+               [[ "$module" == genai && "$GENAI_RELEASE" != true ]]; then
+              continue
+            fi
+            (
+              cd "contrib/$module"
+              go mod edit -require="github.com/neatlogs/neatlogs-go@${ROOT_VERSION}"
+              GOWORK=off GOPROXY=direct go mod tidy
+              GOWORK=off GOPROXY=direct go test -mod=readonly ./...
+              GOWORK=off GOPROXY=direct go vet ./...
+            )
+          done
+          git diff --check
+          git diff --name-only | awk '/^contrib\/(adk|genai)\/go\.(mod|sum)$/ {next} {print; bad=1} END {exit bad}'
+
+      - name: Commit updated dependencies and tag contrib modules
+        if: steps.plan.outputs.adk_release == 'true' || steps.plan.outputs.genai_release == 'true'
+        shell: bash
+        env:
+          RELEASE_TOKEN: ${{ steps.release-token.outputs.token }}
+          ADK_RELEASE: ${{ steps.plan.outputs.adk_release }}
+          ADK_VERSION: ${{ steps.plan.outputs.adk_version }}
+          GENAI_RELEASE: ${{ steps.plan.outputs.genai_release }}
+          GENAI_VERSION: ${{ steps.plan.outputs.genai_version }}
+        run: |
+          set -euo pipefail
+          git config user.name 'neatlogs-release[bot]'
+          git config user.email 'neatlogs-release[bot]@users.noreply.github.com'
+          git remote set-url origin "https://x-access-token:${RELEASE_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git add contrib/adk/go.mod contrib/adk/go.sum contrib/genai/go.mod contrib/genai/go.sum
+          if ! git diff --cached --quiet; then
+            git diff --cached --check
+            git commit -m 'chore(release): update contrib root dependencies'
+            # A concurrent merge stops this release before any contrib tag is made.
+            git push origin HEAD:refs/heads/main
+          fi
+          git diff --exit-code
+          if [[ "$ADK_RELEASE" == true ]]; then
+            tag="contrib/adk/${ADK_VERSION}"
+            git tag -a "$tag" -m "Release ADK module ${ADK_VERSION}"
+            git push origin "refs/tags/${tag}"
+          fi
+          if [[ "$GENAI_RELEASE" == true ]]; then
+            tag="contrib/genai/${GENAI_VERSION}"
+            git tag -a "$tag" -m "Release GenAI module ${GENAI_VERSION}"
+            git push origin "refs/tags/${tag}"
+          fi
+
+      - name: Verify remote module tags
+        if: steps.plan.outputs.action == 'publish'
+        shell: bash
+        env:
+          ROOT_RELEASE: ${{ steps.plan.outputs.root_release }}
+          ROOT_VERSION: ${{ steps.plan.outputs.root_version }}
+          ADK_RELEASE: ${{ steps.plan.outputs.adk_release }}
+          ADK_VERSION: ${{ steps.plan.outputs.adk_version }}
+          GENAI_RELEASE: ${{ steps.plan.outputs.genai_release }}
+          GENAI_VERSION: ${{ steps.plan.outputs.genai_version }}
+        run: |
+          set -euo pipefail
+          if [[ "$ROOT_RELEASE" == true ]]; then
+            git ls-remote --exit-code --tags origin "refs/tags/${ROOT_VERSION}" >/dev/null
+          fi
+          if [[ "$ADK_RELEASE" == true ]]; then
+            git ls-remote --exit-code --tags origin "refs/tags/contrib/adk/${ADK_VERSION}" >/dev/null
+          fi
+          if [[ "$GENAI_RELEASE" == true ]]; then
+            git ls-remote --exit-code --tags origin "refs/tags/contrib/genai/${GENAI_VERSION}" >/dev/null
+          fi
