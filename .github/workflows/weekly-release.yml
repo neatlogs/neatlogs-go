@@ -1,8 +1,8 @@
-name: Weekly Go module release
+name: Daily Go module release
 
 on:
   schedule:
-    - cron: '31 8 * * 1'
+    - cron: '31 8 * * *'
   workflow_dispatch:
 
 permissions:
@@ -17,6 +17,14 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    outputs:
+      action: ${{ steps.plan.outputs.action }}
+      root_release: ${{ steps.plan.outputs.root_release }}
+      root_version: ${{ steps.plan.outputs.root_version }}
+      adk_release: ${{ steps.plan.outputs.adk_release }}
+      adk_version: ${{ steps.plan.outputs.adk_version }}
+      genai_release: ${{ steps.plan.outputs.genai_release }}
+      genai_version: ${{ steps.plan.outputs.genai_version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -70,6 +78,8 @@ jobs:
           GOWORK=off go test -mod=readonly ./...
           GOWORK=off go vet ./...
           go build ./cmd/neatlogs
+          git config user.name 'neatlogs-release[bot]'
+          git config user.email 'neatlogs-release[bot]@users.noreply.github.com'
           git remote set-url origin "https://x-access-token:${RELEASE_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git tag -a "$ROOT_VERSION" -m "Release root module $ROOT_VERSION"
           git push origin "refs/tags/${ROOT_VERSION}"
@@ -153,3 +163,43 @@ jobs:
           if [[ "$GENAI_RELEASE" == true ]]; then
             git ls-remote --exit-code --tags origin "refs/tags/contrib/genai/${GENAI_VERSION}" >/dev/null
           fi
+
+  notify:
+    name: Notify Slack after verified Go module tags
+    needs: release
+    if: needs.release.result == 'success' && needs.release.outputs.action == 'publish'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Post release notification
+        shell: bash
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.COMPAT_SLACK_WEBHOOK_URL }}
+          ROOT_RELEASE: ${{ needs.release.outputs.root_release }}
+          ROOT_VERSION: ${{ needs.release.outputs.root_version }}
+          ADK_RELEASE: ${{ needs.release.outputs.adk_release }}
+          ADK_VERSION: ${{ needs.release.outputs.adk_version }}
+          GENAI_RELEASE: ${{ needs.release.outputs.genai_release }}
+          GENAI_VERSION: ${{ needs.release.outputs.genai_version }}
+        run: |
+          set -euo pipefail
+          test -n "$SLACK_WEBHOOK_URL" || { echo 'COMPAT_SLACK_WEBHOOK_URL is missing' >&2; exit 1; }
+          message=':white_check_mark: *Go SDK module release tags verified*'
+          if [[ "$ROOT_RELEASE" == true ]]; then
+            message+=$'\n'
+            message+="• <https://github.com/${GITHUB_REPOSITORY}/tree/${ROOT_VERSION}|Root ${ROOT_VERSION}>"
+          fi
+          if [[ "$ADK_RELEASE" == true ]]; then
+            message+=$'\n'
+            message+="• <https://github.com/${GITHUB_REPOSITORY}/tree/contrib%2Fadk%2F${ADK_VERSION}|ADK ${ADK_VERSION}>"
+          fi
+          if [[ "$GENAI_RELEASE" == true ]]; then
+            message+=$'\n'
+            message+="• <https://github.com/${GITHUB_REPOSITORY}/tree/contrib%2Fgenai%2F${GENAI_VERSION}|GenAI ${GENAI_VERSION}>"
+          fi
+          message+=$'\n'
+          message+="<https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}|Workflow run>"
+          payload=$(jq -n --arg text "$message" '{text: $text}')
+          response=$(curl --fail --silent --show-error --retry 2 --retry-all-errors --max-time 15 \
+            --header 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL")
+          test "$response" = ok || { echo "Slack webhook returned an unexpected response: $response" >&2; exit 1; }

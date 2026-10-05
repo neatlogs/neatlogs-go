@@ -64,5 +64,5 @@ if __name__ == "__main__":
     try:
         print(json.dumps(plan(), sort_keys=True))
     except (ValueError, RuntimeError, subprocess.CalledProcessError, OSError) as error:
-        print(f"weekly Go release planning failed: {error}", file=sys.stderr)
+        print(f"daily Go release planning failed: {error}", file=sys.stderr)
         sys.exit(1)
