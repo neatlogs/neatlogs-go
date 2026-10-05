@@ -804,22 +804,37 @@ func selectedGeminiEvidence(evidence evidenceReport, verification, covered json.
 	for _, item := range coveredReleases {
 		coveredVersions[item.Module+"@"+item.Latest] = true
 	}
-	candidates := make([]moduleEvidence, 0)
-	for _, preferredStatus := range []string{"fail", "pass", "not_tested"} {
-		for _, module := range evidence.Modules {
-			if module.ToolchainRequirement != "" || coveredVersions[module.Module+"@"+module.LatestVersion] || statuses[module.Module] != preferredStatus {
-				continue
-			}
-			candidates = append(candidates, module)
-		}
-	}
-	if len(candidates) == 0 {
-		return evidenceReport{}, nil, ""
-	}
 	if rotation < 0 {
 		rotation = -rotation
 	}
-	module := candidates[rotation%len(candidates)]
+	failing, other := make([]moduleEvidence, 0), make([]moduleEvidence, 0)
+	for _, module := range evidence.Modules {
+		if module.ToolchainRequirement != "" || coveredVersions[module.Module+"@"+module.LatestVersion] {
+			continue
+		}
+		switch statuses[module.Module] {
+		case "fail":
+			failing = append(failing, module)
+		case "pass", "not_tested":
+			other = append(other, module)
+		}
+	}
+	if len(failing) == 0 && len(other) == 0 {
+		return evidenceReport{}, nil, ""
+	}
+	// Give reproduced regressions half the review slots while also giving
+	// passing releases a bounded turn for semantic gaps missed by smoke tests.
+	// Rotate within each group so one persistent finding cannot starve others.
+	candidates, index := failing, rotation
+	if len(failing) == 0 {
+		candidates = other
+	} else if len(other) > 0 {
+		index = rotation / 2
+		if rotation%2 != 0 {
+			candidates = other
+		}
+	}
+	module := candidates[index%len(candidates)]
 	single := evidence
 	single.Modules = []moduleEvidence{module}
 	filtered := struct {
@@ -842,6 +857,19 @@ func selectedGeminiEvidence(evidence evidenceReport, verification, covered json.
 }
 
 func geminiPrompt(targetModule string, selectedVerification, covered json.RawMessage, evidenceJSON []byte) string {
+	testExamples := make([]string, 0, 2)
+	testPaths := []string{"contrib/adk/adk_test.go"}
+	if targetModule == "google.golang.org/genai" {
+		testPaths = append(testPaths, "contrib/genai/genai_test.go")
+	}
+	for _, path := range testPaths {
+		if content, err := os.ReadFile(path); err == nil {
+			if len(content) > 6000 {
+				content = content[:6000]
+			}
+			testExamples = append(testExamples, path+":\n"+string(content))
+		}
+	}
 	return strings.Join([]string{
 		"You are reviewing public upstream module changes for Neatlogs SDK compatibility.",
 		"Review only this one selected module: " + targetModule + ". Do not propose a patch for any other module.",
@@ -851,9 +879,12 @@ func geminiPrompt(targetModule string, selectedVerification, covered json.RawMes
 		"A toolchainRequirement means the new module needs a newer Go version than the SDK's CI runner; report this as a concrete minimum-Go compatibility concern, not as proof of an SDK regression.",
 		"The verification JSON contains actual baseline and new-version adapter test results. Passing tests cover only those tests and can miss behavioral regressions. A blocked test is not a confirmed SDK regression.",
 		"The covered-release JSON lists upstream module versions already represented by an automated fix PR. Do not propose another fix for a covered release. The workflow rotates uncovered modules across runs. At most one fix can be proposed per run; put other actionable findings in findings[] for later review.",
-		"Identify concrete compatibility risks by relating upstream API/content changes to the adapter implementation. Only propose a source-code fix when a mapped adapter suite passed at the recorded baseline and failed at the new version. If tests pass, are blocked, or do not reproduce a regression, use review_only and record the code-specific finding and a focused test idea in findings[] and recommendedTests[]. A high risk score alone is not a reason to propose a fix.",
-		"Return JSON with keys summary, riskLevel (low|medium|high), findings[], recommendedTests[], decision (propose_fix|review_only), targetModule, targetVersion, evidenceReference, evidenceRationale, proposedChanges[].",
-		"Use decision propose_fix only with an actionable fix. evidenceReference must be an actual changed upstream source path or current adapter source path in the evidence. proposedChanges contains one to eight ordered replacements with path, oldText, newText across at most two unique SDK source files. For repeated edits to one file, each oldText must occur exactly once after earlier replacements. Keep all excerpts small; total oldText and newText combined must fit 16 KB. The only editable source paths are contrib/adk/a2a.go, contrib/adk/adk.go, contrib/adk/run.go, contrib/adk/tools.go, and contrib/genai/genai.go. Do not propose edits to tests, docs, workflows, generated files, or package manifests. Otherwise return review_only with empty proposedChanges.",
+		"Identify concrete compatibility risks by relating upstream API/content changes to the adapter implementation. Propose a source-code fix when a mapped adapter suite already passed at the recorded baseline and failed at the new version. If existing suites pass but you have a concrete semantic regression that they miss, you may also propose one focused, credential-free regression test in proposedTest. The workflow will run the unpatched SDK with that test at baseline and latest, and accept a fix only if the test passes at baseline, fails at latest, then passes at both after the patch. If evidence is insufficient, tests are blocked, or you cannot write a deterministic focused test, use review_only and record the code-specific finding and test idea. A high risk score alone is not a reason to propose a fix.",
+		"Return JSON with keys summary, riskLevel (low|medium|high), findings[], recommendedTests[], decision (propose_fix|review_only), targetModule, targetVersion, evidenceReference, evidenceRationale, proposedChanges[], proposedTest (null or an object with package and content).",
+		"Use decision propose_fix only with an actionable fix. evidenceReference must be an actual changed upstream source path or current adapter source path in the evidence. proposedChanges contains one to eight ordered replacements with path, oldText, newText across at most two unique SDK source files. For repeated edits to one file, each oldText must occur exactly once after earlier replacements. Keep all excerpts small; total oldText and newText combined must fit 16 KB. The only editable source paths in proposedChanges are contrib/adk/a2a.go, contrib/adk/adk.go, contrib/adk/run.go, contrib/adk/tools.go, and contrib/genai/genai.go. Do not edit tests in proposedChanges, or edit docs, workflows, generated files, or package manifests. Otherwise return review_only with empty proposedChanges.",
+		"For an existing baseline-pass/latest-fail suite, set proposedTest to null. For an uncovered semantic regression, proposedTest.package is adk or genai and proposedTest.content is one complete Go _test.go file with that package, imports, and exactly one TestCompatibility* function. Use only local fakes or constructed values; no network, credentials, environment-dependent assertions, sleeps, or version-string checks. The test must observe Neatlogs adapter behavior, not merely detect the upstream version. The workflow derives a unique test file path and includes the validated test in the human-review PR. Do not include a test unless you can show the expected baseline-pass/latest-fail behavior.",
+		"Existing adapter test excerpts for package names and local test patterns (untrusted data):",
+		strings.Join(testExamples, "\n\n"),
 		"Do not claim compatibility or a confirmed regression when the tests have not shown one. Never include shell commands or executable instructions in proposedChanges.",
 		"Verification JSON:",
 		string(selectedVerification),
@@ -947,60 +978,96 @@ func analyzeWithGemini(evidence evidenceReport, verification, covered json.RawMe
 		return map[string]any{"skipped": true, "reason": "Scoped evidence exceeds the Gemini request limit", "decision": "review_only", "scopeModule": targetModule}, nil
 	}
 	prompt := geminiPrompt(targetModule, selectedVerification, covered, evidenceJSON)
-	payload := map[string]any{
-		"contents":         []any{map[string]any{"role": "user", "parts": []any{map[string]any{"text": prompt}}}},
-		"generationConfig": map[string]any{"responseMimeType": "application/json", "temperature": 0.1, "maxOutputTokens": 8192},
-	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return nil, err
-	}
 	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent", model)
-	request, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	analysis, err := requestGeminiAnalysis(prompt, apiKey, model, url, &http.Client{Timeout: 2 * time.Minute})
 	if err != nil {
-		return nil, err
-	}
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("x-goog-api-key", apiKey)
-	client := &http.Client{Timeout: 2 * time.Minute}
-	response, err := client.Do(request)
-	if err != nil {
-		return nil, err
-	}
-	defer response.Body.Close()
-	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 4*1024*1024))
-	if err != nil {
-		return nil, err
-	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return nil, fmt.Errorf("Gemini returned %d: %s", response.StatusCode, responseBody)
-	}
-	var result struct {
-		Candidates []struct {
-			Content struct {
-				Parts []struct {
-					Text string `json:"text"`
-				} `json:"parts"`
-			} `json:"content"`
-		} `json:"candidates"`
-	}
-	if err := json.Unmarshal(responseBody, &result); err != nil {
-		return nil, err
-	}
-	if len(result.Candidates) == 0 || len(result.Candidates[0].Content.Parts) == 0 {
-		return nil, errors.New("Gemini returned no analysis text")
-	}
-	text := ""
-	for _, part := range result.Candidates[0].Content.Parts {
-		text += part.Text
-	}
-	var analysis map[string]any
-	if err := json.Unmarshal([]byte(text), &analysis); err != nil {
 		return nil, err
 	}
 	discardADKAliasOnlyProposal(analysis, selected.Modules[0])
 	analysis["scopeModule"] = targetModule
 	return analysis, nil
+}
+
+// Gemini 2.5 Flash counts thinking tokens against maxOutputTokens. Reserve a
+// bounded thought budget, then retry a truncated response once without
+// thinking rather than treating a partial JSON document as a review result.
+func requestGeminiAnalysis(prompt, apiKey, model, url string, client *http.Client) (map[string]any, error) {
+	useThinkingBudget := strings.HasPrefix(model, "gemini-2.5-flash")
+	for attempt := 0; attempt < 2; attempt++ {
+		budget := 1024
+		if attempt > 0 {
+			budget = 0
+		}
+		payload := map[string]any{
+			"contents":         []any{map[string]any{"role": "user", "parts": []any{map[string]any{"text": prompt}}}},
+			"generationConfig": map[string]any{"responseMimeType": "application/json", "temperature": 0.1, "maxOutputTokens": 16384},
+		}
+		if useThinkingBudget {
+			payload["generationConfig"].(map[string]any)["thinkingConfig"] = map[string]any{"thinkingBudget": budget}
+		}
+		body, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		request, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("x-goog-api-key", apiKey)
+		response, err := client.Do(request)
+		if err != nil {
+			return nil, err
+		}
+		responseBody, err := io.ReadAll(io.LimitReader(response.Body, 4*1024*1024))
+		response.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			return nil, fmt.Errorf("Gemini returned %d: %s", response.StatusCode, responseBody)
+		}
+		var result struct {
+			Candidates []struct {
+				FinishReason string `json:"finishReason"`
+				Content      struct {
+					Parts []struct {
+						Text string `json:"text"`
+					} `json:"parts"`
+				} `json:"content"`
+			} `json:"candidates"`
+		}
+		if err := json.Unmarshal(responseBody, &result); err != nil {
+			return nil, err
+		}
+		if len(result.Candidates) == 0 || len(result.Candidates[0].Content.Parts) == 0 {
+			if len(result.Candidates) > 0 && result.Candidates[0].FinishReason == "MAX_TOKENS" && attempt == 0 && useThinkingBudget {
+				continue
+			}
+			return nil, errors.New("Gemini returned no analysis text")
+		}
+		if result.Candidates[0].FinishReason == "MAX_TOKENS" {
+			if attempt == 0 && useThinkingBudget {
+				continue
+			}
+			return nil, errors.New("Gemini analysis exceeded output token limit")
+		}
+		text := ""
+		for _, part := range result.Candidates[0].Content.Parts {
+			text += part.Text
+		}
+		var analysis map[string]any
+		if err := json.Unmarshal([]byte(text), &analysis); err != nil {
+			return nil, err
+		}
+		decision, _ := analysis["decision"].(string)
+		summary, _ := analysis["summary"].(string)
+		if (decision != "review_only" && decision != "propose_fix") || strings.TrimSpace(summary) == "" {
+			return nil, errors.New("Gemini returned an incomplete compatibility analysis")
+		}
+		return analysis, nil
+	}
+	return nil, errors.New("Gemini analysis retry exhausted")
 }
 
 func writeJSON(path string, value any) error {

@@ -37,16 +37,30 @@ type proposalReport struct {
 type evidenceReport struct {
 	Modules []struct {
 		Module               string `json:"module"`
+		LatestVersion        string `json:"latestVersion"`
 		ToolchainRequirement string `json:"toolchainRequirement"`
 	} `json:"modules"`
 }
 
-type verificationReport struct {
-	Modules []struct {
-		Module string `json:"module"`
-		Latest string `json:"latest"`
+type verificationSuite struct {
+	Status   string `json:"status"`
+	Baseline struct {
 		Status string `json:"status"`
-	} `json:"modules"`
+	} `json:"baseline"`
+	Latest struct {
+		Status string `json:"status"`
+	} `json:"latest"`
+}
+
+type verificationModule struct {
+	Module string              `json:"module"`
+	Latest string              `json:"latest"`
+	Status string              `json:"status"`
+	Suites []verificationSuite `json:"suites"`
+}
+
+type verificationReport struct {
+	Modules []verificationModule `json:"modules"`
 }
 
 type upstreamIssue struct {
@@ -55,27 +69,42 @@ type upstreamIssue struct {
 }
 
 type alertContext struct {
-	ReviewIssueURL          string
-	UnchangedToolchainBlock bool
-	FixPRURL                string
-	FixPROutcome            string
-	PublishCheckOutcome     string
-	PatchJobStatus          string
-	ProposalOutcome         string
-	RetestOutcome           string
-	GeminiOutcome           string
-	IssueOutcome            string
-	FixIssueOutcome         string
-	RunURL                  string
-	FailureStage            string
+	ReviewIssueURL      string
+	FixPRURL            string
+	FixPROutcome        string
+	PublishCheckOutcome string
+	PatchJobStatus      string
+	ProposalOutcome     string
+	RetestOutcome       string
+	GeminiOutcome       string
+	IssueOutcome        string
+	FixIssueOutcome     string
+	RunURL              string
+	FailureStage        string
 }
 
-func optionalJSON(path string, value any) {
+type slackText struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+type slackBlock struct {
+	Type     string      `json:"type"`
+	Text     *slackText  `json:"text,omitempty"`
+	Elements []slackText `json:"elements,omitempty"`
+}
+
+type slackPayload struct {
+	Text   string       `json:"text"`
+	Blocks []slackBlock `json:"blocks"`
+}
+
+func optionalJSON(path string, value any) bool {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return
+		return false
 	}
-	_ = json.Unmarshal(data, value)
+	return json.Unmarshal(data, value) == nil
 }
 
 func workflowURL() string {
@@ -97,6 +126,11 @@ func failedStage() string {
 		{"COMPAT_VERIFY_OUTCOME", "adapter version tests"},
 		{"COMPAT_GEMINI_OUTCOME", "Gemini advisory analysis"},
 		{"COMPAT_ISSUE_OUTCOME", "review issue update"},
+		{"COMPAT_PROPOSAL_OUTCOME", "Gemini patch proposal"},
+		{"COMPAT_RETEST_OUTCOME", "SDK patch retest"},
+		{"COMPAT_PUBLISH_CHECK_OUTCOME", "fix publication validation"},
+		{"COMPAT_FIX_PR_OUTCOME", "fix PR creation"},
+		{"COMPAT_FIX_ISSUE_OUTCOME", "fix status issue update"},
 	} {
 		if os.Getenv(step.env) == "failure" {
 			return step.label
@@ -118,7 +152,7 @@ func conciseSlackText(value string) string {
 }
 
 // A newly published version is recorded in the issue and artifact. Slack is
-// reserved for an outcome that requires a person to act or investigate.
+// reserved for a candidate regression, a fix PR, or failed automation.
 func shouldSendSlack(status string, report releaseReport, evidence evidenceReport, verification verificationReport, analysis analysisReport, proposal proposalReport, alert alertContext) bool {
 	if status != "success" || alert.IssueOutcome == "failure" || alert.FixIssueOutcome == "failure" || alert.GeminiOutcome == "failure" ||
 		alert.PatchJobStatus == "failure" || alert.ProposalOutcome == "failure" || alert.RetestOutcome == "failure" ||
@@ -128,40 +162,77 @@ func shouldSendSlack(status string, report releaseReport, evidence evidenceRepor
 	if len(report.Changes) == 0 {
 		return false
 	}
-	if len(verification.Modules) == 0 {
+	if len(verification.Modules) != len(report.Changes) {
 		return true
+	}
+	for _, change := range report.Changes {
+		found := false
+		for _, module := range verification.Modules {
+			if module.Module == change.Module && module.Latest == change.Latest {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return true
+		}
 	}
 	if alert.FixPRURL != "" || proposal.Status == "validated" {
 		return true
 	}
-	// The review issue retains unchanged toolchain-only findings. A repeated
-	// schedule should not page Slack again for the same blocked release.
-	if alert.UnchangedToolchainBlock {
-		toolchainBlocked := make(map[string]bool)
-		for _, module := range evidence.Modules {
-			toolchainBlocked[module.Module] = module.ToolchainRequirement != ""
-		}
-		unchangedToolchainOnly := false
-		for _, module := range verification.Modules {
-			if module.Status == "blocked" && toolchainBlocked[module.Module] {
-				unchangedToolchainOnly = true
-				continue
-			}
-			if module.Status != "pass" {
-				unchangedToolchainOnly = false
-				break
-			}
-		}
-		if unchangedToolchainOnly {
-			return false
-		}
+	if analysis.Skipped && analysis.Reason != "No uncovered release is testable with this runner" {
+		return true
 	}
 	for _, module := range verification.Modules {
-		if module.Status != "pass" {
+		if len(module.Suites) == 0 && module.Status == "blocked" && hasToolchainBlock(evidence, module) {
+			continue
+		}
+		knownSuites, preexistingFailure := classifySuites(module.Suites)
+		if !knownSuites {
+			return true
+		}
+		switch module.Status {
+		case "pass", "blocked":
+			// Documented in the issue and artifact; no SDK regression established.
+		case "fail":
+			return true
+		case "not_tested":
+			if !preexistingFailure {
+				return true
+			}
+		default:
 			return true
 		}
 	}
-	return analysis.Skipped && analysis.Reason != "No uncovered release is testable with this runner"
+	return false
+}
+
+func hasToolchainBlock(evidence evidenceReport, module verificationModule) bool {
+	for _, item := range evidence.Modules {
+		if item.Module == module.Module && item.LatestVersion == module.Latest && item.ToolchainRequirement != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// The verifier marks baseline-fail/latest-fail suites as not_tested because
+// the failure cannot be attributed to the newly published version. Other
+// not_tested results lack enough evidence and still warrant an alert.
+func classifySuites(suites []verificationSuite) (known, preexistingFailure bool) {
+	if len(suites) == 0 {
+		return false, false
+	}
+	for _, suite := range suites {
+		if suite.Status == "pass" || suite.Status == "blocked" {
+			continue
+		}
+		if suite.Status != "not_tested" || suite.Baseline.Status != "fail" || suite.Latest.Status != "fail" {
+			return false, preexistingFailure
+		}
+		preexistingFailure = true
+	}
+	return true, preexistingFailure
 }
 
 func slackMessage(status string, report releaseReport, evidence evidenceReport, verification verificationReport, analysis analysisReport, proposal proposalReport, issue upstreamIssue, alert alertContext) string {
@@ -188,7 +259,7 @@ func slackMessage(status string, report releaseReport, evidence evidenceReport, 
 		if alert.FixPRURL != "" {
 			fixText = fmt.Sprintf("<%s|open for review>", alert.FixPRURL)
 		}
-		return fmt.Sprintf(":red_circle: *Go SDK: compatibility monitor failed — inspect workflow.*\nChecked: incomplete | Regression: no verdict | Fix PR: %s\nAction: Investigate failure during %s.%s", fixText, alert.FailureStage, linkText)
+		return fmt.Sprintf(":red_circle: *Go SDK: compatibility monitor failed — inspect workflow.*\nChecked: incomplete\nRegression: no verdict\nFix PR: %s\nAction: Investigate failure during %s.%s", fixText, alert.FailureStage, linkText)
 	}
 	toolchainBlocks := make([]string, 0)
 	for _, item := range evidence.Modules {
@@ -261,18 +332,18 @@ func slackMessage(status string, report releaseReport, evidence evidenceReport, 
 		if proposal.Validation == "test_regression_resolved" {
 			action += " The mapped regression passed after the patch."
 		}
+	case alert.GeminiOutcome == "failure" || analysis.Skipped && analysis.Reason != "No uncovered release is testable with this runner":
+		heading = ":warning: *Go SDK: Gemini analysis failed — inspect workflow.*"
+		action = "Inspect Gemini analysis; mapped adapter checks passed."
+	case status != "success" || alert.IssueOutcome == "failure" || alert.FixIssueOutcome == "failure" || alert.PatchJobStatus == "failure" || alert.ProposalOutcome == "failure" || alert.RetestOutcome == "failure" || alert.PublishCheckOutcome == "failure" || alert.FixPROutcome == "failure":
+		heading = ":red_circle: *Go SDK: compatibility automation failed — inspect workflow.*"
+		action = "Inspect workflow failure and the mapped adapter results."
 	case blocked > 0 && len(toolchainBlocks) > 0:
 		heading = ":warning: *Go SDK: release blocked by Go toolchain — review Go version support.*"
 		action = strings.Join(toolchainBlocks, "; ") + ". Decide whether to upgrade SDK CI to test it."
 	case blocked > 0 || notTested > 0 || len(verification.Modules) == 0:
 		heading = ":warning: *Go SDK: verification incomplete — investigate untested releases.*"
 		action = "Investigate blocked or untested adapter checks."
-	case alert.GeminiOutcome == "failure" || analysis.Skipped && analysis.Reason != "No uncovered release is testable with this runner":
-		heading = ":warning: *Go SDK: Gemini analysis failed — inspect workflow.*"
-		action = "Inspect Gemini analysis; mapped adapter checks passed."
-	case status != "success" || alert.IssueOutcome == "failure" || alert.FixIssueOutcome == "failure" || alert.PatchJobStatus == "failure" || alert.ProposalOutcome == "failure" || alert.RetestOutcome == "failure" || alert.PublishCheckOutcome == "failure" || alert.FixPROutcome == "failure":
-		heading = ":red_circle: *Go SDK: compatibility automation failed — inspect workflow.*"
-		action = "Inspect workflow failure; mapped adapter checks passed."
 	}
 	if proposal.Status == "rejected" && proposal.Reason != "" {
 		action += " Proposed fix rejected: " + conciseSlackText(proposal.Reason) + "."
@@ -293,15 +364,45 @@ func slackMessage(status string, report releaseReport, evidence evidenceReport, 
 	if status != "success" {
 		action += fmt.Sprintf(" Monitor also failed during %s.", alert.FailureStage)
 	}
-	return fmt.Sprintf("%s\nChecked: %s | Regression: %s | Fix PR: %s\nAction: %s%s", heading, checked, regression, fixPR, action, linkText)
+	return fmt.Sprintf("%s\nChecked: %s\nRegression: %s\nFix PR: %s\nAction: %s%s", heading, checked, regression, fixPR, action, linkText)
+}
+
+// Keep a plain-text fallback for notifications, and show a small number of
+// separate Block Kit sections so the verdict and next action are scannable.
+func buildSlackPayload(message string) slackPayload {
+	lines := strings.Split(message, "\n")
+	result := slackPayload{Text: message}
+	if len(lines) == 0 {
+		return result
+	}
+	heading := slackText{Type: "mrkdwn", Text: lines[0]}
+	result.Blocks = append(result.Blocks, slackBlock{Type: "section", Text: &heading})
+	verdict := make([]string, 0, 3)
+	for _, line := range lines[1:] {
+		switch {
+		case strings.HasPrefix(line, "Checked: "):
+			verdict = append(verdict, "*Checked:* "+strings.TrimPrefix(line, "Checked: "))
+		case strings.HasPrefix(line, "Regression: "):
+			verdict = append(verdict, "*Regression:* "+strings.TrimPrefix(line, "Regression: "))
+		case strings.HasPrefix(line, "Fix PR: "):
+			verdict = append(verdict, "*Fix PR:* "+strings.TrimPrefix(line, "Fix PR: "))
+		case strings.HasPrefix(line, "Action: "):
+			if len(verdict) > 0 {
+				status := slackText{Type: "mrkdwn", Text: strings.Join(verdict, "\n")}
+				result.Blocks = append(result.Blocks, slackBlock{Type: "section", Text: &status})
+				verdict = nil
+			}
+			action := slackText{Type: "mrkdwn", Text: "*Action:* " + strings.TrimPrefix(line, "Action: ")}
+			result.Blocks = append(result.Blocks, slackBlock{Type: "section", Text: &action})
+		case strings.HasPrefix(line, "Details: "):
+			links := slackText{Type: "mrkdwn", Text: strings.TrimPrefix(line, "Details: ")}
+			result.Blocks = append(result.Blocks, slackBlock{Type: "context", Elements: []slackText{links}})
+		}
+	}
+	return result
 }
 
 func main() {
-	webhook := os.Getenv("COMPAT_SLACK_WEBHOOK_URL")
-	if webhook == "" {
-		fmt.Println("Slack notification skipped: COMPAT_SLACK_WEBHOOK_URL is not configured")
-		return
-	}
 	status := os.Getenv("COMPAT_JOB_STATUS")
 	if os.Getenv("COMPAT_VERIFY_OUTCOME") == "failure" {
 		status = "failure"
@@ -315,10 +416,10 @@ func main() {
 	var analysis analysisReport
 	var proposal proposalReport
 	var issue upstreamIssue
-	optionalJSON("compatibility-release-report.json", &report)
-	optionalJSON("compatibility-evidence.json", &evidence)
-	optionalJSON("compatibility-verification.json", &verification)
-	optionalJSON("compatibility-llm-analysis.json", &analysis)
+	reportLoaded := optionalJSON("compatibility-release-report.json", &report)
+	evidenceLoaded := optionalJSON("compatibility-evidence.json", &evidence)
+	verificationLoaded := optionalJSON("compatibility-verification.json", &verification)
+	analysisLoaded := optionalJSON("compatibility-llm-analysis.json", &analysis)
 	optionalJSON("compatibility-proposal.json", &proposal)
 	issuePath := os.Getenv("COMPAT_UPSTREAM_ISSUE_FILE")
 	if issuePath == "" {
@@ -326,7 +427,7 @@ func main() {
 	}
 	optionalJSON(issuePath, &issue)
 	alert := alertContext{
-		ReviewIssueURL: os.Getenv("COMPAT_REVIEW_ISSUE_URL"), UnchangedToolchainBlock: os.Getenv("COMPAT_UNCHANGED_TOOLCHAIN_BLOCK") == "true", FixPRURL: os.Getenv("COMPAT_FIX_PR_URL"),
+		ReviewIssueURL: os.Getenv("COMPAT_REVIEW_ISSUE_URL"), FixPRURL: os.Getenv("COMPAT_FIX_PR_URL"),
 		FixPROutcome: os.Getenv("COMPAT_FIX_PR_OUTCOME"), PublishCheckOutcome: os.Getenv("COMPAT_PUBLISH_CHECK_OUTCOME"),
 		PatchJobStatus: os.Getenv("COMPAT_PATCH_JOB_STATUS"), IssueOutcome: os.Getenv("COMPAT_ISSUE_OUTCOME"),
 		ProposalOutcome: os.Getenv("COMPAT_PROPOSAL_OUTCOME"), RetestOutcome: os.Getenv("COMPAT_RETEST_OUTCOME"),
@@ -334,27 +435,42 @@ func main() {
 		FixIssueOutcome: os.Getenv("COMPAT_FIX_ISSUE_OUTCOME"),
 		RunURL:          workflowURL(), FailureStage: failedStage(),
 	}
+	if status == "success" && os.Getenv("COMPAT_CHANGES_FOUND") == "true" && (!reportLoaded || !evidenceLoaded || !verificationLoaded || !analysisLoaded) {
+		status = "failure"
+		alert.FailureStage = "compatibility report or analysis artifact loading"
+	}
 	if !shouldSendSlack(status, report, evidence, verification, analysis, proposal, alert) {
 		fmt.Println("Slack compatibility alert skipped: no actionable outcome; results are in the issue and run artifact")
 		return
 	}
-	payload, err := json.Marshal(map[string]string{"text": slackMessage(status, report, evidence, verification, analysis, proposal, issue, alert)})
+	webhook := os.Getenv("COMPAT_SLACK_WEBHOOK_URL")
+	payload, err := json.Marshal(buildSlackPayload(slackMessage(status, report, evidence, verification, analysis, proposal, issue, alert)))
 	if err != nil {
 		panic(err)
 	}
+	if err := postSlack(webhook, payload); err != nil {
+		panic(err)
+	}
+	fmt.Println("Slack compatibility alert sent")
+}
+
+func postSlack(webhook string, payload []byte) error {
+	if webhook == "" {
+		return fmt.Errorf("actionable compatibility alert cannot be delivered: COMPAT_SLACK_WEBHOOK_URL is not configured")
+	}
 	request, err := http.NewRequest(http.MethodPost, webhook, bytes.NewReader(payload))
 	if err != nil {
-		panic(err)
+		return err
 	}
 	request.Header.Set("Content-Type", "application/json")
 	client := &http.Client{Timeout: 30 * time.Second}
 	response, err := client.Do(request)
 	if err != nil {
-		panic(err)
+		return err
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		panic(fmt.Sprintf("Slack webhook returned %d", response.StatusCode))
+		return fmt.Errorf("Slack webhook returned %d", response.StatusCode)
 	}
-	fmt.Println("Slack compatibility alert sent")
+	return nil
 }

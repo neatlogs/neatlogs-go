@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -50,15 +52,85 @@ func TestGeminiSelectsNextUncoveredTestableModule(t *testing.T) {
 	}
 }
 
-func TestGeminiRotatesUncoveredModulesAcrossRuns(t *testing.T) {
+func TestGeminiGivesPersistentRegressionAndPassingModulesReviewSlots(t *testing.T) {
 	evidence := evidenceReport{Modules: []moduleEvidence{{Module: "example.com/first", LatestVersion: "v2"}, {Module: "example.com/second", LatestVersion: "v3"}, {Module: "example.com/third", LatestVersion: "v4"}}}
 	verification := json.RawMessage(`{"modules":[{"module":"example.com/first","status":"fail"},{"module":"example.com/second","status":"pass"},{"module":"example.com/third","status":"pass"}]}`)
-	want := []string{"example.com/first", "example.com/second", "example.com/third", "example.com/first"}
+	want := []string{"example.com/first", "example.com/second", "example.com/first", "example.com/third", "example.com/first", "example.com/second"}
 	for run, expected := range want {
 		_, _, got := selectedGeminiEvidence(evidence, verification, json.RawMessage(`[]`), run)
 		if got != expected {
 			t.Fatalf("run %d selected %q, want %q", run, got, expected)
 		}
+	}
+}
+
+func TestGeminiRotatesAmongUncoveredRegressions(t *testing.T) {
+	evidence := evidenceReport{Modules: []moduleEvidence{
+		{Module: "example.com/failing-a", LatestVersion: "v2"},
+		{Module: "example.com/passing", LatestVersion: "v3"},
+		{Module: "example.com/failing-b", LatestVersion: "v4"},
+	}}
+	verification := json.RawMessage(`{"modules":[{"module":"example.com/failing-a","status":"fail"},{"module":"example.com/passing","status":"pass"},{"module":"example.com/failing-b","status":"fail"}]}`)
+	want := []string{"example.com/failing-a", "example.com/passing", "example.com/failing-b", "example.com/passing", "example.com/failing-a"}
+	for run, expected := range want {
+		_, _, got := selectedGeminiEvidence(evidence, verification, json.RawMessage(`[]`), run)
+		if got != expected {
+			t.Fatalf("run %d selected %q, want %q", run, got, expected)
+		}
+	}
+}
+
+func TestGeminiRetriesTruncatedFlashAnalysisWithNoThinking(t *testing.T) {
+	budgets := make([]int, 0)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		var body struct {
+			GenerationConfig struct {
+				ThinkingConfig struct {
+					ThinkingBudget int `json:"thinkingBudget"`
+				} `json:"thinkingConfig"`
+			} `json:"generationConfig"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Errorf("decode Gemini request: %v", err)
+		}
+		budgets = append(budgets, body.GenerationConfig.ThinkingConfig.ThinkingBudget)
+		writer.Header().Set("Content-Type", "application/json")
+		if len(budgets) == 1 {
+			_, _ = writer.Write([]byte(`{"candidates":[{"finishReason":"MAX_TOKENS","content":{"parts":[]}}]}`))
+			return
+		}
+		_, _ = writer.Write([]byte(`{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"{\"decision\":\"review_only\",\"summary\":\"No mapped regression found\"}"}]}}]}`))
+	}))
+	defer server.Close()
+	analysis, err := requestGeminiAnalysis("review", "test-key", "gemini-2.5-flash", server.URL, server.Client())
+	if err != nil || analysis["decision"] != "review_only" || !reflect.DeepEqual(budgets, []int{1024, 0}) {
+		t.Fatalf("Gemini retry = %#v, %v; thinking budgets = %v", analysis, err, budgets)
+	}
+}
+
+func TestGeminiRepeatedTruncationFailsClosed(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests++
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"candidates":[{"finishReason":"MAX_TOKENS","content":{"parts":[{"text":"{\"decision\":\"propose_fix\"}"}]}}]}`))
+	}))
+	defer server.Close()
+	analysis, err := requestGeminiAnalysis("review", "test-key", "gemini-2.5-flash", server.URL, server.Client())
+	if err == nil || analysis != nil || requests != 2 || !strings.Contains(err.Error(), "output token limit") {
+		t.Fatalf("truncated Gemini result must fail closed: %#v, %v; requests = %d", analysis, err, requests)
+	}
+}
+
+func TestGeminiIncompleteButValidJSONIsNotACompletedReview(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"{}"}]}}]}`))
+	}))
+	defer server.Close()
+	analysis, err := requestGeminiAnalysis("review", "test-key", "gemini-2.5-flash", server.URL, server.Client())
+	if err == nil || analysis != nil || !strings.Contains(err.Error(), "incomplete") {
+		t.Fatalf("empty Gemini analysis must fail visibly: %#v, %v", analysis, err)
 	}
 }
 
@@ -82,7 +154,7 @@ func BeforeTool(ctx tool.Context) { _ = ctx; _ = wrapper.field }
 		t.Fatal(err)
 	}
 	prompt := geminiPrompt(module.Module, json.RawMessage(`{"modules":[]}`), json.RawMessage(`[]`), evidenceJSON)
-	if !strings.Contains(prompt, want[0]) || !strings.Contains(prompt, "identical types") || !strings.Contains(prompt, "Use review_only") || !strings.Contains(prompt, "Only propose a source-code fix when a mapped adapter suite passed at the recorded baseline and failed at the new version") {
+	if !strings.Contains(prompt, want[0]) || !strings.Contains(prompt, "identical types") || !strings.Contains(prompt, "Use review_only") || !strings.Contains(prompt, "accept a fix only if the test passes at baseline, fails at latest") {
 		t.Fatalf("Gemini prompt omitted alias evidence or decision guidance: %s", prompt)
 	}
 	proposal := func() map[string]any {
