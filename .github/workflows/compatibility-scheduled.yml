@@ -128,7 +128,6 @@ jobs:
       gemini_outcome: ${{ steps.gemini.outcome }}
       issue_outcome: ${{ steps.review_issue.outcome }}
       review_issue_url: ${{ steps.review_issue.outputs.issue_url }}
-      unchanged_toolchain_block: ${{ steps.review_issue.outputs.unchanged_toolchain_block }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -188,7 +187,6 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const crypto = require('crypto');
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const title = '[compatibility] New Go integration releases detected';
@@ -215,24 +213,6 @@ jobs:
             const verification = fs.existsSync('compatibility-verification.json')
               ? JSON.parse(fs.readFileSync('compatibility-verification.json', 'utf8'))
               : { modules: JSON.parse(report).changes.map((item) => ({ module: item.module, latest: item.latest, status: 'not_tested', detail: 'Adapter test tooling did not complete; inspect the workflow run', suites: [] })) };
-            const evidenceByModule = new Map(evidence.modules.map((item) => [item.module, item]));
-            const releaseByModule = new Map(JSON.parse(report).changes.map((item) => [item.module, item]));
-            const findings = verification.modules.map((item) => ({
-              module: item.module,
-              baseline: releaseByModule.get(item.module)?.previouslyAnalyzed || '',
-              latest: item.latest,
-              status: item.status,
-              toolchainRequirement: evidenceByModule.get(item.module)?.toolchainRequirement || '',
-              suites: (item.suites || []).map((suite) => ({
-                integration: suite.integration,
-                status: suite.status,
-                baseline: suite.baseline?.status || '',
-                latest: suite.latest?.status || '',
-              })).sort((a, b) => a.integration.localeCompare(b.integration)),
-            })).sort((a, b) => a.module.localeCompare(b.module));
-            const fingerprint = crypto.createHash('sha256').update(JSON.stringify(findings)).digest('hex');
-            const toolchainBlockOnly = findings.length > 0 && findings.some((item) => item.status === 'blocked') &&
-              findings.every((item) => item.status === 'pass' || (item.status === 'blocked' && item.toolchainRequirement));
             const runURL = `${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${context.runId}`;
             const toolchainFindings = evidence.modules
               .filter((item) => item.toolchainRequirement)
@@ -269,7 +249,6 @@ jobs:
               analysisSummary,
               '```',
               '',
-              `<!-- go-compatibility-fingerprint:${fingerprint} -->`,
             ].join('\n');
             const { data: issues } = await github.rest.issues.listForRepo({
               owner,
@@ -280,14 +259,11 @@ jobs:
             });
             const existing = issues.find((issue) => issue.title === title);
             if (existing) {
-              const previousFingerprint = existing.body?.match(/<!-- go-compatibility-fingerprint:([0-9a-f]{64}) -->/)?.[1];
               const { data: updated } = await github.rest.issues.update({ owner, repo, issue_number: existing.number, body });
               core.setOutput('issue_url', updated.html_url);
-              core.setOutput('unchanged_toolchain_block', String(toolchainBlockOnly && previousFingerprint === fingerprint));
             } else {
               const { data: created } = await github.rest.issues.create({ owner, repo, title, body });
               core.setOutput('issue_url', created.html_url);
-              core.setOutput('unchanged_toolchain_block', 'false');
             }
 
   validate_patch:
@@ -519,7 +495,6 @@ jobs:
           COMPAT_ISSUE_OUTCOME: ${{ needs.analyze.outputs.issue_outcome }}
           COMPAT_FIX_ISSUE_OUTCOME: ${{ steps.fix_issue.outcome }}
           COMPAT_REVIEW_ISSUE_URL: ${{ needs.analyze.outputs.review_issue_url }}
-          COMPAT_UNCHANGED_TOOLCHAIN_BLOCK: ${{ needs.analyze.outputs.unchanged_toolchain_block }}
           COMPAT_FIX_PR_URL: ${{ steps.fix_pr.outputs.pr_url }}
           COMPAT_FIX_PR_OUTCOME: ${{ steps.fix_pr.outcome }}
           COMPAT_PUBLISH_CHECK_OUTCOME: ${{ steps.publish_check.outcome }}
