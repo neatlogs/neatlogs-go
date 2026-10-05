@@ -37,6 +37,7 @@ type proposalReport struct {
 type evidenceReport struct {
 	Modules []struct {
 		Module               string `json:"module"`
+		LatestVersion        string `json:"latestVersion"`
 		ToolchainRequirement string `json:"toolchainRequirement"`
 	} `json:"modules"`
 }
@@ -156,7 +157,7 @@ func shouldSendSlack(status string, report releaseReport, evidence evidenceRepor
 	if len(report.Changes) == 0 {
 		return false
 	}
-	if len(verification.Modules) == 0 {
+	if len(verification.Modules) != len(report.Changes) {
 		return true
 	}
 	for _, change := range report.Changes {
@@ -178,6 +179,9 @@ func shouldSendSlack(status string, report releaseReport, evidence evidenceRepor
 		return true
 	}
 	for _, module := range verification.Modules {
+		if len(module.Suites) == 0 && module.Status == "blocked" && hasToolchainBlock(evidence, module) {
+			continue
+		}
 		knownSuites, preexistingFailure := classifySuites(module.Suites)
 		if !knownSuites {
 			return true
@@ -198,10 +202,22 @@ func shouldSendSlack(status string, report releaseReport, evidence evidenceRepor
 	return false
 }
 
+func hasToolchainBlock(evidence evidenceReport, module verificationModule) bool {
+	for _, item := range evidence.Modules {
+		if item.Module == module.Module && item.LatestVersion == module.Latest && item.ToolchainRequirement != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // The verifier marks baseline-fail/latest-fail suites as not_tested because
 // the failure cannot be attributed to the newly published version. Other
 // not_tested results lack enough evidence and still warrant an alert.
 func classifySuites(suites []verificationSuite) (known, preexistingFailure bool) {
+	if len(suites) == 0 {
+		return false, false
+	}
 	for _, suite := range suites {
 		if suite.Status == "pass" || suite.Status == "blocked" {
 			continue
