@@ -78,6 +78,8 @@ jobs:
           GOWORK=off go test -mod=readonly ./...
           GOWORK=off go vet ./...
           go build ./cmd/neatlogs
+          git config user.name 'neatlogs-release[bot]'
+          git config user.email 'neatlogs-release[bot]@users.noreply.github.com'
           git remote set-url origin "https://x-access-token:${RELEASE_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git tag -a "$ROOT_VERSION" -m "Release root module $ROOT_VERSION"
           git push origin "refs/tags/${ROOT_VERSION}"
