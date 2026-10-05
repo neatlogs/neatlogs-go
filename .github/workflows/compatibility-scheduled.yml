@@ -128,6 +128,7 @@ jobs:
       gemini_outcome: ${{ steps.gemini.outcome }}
       issue_outcome: ${{ steps.review_issue.outcome }}
       review_issue_url: ${{ steps.review_issue.outputs.issue_url }}
+      unchanged_toolchain_block: ${{ steps.review_issue.outputs.unchanged_toolchain_block }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -187,6 +188,7 @@ jobs:
         with:
           script: |
             const fs = require('fs');
+            const crypto = require('crypto');
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const title = '[compatibility] New Go integration releases detected';
@@ -204,6 +206,7 @@ jobs:
               evidenceReference: analysis.evidenceReference,
               evidenceRationale: String(analysis.evidenceRationale || '').slice(0, 2000),
               findings: Array.isArray(analysis.findings) ? analysis.findings.slice(0, 5) : [],
+              recommendedTests: Array.isArray(analysis.recommendedTests) ? analysis.recommendedTests.slice(0, 5) : [],
               skipped: analysis.skipped,
               reason: analysis.reason,
               note: 'Proposed source changes are omitted here; see the run artifact and any fix PR diff.',
@@ -212,6 +215,24 @@ jobs:
             const verification = fs.existsSync('compatibility-verification.json')
               ? JSON.parse(fs.readFileSync('compatibility-verification.json', 'utf8'))
               : { modules: JSON.parse(report).changes.map((item) => ({ module: item.module, latest: item.latest, status: 'not_tested', detail: 'Adapter test tooling did not complete; inspect the workflow run', suites: [] })) };
+            const evidenceByModule = new Map(evidence.modules.map((item) => [item.module, item]));
+            const releaseByModule = new Map(JSON.parse(report).changes.map((item) => [item.module, item]));
+            const findings = verification.modules.map((item) => ({
+              module: item.module,
+              baseline: releaseByModule.get(item.module)?.previouslyAnalyzed || '',
+              latest: item.latest,
+              status: item.status,
+              toolchainRequirement: evidenceByModule.get(item.module)?.toolchainRequirement || '',
+              suites: (item.suites || []).map((suite) => ({
+                integration: suite.integration,
+                status: suite.status,
+                baseline: suite.baseline?.status || '',
+                latest: suite.latest?.status || '',
+              })).sort((a, b) => a.integration.localeCompare(b.integration)),
+            })).sort((a, b) => a.module.localeCompare(b.module));
+            const fingerprint = crypto.createHash('sha256').update(JSON.stringify(findings)).digest('hex');
+            const toolchainBlockOnly = findings.length > 0 && findings.some((item) => item.status === 'blocked') &&
+              findings.every((item) => item.status === 'pass' || (item.status === 'blocked' && item.toolchainRequirement));
             const runURL = `${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${context.runId}`;
             const toolchainFindings = evidence.modules
               .filter((item) => item.toolchainRequirement)
@@ -222,12 +243,12 @@ jobs:
             ]);
             const body = [
               verification.modules.some((item) => item.status === 'fail')
-                ? 'The scheduled monitor found upstream releases and a regression in a mapped adapter test suite: the recorded baseline passed, but the new version failed. Human review is required.'
+                ? 'The scheduled monitor found a candidate regression in a mapped adapter test suite: the recorded baseline passed, but the new version failed. Human review is required.'
                 : 'The scheduled monitor found upstream releases newer than the analyzed version lock. No regression was confirmed in the mapped adapter tests; review is still needed for blocked or untested behavior.',
               '',
               `Evidence and workflow logs: ${runURL}`,
               '',
-              'The workflow compares published module contents, APIs, and documentation. It runs mapped adapter suites at the analyzed baseline and new version. Gemini may propose one bounded SDK source fix per run for a separate read-only validation job; a validated candidate can open a PR for human review. Other findings remain deferred in this issue. A failed latest-version suite is attributed to the release only when its baseline passes. Review the evidence before updating `.compatibility/versions.lock.json`.',
+              'The workflow compares published module contents, APIs, and documentation. It runs mapped adapter suites at the analyzed baseline and new version. Gemini records code-specific advisory findings here, but an automated fix PR opens only when a mapped suite passes at baseline, fails at the new version, and passes after the patch. Other findings remain for review and focused test development. Review the evidence before updating `.compatibility/versions.lock.json`.',
               '',
               '### Deterministic adapter test results',
               ...verificationFindings,
@@ -247,6 +268,8 @@ jobs:
               '```json',
               analysisSummary,
               '```',
+              '',
+              `<!-- go-compatibility-fingerprint:${fingerprint} -->`,
             ].join('\n');
             const { data: issues } = await github.rest.issues.listForRepo({
               owner,
@@ -257,11 +280,14 @@ jobs:
             });
             const existing = issues.find((issue) => issue.title === title);
             if (existing) {
+              const previousFingerprint = existing.body?.match(/<!-- go-compatibility-fingerprint:([0-9a-f]{64}) -->/)?.[1];
               const { data: updated } = await github.rest.issues.update({ owner, repo, issue_number: existing.number, body });
               core.setOutput('issue_url', updated.html_url);
+              core.setOutput('unchanged_toolchain_block', String(toolchainBlockOnly && previousFingerprint === fingerprint));
             } else {
               const { data: created } = await github.rest.issues.create({ owner, repo, title, body });
               core.setOutput('issue_url', created.html_url);
+              core.setOutput('unchanged_toolchain_block', 'false');
             }
 
   validate_patch:
@@ -302,7 +328,7 @@ jobs:
           go run ./scripts/compatibility/verify --output=compatibility-proposal-verification.json
           go run ./scripts/compatibility/propose --check-tests
           git diff --check
-          if jq -e '.status == "validated"' compatibility-proposal.json >/dev/null; then
+          if jq -e '.status == "validated" and .validation == "test_regression_resolved"' compatibility-proposal.json >/dev/null; then
             echo 'validated=true' >> "$GITHUB_OUTPUT"
           fi
       - uses: actions/upload-artifact@v4
@@ -365,7 +391,7 @@ jobs:
             --output=compatibility-proposal.json \
             --verification=compatibility-discovery/compatibility-verification.json \
             --retest=compatibility-validation/compatibility-proposal-verification.json
-          jq -e '.status == "validated"' compatibility-proposal.json >/dev/null
+          jq -e '.status == "validated" and .validation == "test_regression_resolved"' compatibility-proposal.json >/dev/null
           git diff --check
           echo 'ready=true' >> "$GITHUB_OUTPUT"
       - name: Open or reuse a fix PR for review
@@ -383,7 +409,7 @@ jobs:
             const cp = require('child_process');
             const proposal = JSON.parse(fs.readFileSync('compatibility-proposal.json', 'utf8'));
             const validated = JSON.parse(fs.readFileSync('compatibility-validation/compatibility-proposal.json', 'utf8'));
-            if (proposal.status !== 'validated' || validated.status !== 'validated') throw new Error('Proposal was not validated');
+            if (proposal.status !== 'validated' || validated.status !== 'validated' || proposal.validation !== 'test_regression_resolved' || validated.validation !== 'test_regression_resolved') throw new Error('Proposal lacks a reproduced and resolved mapped adapter regression');
             if (context.ref !== `refs/heads/${context.payload.repository.default_branch}`) throw new Error('Fix PR creation requires a default-branch run');
             if (cp.execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim() !== context.sha) throw new Error('Checkout differs from workflow base SHA');
             const allow = new Set(['contrib/adk/a2a.go', 'contrib/adk/adk.go', 'contrib/adk/run.go', 'contrib/adk/tools.go', 'contrib/genai/genai.go']);
@@ -443,9 +469,7 @@ jobs:
               return;
             }
             const runURL = `${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${context.runId}`;
-            const validation = proposal.validation === 'test_regression_resolved'
-              ? 'A baseline-pass/latest-fail adapter test was resolved by this patch.'
-              : 'Mapped adapter suites passed before and after this patch; the suspected behavioral regression has not been reproduced. Human review and a focused regression test are required.';
+            const validation = 'A baseline-pass/latest-fail mapped adapter test passed after this patch.';
             const body = `Gemini-proposed SDK source fix for ${proposal.targetModule}@${proposal.targetVersion}. Review the code and evidence before merging; this workflow does not approve or merge PRs. This PR also advances the analyzed version lock for only this module from ${release.previouslyAnalyzed} to ${proposal.targetVersion}.\n\nEvidence: ${proposal.evidenceReference}\n\nRationale: ${proposal.evidenceRationale}\n\nValidation: ${validation}\n\nReview issue: ${process.env.REVIEW_ISSUE_URL || 'unavailable'}\nWorkflow and artifacts: ${runURL}`;
             const { data: pull } = await github.rest.pulls.create({ owner, repo, head: branch, base: context.payload.repository.default_branch, title: `[compatibility] Proposed Go SDK fix for ${proposal.targetModule}@${proposal.targetVersion}`, body, draft: false });
             core.setOutput('pr_url', pull.html_url);
@@ -495,6 +519,7 @@ jobs:
           COMPAT_ISSUE_OUTCOME: ${{ needs.analyze.outputs.issue_outcome }}
           COMPAT_FIX_ISSUE_OUTCOME: ${{ steps.fix_issue.outcome }}
           COMPAT_REVIEW_ISSUE_URL: ${{ needs.analyze.outputs.review_issue_url }}
+          COMPAT_UNCHANGED_TOOLCHAIN_BLOCK: ${{ needs.analyze.outputs.unchanged_toolchain_block }}
           COMPAT_FIX_PR_URL: ${{ steps.fix_pr.outputs.pr_url }}
           COMPAT_FIX_PR_OUTCOME: ${{ steps.fix_pr.outcome }}
           COMPAT_PUBLISH_CHECK_OUTCOME: ${{ steps.publish_check.outcome }}
