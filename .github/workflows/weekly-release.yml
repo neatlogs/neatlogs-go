@@ -1,8 +1,8 @@
-name: Weekly Go module release
+name: Daily Go module release
 
 on:
   schedule:
-    - cron: '31 8 * * 1'
+    - cron: '31 8 * * *'
   workflow_dispatch:
 
 permissions:
