@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -112,6 +113,26 @@ func TestValidateCandidateRejectsThirdSourceFile(t *testing.T) {
 	}
 }
 
+func TestFocusedRegressionTestIsBoundedAndCannotReplaceExistingFile(t *testing.T) {
+	candidate, releases, evidence, root := fixtureCandidate(t)
+	candidate.ProposedTest = &candidateTest{Package: "genai", Content: "package genai\nimport \"testing\"\nfunc TestCompatibilitySemanticRegression(t *testing.T) { if false { t.Fatal(\"unreachable\") } }\n"}
+	proposal, patches, err := validateCandidate(candidate, releases, evidence, nil, root)
+	if err != nil || proposal.Status != "proposed" || proposal.TestPath == "" || proposal.TestName != "TestCompatibilitySemanticRegression" || !strings.HasPrefix(proposal.TestPath, "contrib/genai/compatibility_") || len(patches[proposal.TestPath]) == 0 {
+		t.Fatalf("focused test proposal = %#v, %v", proposal, err)
+	}
+	fullPath := filepath.Join(root, proposal.TestPath)
+	if err := os.WriteFile(fullPath, []byte("package genai\nfunc TestCompatibilityHijack() {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := validateCandidate(candidate, releases, evidence, nil, root); err == nil || !strings.Contains(err.Error(), "already contains different source") {
+		t.Fatalf("existing test source must not be overwritten: %v", err)
+	}
+	candidate.ProposedTest.Content = "package genai\nfunc init() {}\n"
+	if _, _, err := validateCandidate(candidate, releases, evidence, nil, root); err == nil || !strings.Contains(err.Error(), "one nonempty TestCompatibility") {
+		t.Fatalf("generated init function must be rejected: %v", err)
+	}
+}
+
 func TestValidateRetestRequiresBothVersionSuitesPass(t *testing.T) {
 	proposal := proposalReport{Status: "proposed", TargetModule: "example.com/sdk", TargetVersion: "v2"}
 	before := verificationReport{}
@@ -179,5 +200,73 @@ func TestValidateRetestRejectsAdvisoryOnlyPatchWithoutRedGreenProof(t *testing.T
 	got = validateRetest(proposal, before, after)
 	if got.Status != "rejected" || !strings.Contains(got.Reason, "same suite") {
 		t.Fatalf("different suite must not count as green proof: %#v", got)
+	}
+}
+
+func TestValidateRetestPreservesPassingSuiteInMixedStatusModule(t *testing.T) {
+	proposal := proposalReport{Status: "proposed", TargetModule: "example.com/target", TargetVersion: "v2"}
+	var before, after verificationReport
+	if err := json.Unmarshal([]byte(`{"modules":[
+		{"module":"example.com/target","latest":"v2","status":"fail","suites":[{"integration":"target","package":"contrib/genai","status":"fail","baseline":{"status":"pass"},"latest":{"status":"fail"}}]},
+		{"module":"example.com/other","latest":"v3","status":"blocked","suites":[{"integration":"shared","package":"contrib/adk","status":"pass","baseline":{"status":"pass"},"latest":{"status":"pass"}},{"integration":"blocked","package":"contrib/adk","status":"blocked","baseline":{"status":"pass"},"latest":{"status":"blocked"}}]}
+	]}`), &before); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(`{"modules":[
+		{"module":"example.com/target","latest":"v2","status":"pass","suites":[{"integration":"target","package":"contrib/genai","status":"pass","baseline":{"status":"pass"},"latest":{"status":"pass"}}]},
+		{"module":"example.com/other","latest":"v3","status":"fail","suites":[{"integration":"shared","package":"contrib/adk","status":"fail","baseline":{"status":"pass"},"latest":{"status":"fail"}},{"integration":"blocked","package":"contrib/adk","status":"blocked","baseline":{"status":"pass"},"latest":{"status":"blocked"}}]}
+	]}`), &after); err != nil {
+		t.Fatal(err)
+	}
+	got := validateRetest(proposal, before, after)
+	if got.Status != "rejected" || !strings.Contains(got.Reason, "previously passing mapped adapter suite") {
+		t.Fatalf("collateral suite failure must reject the patch: %#v", got)
+	}
+}
+
+func TestFocusedTestNeedsOriginalGreenRedGreenProof(t *testing.T) {
+	proposal := proposalReport{Status: "proposed", TargetModule: "example.com/sdk", TargetVersion: "v2", TestPath: "contrib/genai/compatibility_123_test.go", TestName: "TestCompatibilitySemanticRegression"}
+	var original, red, green verificationReport
+	for _, item := range []struct {
+		text  string
+		value any
+	}{
+		{`{"modules":[{"module":"example.com/sdk","latest":"v2","status":"pass","suites":[{"integration":"genai","package":"contrib/genai","status":"pass","baseline":{"status":"pass"},"latest":{"status":"pass"}}]}]}`, &original},
+		{`{"modules":[{"module":"example.com/sdk","latest":"v2","status":"fail","suites":[{"integration":"genai","package":"contrib/genai","status":"fail","baseline":{"status":"pass"},"latest":{"status":"fail","output":"--- FAIL: TestCompatibilitySemanticRegression (0.00s)"}}]}]}`, &red},
+		{`{"modules":[{"module":"example.com/sdk","latest":"v2","status":"pass","suites":[{"integration":"genai","package":"contrib/genai","status":"pass","baseline":{"status":"pass"},"latest":{"status":"pass"}}]}]}`, &green},
+	} {
+		if err := json.Unmarshal([]byte(item.text), item.value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := validateFocusedRetest(proposal, original, red, green); got.Status != "validated" || got.Validation != "test_regression_resolved" {
+		t.Fatalf("focused red-green proof should validate: %#v", got)
+	}
+	if got := validateFocusedRetest(proposal, original, original, green); got.Status != "rejected" {
+		t.Fatalf("advisory-only focused test must not publish: %#v", got)
+	}
+	red.Modules[0].Suites[0].Latest.Output = "--- FAIL: TestUnrelatedFlake (0.00s)"
+	if got := validateFocusedRetest(proposal, original, red, green); got.Status != "rejected" {
+		t.Fatalf("another test failure must not prove the generated regression: %#v", got)
+	}
+	red.Modules[0].Suites[0].Latest.Output = "--- FAIL: TestCompatibilitySemanticRegression (0.00s)"
+	otherOriginal := original.Modules[0]
+	otherOriginal.Module, otherOriginal.Latest = "example.com/other", "v3"
+	otherSuite := suiteResult{Integration: "adk", Package: "contrib/adk", Status: "pass"}
+	otherSuite.Baseline.Status, otherSuite.Latest.Status = "pass", "pass"
+	otherOriginal.Suites = []suiteResult{otherSuite}
+	original.Modules = append(original.Modules, otherOriginal)
+	otherAfter := otherOriginal
+	otherAfter.Status = "fail"
+	otherSuite.Status, otherSuite.Latest.Status = "fail", "fail"
+	otherAfter.Suites = []suiteResult{otherSuite}
+	red.Modules = append(red.Modules, otherAfter)
+	green.Modules = append(green.Modules, otherAfter)
+	if got := validateFocusedRetest(proposal, original, red, green); got.Status != "rejected" || !strings.Contains(got.Reason, "previously passing") {
+		t.Fatalf("focused test must not break another passing module: %#v", got)
+	}
+	original.Modules[0].Status = "blocked"
+	if got := validateFocusedRetest(proposal, original, red, green); got.Status != "rejected" {
+		t.Fatalf("incomplete original verifier must not publish: %#v", got)
 	}
 }

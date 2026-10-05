@@ -74,7 +74,6 @@ jobs:
           if-no-files-found: ignore
       - name: Notify Slack of releases or workflow failure
         if: always() && steps.discover.outputs.changes_found != 'true'
-        continue-on-error: true
         env:
           COMPAT_SLACK_WEBHOOK_URL: ${{ secrets.COMPAT_SLACK_WEBHOOK_URL }}
           COMPAT_JOB_STATUS: ${{ job.status }}
@@ -228,7 +227,7 @@ jobs:
               '',
               `Evidence and workflow logs: ${runURL}`,
               '',
-              'The workflow compares published module contents, APIs, and documentation. It runs mapped adapter suites at the analyzed baseline and new version. Gemini records code-specific advisory findings here, but an automated fix PR opens only when a mapped suite passes at baseline, fails at the new version, and passes after the patch. Other findings remain for review and focused test development. Review the evidence before updating `.compatibility/versions.lock.json`.',
+              'The workflow compares published module contents, APIs, and documentation. It runs mapped adapter suites at the analyzed baseline and new version. Gemini records code-specific advisory findings here. An automated fix PR opens only after a baseline-pass/latest-fail adapter result is reproduced and the proposed patch passes at both versions. For a semantic issue missed by existing suites, Gemini may add one focused regression test; the unpatched SDK must pass that test at baseline and fail it at the new version before the patch can be validated. Other findings remain for review. Humans must review and approve every fix PR, including generated tests. Review the evidence before updating `.compatibility/versions.lock.json`.',
               '',
               '### Deterministic adapter test results',
               ...verificationFindings,
@@ -288,21 +287,34 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: go-compatibility-release-report
-      - name: Validate and apply bounded Gemini source proposal
+      - name: Stage bounded Gemini proposal
         id: propose
         continue-on-error: true
         run: |
-          go run ./scripts/compatibility/propose
+          go run ./scripts/compatibility/propose --test-only
           if jq -e '.status == "proposed"' compatibility-proposal.json >/dev/null; then
             echo 'candidate=true' >> "$GITHUB_OUTPUT"
+            if jq -e '.testPath != null and .testPath != ""' compatibility-proposal.json >/dev/null; then
+              echo 'focused=true' >> "$GITHUB_OUTPUT"
+            fi
           fi
+      - name: Reproduce a focused regression before changing SDK source
+        id: focused
+        if: steps.propose.outputs.focused == 'true'
+        run: |
+          go run ./scripts/compatibility/verify --output=compatibility-focused-verification.json
+          go run ./scripts/compatibility/propose
       - name: Retest proposed adapter fix without credentials
         id: retest
-        if: steps.propose.outputs.candidate == 'true'
+        if: steps.propose.outputs.candidate == 'true' && (steps.focused.outcome == 'success' || steps.focused.outcome == 'skipped')
         continue-on-error: true
         run: |
           go run ./scripts/compatibility/verify --output=compatibility-proposal-verification.json
-          go run ./scripts/compatibility/propose --check-tests
+          if jq -e '.testPath != null and .testPath != ""' compatibility-proposal.json >/dev/null; then
+            go run ./scripts/compatibility/propose --check-tests --verification=compatibility-focused-verification.json --original=compatibility-verification.json
+          else
+            go run ./scripts/compatibility/propose --check-tests
+          fi
           git diff --check
           if jq -e '.status == "validated" and .validation == "test_regression_resolved"' compatibility-proposal.json >/dev/null; then
             echo 'validated=true' >> "$GITHUB_OUTPUT"
@@ -313,7 +325,10 @@ jobs:
           name: go-compatibility-patch-validation
           path: |
             compatibility-proposal.json
+            compatibility-focused-verification.json
             compatibility-proposal-verification.json
+            contrib/adk/compatibility_*_test.go
+            contrib/genai/compatibility_*_test.go
             contrib/adk/a2a.go
             contrib/adk/adk.go
             contrib/adk/run.go
@@ -354,19 +369,32 @@ jobs:
         if: needs.validate_patch.outputs.validated == 'true'
         continue-on-error: true
         run: |
+          test_path=$(jq -r '.testPath // ""' compatibility-validation/compatibility-proposal.json)
+          if [ -n "$test_path" ] && [ -e "$test_path" ]; then
+            echo "Focused regression test already exists on the base checkout" >&2
+            exit 1
+          fi
           go run ./scripts/compatibility/propose \
             --analysis=compatibility-discovery/compatibility-llm-analysis.json \
             --release-report=compatibility-discovery/compatibility-release-report.json \
             --evidence=compatibility-discovery/compatibility-evidence.json \
             --covered=compatibility-discovery/compatibility-covered.json \
             --output=compatibility-proposal.json
-          jq -S '{targetModule,targetVersion,evidenceReference,evidenceRationale,paths}' compatibility-proposal.json > compatibility-proposal-identity.json
-          jq -S '{targetModule,targetVersion,evidenceReference,evidenceRationale,paths}' compatibility-validation/compatibility-proposal.json > compatibility-validated-identity.json
+          jq -S '{targetModule,targetVersion,evidenceReference,evidenceRationale,paths,testPath,testName}' compatibility-proposal.json > compatibility-proposal-identity.json
+          jq -S '{targetModule,targetVersion,evidenceReference,evidenceRationale,paths,testPath,testName}' compatibility-validation/compatibility-proposal.json > compatibility-validated-identity.json
           cmp compatibility-proposal-identity.json compatibility-validated-identity.json
-          go run ./scripts/compatibility/propose --check-tests \
-            --output=compatibility-proposal.json \
-            --verification=compatibility-discovery/compatibility-verification.json \
-            --retest=compatibility-validation/compatibility-proposal-verification.json
+          if jq -e '.testPath != null and .testPath != ""' compatibility-proposal.json >/dev/null; then
+            go run ./scripts/compatibility/propose --check-tests \
+              --output=compatibility-proposal.json \
+              --original=compatibility-discovery/compatibility-verification.json \
+              --verification=compatibility-validation/compatibility-focused-verification.json \
+              --retest=compatibility-validation/compatibility-proposal-verification.json
+          else
+            go run ./scripts/compatibility/propose --check-tests \
+              --output=compatibility-proposal.json \
+              --verification=compatibility-discovery/compatibility-verification.json \
+              --retest=compatibility-validation/compatibility-proposal-verification.json
+          fi
           jq -e '.status == "validated" and .validation == "test_regression_resolved"' compatibility-proposal.json >/dev/null
           git diff --check
           echo 'ready=true' >> "$GITHUB_OUTPUT"
@@ -390,10 +418,23 @@ jobs:
             if (cp.execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim() !== context.sha) throw new Error('Checkout differs from workflow base SHA');
             const allow = new Set(['contrib/adk/a2a.go', 'contrib/adk/adk.go', 'contrib/adk/run.go', 'contrib/adk/tools.go', 'contrib/genai/genai.go']);
             if (!proposal.paths.length || proposal.paths.length > 2 || proposal.paths.some((path) => !allow.has(path))) throw new Error('Invalid proposal paths');
+            if (proposal.testPath !== validated.testPath || proposal.testName !== validated.testName) throw new Error('Validated focused test identity differs from publisher proposal');
+            if (proposal.testPath) {
+              const testHash = crypto.createHash('sha256').update(`${proposal.targetModule}@${proposal.targetVersion}`).digest('hex').slice(0, 12);
+              const allowedTests = proposal.targetModule === 'google.golang.org/genai'
+                ? [`contrib/genai/compatibility_${testHash}_test.go`, `contrib/adk/compatibility_${testHash}_test.go`]
+                : [`contrib/adk/compatibility_${testHash}_test.go`];
+              if (!allowedTests.includes(proposal.testPath)) throw new Error('Invalid focused regression test path');
+            }
             for (const path of proposal.paths) {
               const local = fs.readFileSync(path);
               const tested = fs.readFileSync(`compatibility-validation/${path}`);
               if (!local.equals(tested)) throw new Error(`Validated source differs from publisher patch: ${path}`);
+            }
+            if (proposal.testPath) {
+              const local = fs.readFileSync(proposal.testPath);
+              const tested = fs.readFileSync(`compatibility-validation/${proposal.testPath}`);
+              if (!local.equals(tested)) throw new Error('Focused regression test differs from validated test');
             }
             const releaseReport = JSON.parse(fs.readFileSync('compatibility-discovery/compatibility-release-report.json', 'utf8'));
             const release = releaseReport.changes.find((item) => item.module === proposal.targetModule && item.latest === proposal.targetVersion);
@@ -403,6 +444,7 @@ jobs:
             if (!release || !Object.hasOwn(lock.packages, proposal.targetModule) || lock.packages[proposal.targetModule] !== release.previouslyAnalyzed) throw new Error('Version lock no longer matches the analyzed baseline; no fix PR opened');
             lock.packages[proposal.targetModule] = proposal.targetVersion;
             const expectedFiles = new Map(proposal.paths.map((path) => [path, fs.readFileSync(path)]));
+            if (proposal.testPath) expectedFiles.set(proposal.testPath, fs.readFileSync(proposal.testPath));
             expectedFiles.set(lockPath, Buffer.from(JSON.stringify(lock, null, 2) + '\n'));
             const owner = context.repo.owner;
             const repo = context.repo.repo;
@@ -445,7 +487,9 @@ jobs:
               return;
             }
             const runURL = `${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${context.runId}`;
-            const validation = 'A baseline-pass/latest-fail mapped adapter test passed after this patch.';
+            const validation = proposal.testPath
+              ? `A generated focused regression test (${proposal.testPath}) passed at the analyzed baseline, failed at the new version before the SDK patch, and passed at both versions after the patch. Review this test carefully.`
+              : 'A baseline-pass/latest-fail mapped adapter test passed after this patch.';
             const body = `Gemini-proposed SDK source fix for ${proposal.targetModule}@${proposal.targetVersion}. Review the code and evidence before merging; this workflow does not approve or merge PRs. This PR also advances the analyzed version lock for only this module from ${release.previouslyAnalyzed} to ${proposal.targetVersion}.\n\nEvidence: ${proposal.evidenceReference}\n\nRationale: ${proposal.evidenceRationale}\n\nValidation: ${validation}\n\nReview issue: ${process.env.REVIEW_ISSUE_URL || 'unavailable'}\nWorkflow and artifacts: ${runURL}`;
             const { data: pull } = await github.rest.pulls.create({ owner, repo, head: branch, base: context.payload.repository.default_branch, title: `[compatibility] Proposed Go SDK fix for ${proposal.targetModule}@${proposal.targetVersion}`, body, draft: false });
             core.setOutput('pr_url', pull.html_url);
@@ -483,7 +527,6 @@ jobs:
             await github.rest.issues.update({ ...context.repo, issue_number: number, body });
       - name: Notify Slack of release results and fix proposal
         if: always()
-        continue-on-error: true
         env:
           COMPAT_SLACK_WEBHOOK_URL: ${{ secrets.COMPAT_SLACK_WEBHOOK_URL }}
           COMPAT_JOB_STATUS: ${{ needs.discover.result == 'success' && needs.verify.result == 'success' && needs.analyze.result == 'success' && 'success' || 'failure' }}
@@ -512,9 +555,18 @@ jobs:
         if: always()
         env:
           VERIFY_OUTCOME: ${{ needs.verify.outputs.verify_outcome }}
+          GEMINI_OUTCOME: ${{ needs.analyze.outputs.gemini_outcome }}
+          ISSUE_OUTCOME: ${{ needs.analyze.outputs.issue_outcome }}
+          PATCH_JOB_STATUS: ${{ needs.validate_patch.result }}
+          PROPOSAL_OUTCOME: ${{ needs.validate_patch.outputs.proposal_outcome }}
+          RETEST_OUTCOME: ${{ needs.validate_patch.outputs.retest_outcome }}
+          FIX_ISSUE_OUTCOME: ${{ steps.fix_issue.outcome }}
           VALIDATED: ${{ needs.validate_patch.outputs.validated }}
           PR_OUTCOME: ${{ steps.fix_pr.outcome }}
         run: |
           if [ "$VERIFY_OUTCOME" != success ]; then exit 1; fi
+          if [ "$GEMINI_OUTCOME" != success ]; then exit 1; fi
+          if [ "$ISSUE_OUTCOME" != success ] || [ "$PATCH_JOB_STATUS" = failure ] || [ "$PROPOSAL_OUTCOME" = failure ] || [ "$RETEST_OUTCOME" = failure ] || [ "$FIX_ISSUE_OUTCOME" = failure ]; then exit 1; fi
+          jq -e 'type == "object" and (.skipped != true or .reason == "No uncovered release is testable with this runner")' compatibility-discovery/compatibility-llm-analysis.json
           if [ "$VALIDATED" = true ] && [ "$PR_OUTCOME" != success ]; then exit 1; fi
           jq -e '[.modules[] | select(.status == "fail")] | length == 0' compatibility-discovery/compatibility-verification.json

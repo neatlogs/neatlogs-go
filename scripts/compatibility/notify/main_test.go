@@ -2,9 +2,27 @@ package main
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
+
+func TestActionableAlertDeliveryFailureIsAnError(t *testing.T) {
+	if err := postSlack("", []byte(`{"text":"regression"}`)); err == nil || !strings.Contains(err.Error(), "COMPAT_SLACK_WEBHOOK_URL") {
+		t.Fatalf("missing webhook must fail visibly: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost || request.Header.Get("Content-Type") != "application/json" {
+			t.Errorf("unexpected Slack request: %s %s", request.Method, request.Header.Get("Content-Type"))
+		}
+		writer.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	if err := postSlack(server.URL, []byte(`{"text":"regression"}`)); err == nil || !strings.Contains(err.Error(), "503") {
+		t.Fatalf("failed webhook must fail visibly: %v", err)
+	}
+}
 
 func TestWorkflowURLUsesCurrentActionsRun(t *testing.T) {
 	t.Setenv("GITHUB_SERVER_URL", "https://github.com")
@@ -12,6 +30,13 @@ func TestWorkflowURLUsesCurrentActionsRun(t *testing.T) {
 	t.Setenv("GITHUB_RUN_ID", "12345")
 	if got := workflowURL(); got != "https://github.com/neatlogs/neatlogs-go/actions/runs/12345" {
 		t.Fatalf("workflowURL() = %q", got)
+	}
+}
+
+func TestFailedStageNamesFixPublicationFailure(t *testing.T) {
+	t.Setenv("COMPAT_FIX_PR_OUTCOME", "failure")
+	if got := failedStage(); got != "fix PR creation" {
+		t.Fatalf("failedStage() = %q", got)
 	}
 }
 

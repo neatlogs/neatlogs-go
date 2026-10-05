@@ -99,12 +99,12 @@ type slackPayload struct {
 	Blocks []slackBlock `json:"blocks"`
 }
 
-func optionalJSON(path string, value any) {
+func optionalJSON(path string, value any) bool {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return
+		return false
 	}
-	_ = json.Unmarshal(data, value)
+	return json.Unmarshal(data, value) == nil
 }
 
 func workflowURL() string {
@@ -126,6 +126,11 @@ func failedStage() string {
 		{"COMPAT_VERIFY_OUTCOME", "adapter version tests"},
 		{"COMPAT_GEMINI_OUTCOME", "Gemini advisory analysis"},
 		{"COMPAT_ISSUE_OUTCOME", "review issue update"},
+		{"COMPAT_PROPOSAL_OUTCOME", "Gemini patch proposal"},
+		{"COMPAT_RETEST_OUTCOME", "SDK patch retest"},
+		{"COMPAT_PUBLISH_CHECK_OUTCOME", "fix publication validation"},
+		{"COMPAT_FIX_PR_OUTCOME", "fix PR creation"},
+		{"COMPAT_FIX_ISSUE_OUTCOME", "fix status issue update"},
 	} {
 		if os.Getenv(step.env) == "failure" {
 			return step.label
@@ -398,11 +403,6 @@ func buildSlackPayload(message string) slackPayload {
 }
 
 func main() {
-	webhook := os.Getenv("COMPAT_SLACK_WEBHOOK_URL")
-	if webhook == "" {
-		fmt.Println("Slack notification skipped: COMPAT_SLACK_WEBHOOK_URL is not configured")
-		return
-	}
 	status := os.Getenv("COMPAT_JOB_STATUS")
 	if os.Getenv("COMPAT_VERIFY_OUTCOME") == "failure" {
 		status = "failure"
@@ -416,10 +416,10 @@ func main() {
 	var analysis analysisReport
 	var proposal proposalReport
 	var issue upstreamIssue
-	optionalJSON("compatibility-release-report.json", &report)
-	optionalJSON("compatibility-evidence.json", &evidence)
-	optionalJSON("compatibility-verification.json", &verification)
-	optionalJSON("compatibility-llm-analysis.json", &analysis)
+	reportLoaded := optionalJSON("compatibility-release-report.json", &report)
+	evidenceLoaded := optionalJSON("compatibility-evidence.json", &evidence)
+	verificationLoaded := optionalJSON("compatibility-verification.json", &verification)
+	analysisLoaded := optionalJSON("compatibility-llm-analysis.json", &analysis)
 	optionalJSON("compatibility-proposal.json", &proposal)
 	issuePath := os.Getenv("COMPAT_UPSTREAM_ISSUE_FILE")
 	if issuePath == "" {
@@ -435,27 +435,42 @@ func main() {
 		FixIssueOutcome: os.Getenv("COMPAT_FIX_ISSUE_OUTCOME"),
 		RunURL:          workflowURL(), FailureStage: failedStage(),
 	}
+	if status == "success" && os.Getenv("COMPAT_CHANGES_FOUND") == "true" && (!reportLoaded || !evidenceLoaded || !verificationLoaded || !analysisLoaded) {
+		status = "failure"
+		alert.FailureStage = "compatibility report or analysis artifact loading"
+	}
 	if !shouldSendSlack(status, report, evidence, verification, analysis, proposal, alert) {
 		fmt.Println("Slack compatibility alert skipped: no actionable outcome; results are in the issue and run artifact")
 		return
 	}
+	webhook := os.Getenv("COMPAT_SLACK_WEBHOOK_URL")
 	payload, err := json.Marshal(buildSlackPayload(slackMessage(status, report, evidence, verification, analysis, proposal, issue, alert)))
 	if err != nil {
 		panic(err)
 	}
+	if err := postSlack(webhook, payload); err != nil {
+		panic(err)
+	}
+	fmt.Println("Slack compatibility alert sent")
+}
+
+func postSlack(webhook string, payload []byte) error {
+	if webhook == "" {
+		return fmt.Errorf("actionable compatibility alert cannot be delivered: COMPAT_SLACK_WEBHOOK_URL is not configured")
+	}
 	request, err := http.NewRequest(http.MethodPost, webhook, bytes.NewReader(payload))
 	if err != nil {
-		panic(err)
+		return err
 	}
 	request.Header.Set("Content-Type", "application/json")
 	client := &http.Client{Timeout: 30 * time.Second}
 	response, err := client.Do(request)
 	if err != nil {
-		panic(err)
+		return err
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		panic(fmt.Sprintf("Slack webhook returned %d", response.StatusCode))
+		return fmt.Errorf("Slack webhook returned %d", response.StatusCode)
 	}
-	fmt.Println("Slack compatibility alert sent")
+	return nil
 }
