@@ -121,6 +121,9 @@ func TestValidateRetestRequiresBothVersionSuitesPass(t *testing.T) {
 		Status string        `json:"status"`
 		Suites []suiteResult `json:"suites"`
 	}{Module: "example.com/sdk", Latest: "v2", Status: "fail"})
+	failingSuite := suiteResult{Integration: "sdk", Package: "contrib/genai", Status: "fail"}
+	failingSuite.Baseline.Status, failingSuite.Latest.Status = "pass", "fail"
+	before.Modules[0].Suites = []suiteResult{failingSuite}
 	after := before
 	after.Modules = append([]struct {
 		Module string        `json:"module"`
@@ -128,7 +131,7 @@ func TestValidateRetestRequiresBothVersionSuitesPass(t *testing.T) {
 		Status string        `json:"status"`
 		Suites []suiteResult `json:"suites"`
 	}(nil), before.Modules...)
-	suite := suiteResult{}
+	suite := suiteResult{Integration: "sdk", Package: "contrib/genai", Status: "pass"}
 	suite.Baseline.Status, suite.Latest.Status = "pass", "pass"
 	after.Modules[0].Status, after.Modules[0].Suites = "pass", []suiteResult{suite}
 	got := validateRetest(proposal, before, after)
@@ -138,5 +141,43 @@ func TestValidateRetestRequiresBothVersionSuitesPass(t *testing.T) {
 	after.Modules[0].Suites[0].Latest.Status = "fail"
 	if got := validateRetest(proposal, before, after); got.Status != "rejected" {
 		t.Fatalf("validateRetest() = %#v", got)
+	}
+}
+
+func TestValidateRetestRejectsAdvisoryOnlyPatchWithoutRedGreenProof(t *testing.T) {
+	proposal := proposalReport{Status: "proposed", TargetModule: "example.com/sdk", TargetVersion: "v2"}
+	before := verificationReport{}
+	before.Modules = append(before.Modules, struct {
+		Module string        `json:"module"`
+		Latest string        `json:"latest"`
+		Status string        `json:"status"`
+		Suites []suiteResult `json:"suites"`
+	}{Module: "example.com/sdk", Latest: "v2", Status: "pass"})
+	passedSuite := suiteResult{Integration: "sdk", Package: "contrib/genai", Status: "pass"}
+	passedSuite.Baseline.Status, passedSuite.Latest.Status = "pass", "pass"
+	before.Modules[0].Suites = []suiteResult{passedSuite}
+	after := before
+	after.Modules = append([]struct {
+		Module string        `json:"module"`
+		Latest string        `json:"latest"`
+		Status string        `json:"status"`
+		Suites []suiteResult `json:"suites"`
+	}(nil), before.Modules...)
+	got := validateRetest(proposal, before, after)
+	if got.Status != "rejected" || !strings.Contains(got.Reason, "No reproduced baseline-pass/latest-fail") || got.Validation != "" {
+		t.Fatalf("advisory-only patch must not be publishable: %#v", got)
+	}
+	before.Modules[0].Status = "fail"
+	failingSuite := passedSuite
+	failingSuite.Status, failingSuite.Latest.Status = "fail", "fail"
+	before.Modules[0].Suites = []suiteResult{failingSuite}
+	got = validateRetest(proposal, before, after)
+	if got.Status != "validated" {
+		t.Fatalf("matching red/green suite should validate: %#v", got)
+	}
+	after.Modules[0].Suites = []suiteResult{{Integration: "different", Package: "contrib/genai", Status: "pass", Baseline: passedSuite.Baseline, Latest: passedSuite.Latest}}
+	got = validateRetest(proposal, before, after)
+	if got.Status != "rejected" || !strings.Contains(got.Reason, "same suite") {
+		t.Fatalf("different suite must not count as green proof: %#v", got)
 	}
 }

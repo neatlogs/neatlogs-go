@@ -33,7 +33,7 @@ func TestSlackReleaseMessage(t *testing.T) {
 		upstreamIssue{Title: "empty tool arguments disappear", URL: "https://github.com/example/sdk/issues/3"},
 		alertContext{ReviewIssueURL: "https://example.test/issues/7", RunURL: "https://example.test/run"},
 	)
-	for _, expected := range []string{"1 upstream release", "example.com/sdk v1 → v2", "Go ≥1.26.0", "verification incomplete: toolchain blocked; no regression established", "blocked", "Gemini advisory risk", "high", "No SDK fix proposal", "empty tool arguments disappear", "github.com/example/sdk/issues/3", "https://example.test/issues/7", "https://example.test/run"} {
+	for _, expected := range []string{"Go SDK: release blocked by Go toolchain", "Checked: 1 newer release", "1 blocked", "Regression: none found in tested scope; some releases untested", "Fix PR: none", "Action: example.com/sdk requires Go ≥1.26.0. Decide whether to upgrade SDK CI", "empty tool arguments disappear", "github.com/example/sdk/issues/3", "https://example.test/issues/7", "https://example.test/run"} {
 		if !strings.Contains(message, expected) {
 			t.Fatalf("message %q does not contain %q", message, expected)
 		}
@@ -52,11 +52,19 @@ func verificationWithStatuses(statuses ...string) verificationReport {
 	return result
 }
 
+func evidenceWithToolchainBlock() evidenceReport {
+	return evidenceReport{Modules: []struct {
+		Module               string `json:"module"`
+		ToolchainRequirement string `json:"toolchainRequirement"`
+	}{{Module: "example.com/sdk", ToolchainRequirement: "requires go >= 1.26.0"}}}
+}
+
 func TestSlackSendsOnlyActionableResults(t *testing.T) {
 	releases := releaseReport{Changes: []releaseChange{{Module: "example.com/sdk", Latest: "v2"}}}
 	for _, tc := range []struct {
 		name         string
 		status       string
+		evidence     evidenceReport
 		verification verificationReport
 		analysis     analysisReport
 		proposal     proposalReport
@@ -66,6 +74,13 @@ func TestSlackSendsOnlyActionableResults(t *testing.T) {
 		{name: "routine pass", status: "success", verification: verificationWithStatuses("pass"), proposal: proposalReport{Status: "skipped"}},
 		{name: "unverified rejected suggestion", status: "success", verification: verificationWithStatuses("pass"), analysis: analysisReport{RiskLevel: "high"}, proposal: proposalReport{Status: "rejected", Reason: "cosmetic patch"}},
 		{name: "blocked release with rejected suggestion", status: "success", verification: verificationWithStatuses("blocked", "pass", "pass"), proposal: proposalReport{Status: "rejected"}, want: true},
+		{name: "unchanged toolchain blocker", status: "success", evidence: evidenceWithToolchainBlock(), verification: verificationWithStatuses("blocked", "pass", "pass"), proposal: proposalReport{Status: "rejected"}, alert: alertContext{UnchangedToolchainBlock: true}},
+		{name: "changed toolchain blocker", status: "success", verification: verificationWithStatuses("blocked", "pass", "pass"), alert: alertContext{UnchangedToolchainBlock: false}, want: true},
+		{name: "new PR despite unchanged toolchain blocker", status: "success", evidence: evidenceWithToolchainBlock(), verification: verificationWithStatuses("blocked", "pass", "pass"), alert: alertContext{UnchangedToolchainBlock: true, FixPRURL: "https://example.test/pr/8"}, want: true},
+		{name: "workflow failure despite unchanged toolchain blocker", status: "failure", evidence: evidenceWithToolchainBlock(), verification: verificationWithStatuses("blocked", "pass", "pass"), alert: alertContext{UnchangedToolchainBlock: true}, want: true},
+		{name: "automation failure despite unchanged toolchain blocker", status: "success", evidence: evidenceWithToolchainBlock(), verification: verificationWithStatuses("blocked", "pass", "pass"), alert: alertContext{UnchangedToolchainBlock: true, FixIssueOutcome: "failure"}, want: true},
+		{name: "non-toolchain block cannot be suppressed", status: "success", verification: verificationWithStatuses("blocked"), alert: alertContext{UnchangedToolchainBlock: true}, want: true},
+		{name: "regression cannot be suppressed", status: "success", evidence: evidenceWithToolchainBlock(), verification: verificationWithStatuses("fail"), alert: alertContext{UnchangedToolchainBlock: true}, want: true},
 		{name: "baseline-pass latest-fail", status: "success", verification: verificationWithStatuses("fail"), want: true},
 		{name: "not tested", status: "success", verification: verificationWithStatuses("not_tested"), want: true},
 		{name: "missing verification", status: "success", want: true},
@@ -78,7 +93,7 @@ func TestSlackSendsOnlyActionableResults(t *testing.T) {
 		{name: "monitor failed", status: "failure", verification: verificationWithStatuses("pass"), want: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := shouldSendSlack(tc.status, releases, tc.verification, tc.analysis, tc.proposal, tc.alert); got != tc.want {
+			if got := shouldSendSlack(tc.status, releases, tc.evidence, tc.verification, tc.analysis, tc.proposal, tc.alert); got != tc.want {
 				t.Fatalf("shouldSendSlack() = %v, want %v", got, tc.want)
 			}
 		})
@@ -87,7 +102,7 @@ func TestSlackSendsOnlyActionableResults(t *testing.T) {
 
 func TestSlackNamesGeminiStepFailure(t *testing.T) {
 	message := slackMessage("success", releaseReport{}, evidenceReport{}, verificationWithStatuses("pass"), analysisReport{}, proposalReport{}, upstreamIssue{}, alertContext{GeminiOutcome: "failure"})
-	if !strings.Contains(message, "Gemini advisory analysis failed") {
+	if !strings.Contains(message, "Go SDK: Gemini analysis failed") || !strings.Contains(message, "Regression: none found in tested scope") {
 		t.Fatalf("Gemini failure missing from Slack message: %q", message)
 	}
 }
@@ -111,20 +126,53 @@ func TestSlackOct2GoResultLeadsWithToolchainBlock(t *testing.T) {
 	analysis := analysisReport{RiskLevel: "high", ScopeModule: "google.golang.org/adk"}
 	proposal := proposalReport{Status: "rejected", Reason: "proposal must change one or two allowlisted SDK source files"}
 	alert := alertContext{ReviewIssueURL: "https://github.com/neatlogs/neatlogs-go/issues/29", RunURL: "https://github.com/neatlogs/neatlogs-go/actions/runs/36974183035"}
-	if !shouldSendSlack("success", releases, verification, analysis, proposal, alert) {
+	if !shouldSendSlack("success", releases, evidence, verification, analysis, proposal, alert) {
 		t.Fatal("toolchain block should notify even when the Gemini suggestion is unverified")
 	}
 	message := slackMessage("success", releases, evidence, verification, analysis, proposal, upstreamIssue{}, alert)
-	for _, expected := range []string{"verification incomplete: toolchain blocked; no regression established", "a2a-go/v2 requires Go ≥1.26.0", "google.golang.org/adk v1.7.0: *pass*", "google.golang.org/genai v1.72.0: *pass*", "fix rejected by validation", "issues/29", "actions/runs/36974183035"} {
+	for _, expected := range []string{"Go SDK: release blocked by Go toolchain", "2 passed, 0 failed, 1 blocked", "Regression: none found in tested scope; some releases untested", "a2a-go/v2 requires Go ≥1.26.0", "proposed fix rejected by validation", "issues/29", "actions/runs/36974183035"} {
 		if !strings.Contains(message, expected) {
 			t.Fatalf("message %q does not contain %q", message, expected)
 		}
 	}
 }
 
+func TestSlackOct3GoAlertIsScannable(t *testing.T) {
+	releases := releaseReport{Changes: []releaseChange{
+		{Module: "github.com/a2aproject/a2a-go/v2", PreviouslyAnalyzed: "v2.3.1", Latest: "v2.6.0"},
+		{Module: "google.golang.org/adk", PreviouslyAnalyzed: "v1.4.0", Latest: "v1.7.0"},
+		{Module: "google.golang.org/genai", PreviouslyAnalyzed: "v1.61.0", Latest: "v1.72.0"},
+	}}
+	evidence := evidenceReport{Modules: []struct {
+		Module               string `json:"module"`
+		ToolchainRequirement string `json:"toolchainRequirement"`
+	}{{Module: "github.com/a2aproject/a2a-go/v2", ToolchainRequirement: "github.com/a2aproject/a2a-go/v2@v2.6.0 requires go >= 1.26.0 (running go 1.25.0)"}}}
+	verification := verificationReport{Modules: []struct {
+		Module string `json:"module"`
+		Latest string `json:"latest"`
+		Status string `json:"status"`
+	}{
+		{Module: "github.com/a2aproject/a2a-go/v2", Latest: "v2.6.0", Status: "blocked"},
+		{Module: "google.golang.org/adk", Latest: "v1.7.0", Status: "pass"},
+		{Module: "google.golang.org/genai", Latest: "v1.72.0", Status: "pass"},
+	}}
+	alert := alertContext{ReviewIssueURL: "https://github.com/neatlogs/neatlogs-go/issues/29", RunURL: "https://github.com/neatlogs/neatlogs-go/actions/runs/37085365700"}
+	got := slackMessage("success", releases, evidence, verification, analysisReport{RiskLevel: "low", ScopeModule: "google.golang.org/genai"}, proposalReport{Status: "skipped", Reason: "Gemini did not produce an actionable SDK fix"}, upstreamIssue{}, alert)
+	want := ":warning: *Go SDK: release blocked by Go toolchain — review Go version support.*\n" +
+		"Checked: 3 newer releases; mapped adapter checks: 2 passed, 0 failed, 1 blocked, 0 not tested | Regression: none found in tested scope; some releases untested | Fix PR: none — no actionable SDK fix\n" +
+		"Action: github.com/a2aproject/a2a-go/v2 requires Go ≥1.26.0. Decide whether to upgrade SDK CI to test it.\n" +
+		"Details: <https://github.com/neatlogs/neatlogs-go/issues/29|Review issue> · <https://github.com/neatlogs/neatlogs-go/actions/runs/37085365700|Workflow evidence>"
+	if got != want {
+		t.Fatalf("Oct 3 alert:\n%s\nwant:\n%s", got, want)
+	}
+	if strings.Contains(got, "Gemini advisory risk") || strings.Contains(got, "*low*") {
+		t.Fatalf("unverified advisory should not distract from the toolchain blocker: %q", got)
+	}
+}
+
 func TestSlackFailureMessage(t *testing.T) {
 	message := slackMessage("failure", releaseReport{}, evidenceReport{}, verificationReport{}, analysisReport{}, proposalReport{}, upstreamIssue{}, alertContext{RunURL: "https://example.test/run", FailureStage: "deterministic evidence collection"})
-	if !strings.Contains(message, "failed during deterministic evidence collection") || !strings.Contains(message, "https://example.test/run") {
+	if !strings.Contains(message, "Go SDK: compatibility monitor failed") || !strings.Contains(message, "Investigate failure during deterministic evidence collection") || !strings.Contains(message, "https://example.test/run") {
 		t.Fatalf("unexpected failure message: %q", message)
 	}
 }
@@ -136,7 +184,7 @@ func TestSlackRetainsTestVerdictWhenLaterAutomationFails(t *testing.T) {
 		Status string `json:"status"`
 	}{{Module: "example.com/sdk", Latest: "v2", Status: "fail"}}}
 	message := slackMessage("failure", releaseReport{Changes: []releaseChange{{Module: "example.com/sdk", Latest: "v2"}}}, evidenceReport{}, verification, analysisReport{}, proposalReport{}, upstreamIssue{}, alertContext{RunURL: "https://example.test/run", FailureStage: "review issue update"})
-	if !strings.Contains(message, "regression in mapped adapter tests") || !strings.Contains(message, "Monitor also failed during review issue update") || strings.Contains(message, "No regression verdict is available") {
+	if !strings.Contains(message, "candidate regression in mapped adapter tests") || !strings.Contains(message, "Monitor also failed during review issue update") || strings.Contains(message, "Regression: no verdict") {
 		t.Fatalf("unexpected failure message: %q", message)
 	}
 }
@@ -148,7 +196,7 @@ func TestSlackReportsDeterministicFailureSeparatelyFromGemini(t *testing.T) {
 		Status string `json:"status"`
 	}{{Module: "example.com/sdk", Latest: "v2", Status: "fail"}}}
 	message := slackMessage("success", releaseReport{Changes: []releaseChange{{Module: "example.com/sdk", Latest: "v2"}}}, evidenceReport{}, verification, analysisReport{RiskLevel: "low", ScopeModule: "example.com/sdk"}, proposalReport{}, upstreamIssue{}, alertContext{})
-	if !strings.Contains(message, "regression in mapped adapter tests") || !strings.Contains(message, "Gemini advisory risk for example.com/sdk: *low* (unverified)") {
+	if !strings.Contains(message, "candidate regression in mapped adapter tests") || !strings.Contains(message, "Regression: 1 candidate (baseline passed, latest failed)") || strings.Contains(message, "*low*") {
 		t.Fatalf("unexpected message: %q", message)
 	}
 }
@@ -161,14 +209,13 @@ func TestSlackReportsFixPublicationOutcomes(t *testing.T) {
 		alert    alertContext
 		want     []string
 	}{
-		{"unverified fix PR", proposalReport{Status: "validated", Validation: "advisory_only_no_reproduction"}, alertContext{FixPRURL: "https://example.test/pr/8", RunURL: "https://example.test/run", ReviewIssueURL: "https://example.test/issues/7"}, []string{"PR opened for human code review", "suspected behavior unverified", "no automated approval or merge", "https://example.test/pr/8", "https://example.test/issues/7", "https://example.test/run"}},
-		{"reproduced fix PR", proposalReport{Status: "validated", Validation: "test_regression_resolved"}, alertContext{FixPRURL: "https://example.test/pr/8"}, []string{"PR opened for human code review", "mapped regression passed after the patch"}},
-		{"patch rejected", proposalReport{Status: "rejected", Reason: "adapter tests failed"}, alertContext{}, []string{"fix rejected by validation", "adapter tests failed", "no PR opened"}},
-		{"publication check failed", proposalReport{Status: "validated"}, alertContext{PublishCheckOutcome: "failure"}, []string{"publication check failed", "no PR opened"}},
-		{"PR creation failed", proposalReport{Status: "validated"}, alertContext{FixPROutcome: "failure"}, []string{"PR creation failed", "no PR opened"}},
-		{"patch job failed", proposalReport{}, alertContext{PatchJobStatus: "failure"}, []string{"patch validation failed", "no PR opened"}},
-		{"proposal tooling failed", proposalReport{}, alertContext{ProposalOutcome: "failure"}, []string{"proposal validation tooling failed", "no PR opened"}},
-		{"retest tooling failed", proposalReport{}, alertContext{RetestOutcome: "failure"}, []string{"patch retest tooling failed", "no PR opened"}},
+		{"reproduced fix PR", proposalReport{Status: "validated", Validation: "test_regression_resolved"}, alertContext{FixPRURL: "https://example.test/pr/8"}, []string{"fix PR opened", "mapped regression passed after the patch"}},
+		{"patch rejected", proposalReport{Status: "rejected", Reason: "adapter tests failed"}, alertContext{}, []string{"proposed fix rejected by validation", "adapter tests failed", "Fix PR: none"}},
+		{"publication check failed", proposalReport{Status: "validated"}, alertContext{PublishCheckOutcome: "failure"}, []string{"publication check failed", "Fix PR: none"}},
+		{"PR creation failed", proposalReport{Status: "validated"}, alertContext{FixPROutcome: "failure"}, []string{"PR creation failed", "Fix PR: none"}},
+		{"patch job failed", proposalReport{}, alertContext{PatchJobStatus: "failure"}, []string{"patch validation failed", "Fix PR: none"}},
+		{"proposal tooling failed", proposalReport{}, alertContext{ProposalOutcome: "failure"}, []string{"proposal tooling failed", "Fix PR: none"}},
+		{"retest tooling failed", proposalReport{}, alertContext{RetestOutcome: "failure"}, []string{"patch retest failed", "Fix PR: none"}},
 		{"issue update failed", proposalReport{}, alertContext{IssueOutcome: "failure"}, []string{"Review issue update failed"}},
 		{"fix issue update failed", proposalReport{}, alertContext{FixIssueOutcome: "failure"}, []string{"Fix status update to the review issue failed"}},
 	} {
