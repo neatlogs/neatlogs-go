@@ -84,7 +84,7 @@ jobs:
           git tag -a "$ROOT_VERSION" -m "Release root module $ROOT_VERSION"
           git push origin "refs/tags/${ROOT_VERSION}"
 
-      - name: Update and test each contrib module
+      - name: Update and test contrib and example modules
         if: steps.plan.outputs.adk_release == 'true' || steps.plan.outputs.genai_release == 'true'
         shell: bash
         env:
@@ -106,8 +106,17 @@ jobs:
               GOWORK=off GOPROXY=direct go vet ./...
             )
           done
+          for module in adk genai; do
+            (
+              cd "examples/$module"
+              go mod edit -require="github.com/neatlogs/neatlogs-go@${ROOT_VERSION}"
+              GOWORK=off GOPROXY=direct go mod tidy
+              GOWORK=off GOPROXY=direct go test -mod=readonly ./...
+              GOWORK=off GOPROXY=direct go vet ./...
+            )
+          done
           git diff --check
-          git diff --name-only | awk '/^contrib\/(adk|genai)\/go\.(mod|sum)$/ {next} {print; bad=1} END {exit bad}'
+          git diff --name-only | awk '/^(contrib|examples)\/(adk|genai)\/go\.(mod|sum)$/ {next} {print; bad=1} END {exit bad}'
 
       - name: Commit updated dependencies and tag contrib modules
         if: steps.plan.outputs.adk_release == 'true' || steps.plan.outputs.genai_release == 'true'
@@ -123,10 +132,10 @@ jobs:
           git config user.name 'neatlogs-release[bot]'
           git config user.email 'neatlogs-release[bot]@users.noreply.github.com'
           git remote set-url origin "https://x-access-token:${RELEASE_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git add contrib/adk/go.mod contrib/adk/go.sum contrib/genai/go.mod contrib/genai/go.sum
+          git add contrib/adk/go.mod contrib/adk/go.sum contrib/genai/go.mod contrib/genai/go.sum examples/adk/go.mod examples/adk/go.sum examples/genai/go.mod examples/genai/go.sum
           if ! git diff --cached --quiet; then
             git diff --cached --check
-            git commit -m 'chore(release): update contrib root dependencies'
+            git commit -m 'chore(release): update module root dependencies'
             # A concurrent merge stops this release before any contrib tag is made.
             git push origin HEAD:refs/heads/main
           fi
