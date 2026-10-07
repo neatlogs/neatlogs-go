@@ -38,7 +38,7 @@ func text(value any) string {
 	return s
 }
 
-// checkTrace runs pure checks over a persisted trace.
+// checkTrace checks a trace as the backend returns it.
 func checkTrace(trace map[string]any) []traceCheck {
 	var spans []map[string]any
 	if raw, ok := trace["spans"].([]any); ok {
@@ -102,7 +102,7 @@ func checkTrace(trace map[string]any) []traceCheck {
 }
 
 // runTrace handles `neatlogs trace get <trace_id>`.
-// Exit codes: 0 pass, 1 check failed, 2 not ready/not found, 3 key, 4 usage, 5 error.
+// exit: 0 pass, 1 check failed, 2 not ready or not found, 3 key, 4 usage, 5 error
 func runTrace(arguments []string, in traceIO) int {
 	jsonOutput := false
 	var rest []string
