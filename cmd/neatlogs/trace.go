@@ -193,6 +193,10 @@ func runTrace(arguments []string, in traceIO) int {
 	if code != 0 {
 		return code
 	}
+	if trace["finalizationStatus"] == "dlq" {
+		fmt.Fprintln(in.stderr, "Trace ingestion failed for good (finalizationStatus=dlq); retrying will not help")
+		return 5
+	}
 	var spans []map[string]any
 	cursor := ""
 	for page := 0; page < traceMaxPages; page++ {
@@ -215,6 +219,10 @@ func runTrace(arguments []string, in traceIO) int {
 		cursor = text(pageInfo["nextCursor"])
 		if cursor == "" {
 			break
+		}
+		if page == traceMaxPages-1 {
+			fmt.Fprintf(in.stderr, "Span pagination incomplete: still more spans after %d pages, so the trace was not checked\n", traceMaxPages)
+			return 5
 		}
 	}
 
