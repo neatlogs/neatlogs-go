@@ -34,7 +34,7 @@ type normalizingExporter struct {
 	delivery              *deliveryDiagnostics
 	uploads               uploadAuthority
 	captures              *doctorCaptureStore
-	release               func(int)
+	release               func([]trace.ReadOnlySpan)
 	emitCompletionMarkers bool
 	maskOnce              sync.Once
 	maskSlots             chan struct{}
@@ -56,7 +56,7 @@ var _ trace.SpanExporter = (*normalizingExporter)(nil)
 
 func (e *normalizingExporter) ExportSpans(ctx context.Context, spans []trace.ReadOnlySpan) error {
 	if e.release != nil {
-		defer e.release(len(spans))
+		defer e.release(spans)
 	}
 	if err := ctx.Err(); err != nil {
 		e.discardAndRecord(spans, nil)
