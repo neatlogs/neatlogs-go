@@ -93,7 +93,7 @@ func checkTrace(trace map[string]any) []traceCheck {
 		add("spans_named", false, fmt.Sprintf("%d span(s) have no name", unnamed))
 	}
 	if total, ok := trace["totalTokensUsed"].(float64); ok && llm > 0 {
-		add("llm_token_usage", total > 0, fmt.Sprintf("LLM span(s): %d, totalTokensUsed=%d", llm, int(total)))
+		add("llm_token_usage", total >= 0, fmt.Sprintf("LLM span(s): %d, totalTokensUsed=%d (0 can mean the provider sent no usage)", llm, int(total)))
 	}
 	if status, ok := trace["finalizationStatus"]; ok {
 		add("finalized", status == "finalized", fmt.Sprintf("finalizationStatus=%v", status))
@@ -159,7 +159,10 @@ func runTrace(arguments []string, in traceIO) int {
 	case response.StatusCode == 401 || response.StatusCode == 403:
 		fmt.Fprintln(in.stderr, "Trace read rejected the API key")
 		return 3
-	case response.StatusCode == 202 || response.StatusCode == 404 || response.StatusCode == 409:
+	case response.StatusCode == 409:
+		fmt.Fprintln(in.stderr, "Trace ingestion failed for good (HTTP 409, failed or dead-lettered); retrying will not help")
+		return 5
+	case response.StatusCode == 202 || response.StatusCode == 404:
 		fmt.Fprintf(in.stderr, "Trace not ready or not found (HTTP %d); retry after the app flushes\n", response.StatusCode)
 		return 2
 	case response.StatusCode < 200 || response.StatusCode > 299:
