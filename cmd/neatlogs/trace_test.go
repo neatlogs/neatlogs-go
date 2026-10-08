@@ -53,7 +53,7 @@ func TestTraceGetExitCodesAndKeySafety(t *testing.T) {
 	cases := []struct {
 		status int
 		want   int
-	}{{404, 2}, {202, 2}, {401, 3}, {403, 3}, {500, 5}}
+	}{{404, 2}, {202, 2}, {409, 5}, {401, 3}, {403, 3}, {500, 5}}
 	for _, c := range cases {
 		code, _, errOut, _ := traceRun(t, c.status, "{}", nil, "trace", "get", "t1")
 		if code != c.want || strings.Contains(errOut, "secret-key") {
@@ -75,5 +75,12 @@ func TestTraceGetEncodesTraceID(t *testing.T) {
 	_, _, _, path := traceRun(t, 200, goodTrace, nil, "trace", "get", "a/b")
 	if path != "/api/traces/v3/a%2Fb" {
 		t.Fatalf("path=%s", path)
+	}
+}
+
+func TestTraceGetZeroTokensPasses(t *testing.T) {
+	body := strings.Replace(goodTrace, `"totalTokensUsed":5`, `"totalTokensUsed":0`, 1)
+	if code, _, _, _ := traceRun(t, 200, body, nil, "trace", "get", "t1", "--json"); code != 0 {
+		t.Fatalf("zero tokens code=%d", code)
 	}
 }
