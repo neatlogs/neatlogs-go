@@ -73,7 +73,7 @@ jobs:
         run: |
           set -euo pipefail
           go version
-          for module in . contrib/adk contrib/genai; do
+          for module in . contrib/adk contrib/genai examples/adk examples/genai; do
             (cd "$module" && go vet ./... && go test ./...)
           done
 
