@@ -42,7 +42,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for module in . contrib/adk contrib/genai; do
+          for module in . contrib/adk contrib/genai examples/adk examples/genai; do
             (cd "$module" && GOWORK=off go mod tidy -diff)
           done
 
@@ -62,6 +62,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for module in . contrib/adk contrib/genai; do
+          for module in . contrib/adk contrib/genai examples/adk examples/genai; do
             (cd "$module" && go test -race -count=1 ./...)
           done
