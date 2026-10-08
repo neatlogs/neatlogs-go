@@ -95,12 +95,12 @@ func TestTraceGetFailsMissingParentAndUnnamedSpan(t *testing.T) {
 	}
 }
 
-func TestTraceGetDeadLetterFailsAndZeroTokensPasses(t *testing.T) {
+func TestTraceGetPendingFailsFinalizedAndZeroTokensPasses(t *testing.T) {
 	handler := func(r *http.Request) (int, string) {
 		if strings.HasSuffix(r.URL.Path, "/spans") {
 			return healthy(r)
 		}
-		return 200, envelope(`{"traceId":"t1","status":"failed","finalizationStatus":"dlq","spansCount":2,"totalTokens":0}`)
+		return 200, envelope(`{"traceId":"t1","status":"failed","finalizationStatus":"pending","spansCount":2,"totalTokens":0}`)
 	}
 	code, out, _, _ := traceRun(t, handler, nil, "trace", "get", "t1", "--json")
 	if code != 1 || !strings.Contains(out, `"finalized"`) {
@@ -160,5 +160,44 @@ func TestTraceGetEncodesTraceID(t *testing.T) {
 	_, _, _, calls := traceRun(t, healthy, nil, "trace", "get", "a/b")
 	if len(calls) == 0 || calls[0].path != "/api/v1/public/traces/a%2Fb" {
 		t.Fatalf("calls=%v", calls)
+	}
+}
+
+func TestTraceGetDLQIsTerminalBeforeReadingSpans(t *testing.T) {
+	handler := func(r *http.Request) (int, string) {
+		if strings.HasSuffix(r.URL.Path, "/spans") {
+			return 409, "{}"
+		}
+		return 200, envelope(`{"traceId":"t1","status":"failed","finalizationStatus":"dlq","spansCount":0,"totalTokens":0}`)
+	}
+	code, _, errOut, calls := traceRun(t, handler, nil, "trace", "get", "t1")
+	if code != 5 || len(calls) != 1 || !strings.Contains(errOut, "dlq") {
+		t.Fatalf("code=%d calls=%d err=%q", code, len(calls), errOut)
+	}
+}
+
+func TestTraceGetPendingWith409OnSpansIsNotReady(t *testing.T) {
+	handler := func(r *http.Request) (int, string) {
+		if strings.HasSuffix(r.URL.Path, "/spans") {
+			return 409, "{}"
+		}
+		return 200, envelope(`{"traceId":"t1","status":"success","finalizationStatus":"pending","spansCount":2,"totalTokens":0}`)
+	}
+	code, _, errOut, _ := traceRun(t, handler, nil, "trace", "get", "t1")
+	if code != 2 || !strings.Contains(errOut, "not ready") {
+		t.Fatalf("code=%d err=%q", code, errOut)
+	}
+}
+
+func TestTraceGetPaginationCapIsIncompleteNotACheck(t *testing.T) {
+	handler := func(r *http.Request) (int, string) {
+		if !strings.HasSuffix(r.URL.Path, "/spans") {
+			return 200, envelope(traceData)
+		}
+		return 200, envelope(`{"spans":[` + spanA + `],"page":{"hasMore":true,"limit":50,"nextCursor":"more"}}`)
+	}
+	code, out, errOut, calls := traceRun(t, handler, nil, "trace", "get", "t1", "--json")
+	if code != 5 || out != "" || len(calls) != 201 || !strings.Contains(errOut, "pagination incomplete") {
+		t.Fatalf("code=%d out=%q calls=%d err=%q", code, out, len(calls), errOut)
 	}
 }
