@@ -1,0 +1,67 @@
+name: Quality gates
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: go-quality-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  format-and-tidy:
+    name: gofmt and go.mod tidy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        shell: bash
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+
+      - name: go.mod and go.sum are tidy
+        shell: bash
+        run: |
+          set -euo pipefail
+          for module in . contrib/adk contrib/genai examples/adk examples/genai; do
+            (cd "$module" && GOWORK=off go mod tidy -diff)
+          done
+
+  race:
+    name: tests with the race detector
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go test -race
+        shell: bash
+        run: |
+          set -euo pipefail
+          for module in . contrib/adk contrib/genai examples/adk examples/genai; do
+            (cd "$module" && go test -race -count=1 ./...)
+          done
