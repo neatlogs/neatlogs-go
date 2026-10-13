@@ -602,6 +602,36 @@ func TestRunMarksRootFailedWhenAnEventCarriesAnError(t *testing.T) {
 	assertAttributeAbsent(t, root.Attributes, "neatlogs.stream.cancelled")
 }
 
+func TestRunThatAnswersAfterAnErrorEventIsNotFailed(t *testing.T) {
+	// A remote agent fails, then the run still produces its answer.
+	recovering, err := agent.New(agent.Config{
+		Name: "recovering_agent",
+		Run: func(ic agent.InvocationContext) iter.Seq2[*session.Event, error] {
+			return func(yield func(*session.Event, error) bool) {
+				failed := session.NewEvent(ic.InvocationID())
+				failed.Author = ic.Agent().Name()
+				failed.ErrorMessage = "a2a task failed"
+				if !yield(failed, nil) {
+					return
+				}
+				answer := session.NewEvent(ic.InvocationID())
+				answer.Author = ic.Agent().Name()
+				answer.TurnComplete = true
+				answer.Content = genai.NewContentFromText("done without the remote agent", genai.RoleModel)
+				yield(answer, nil)
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, _ := runAgent(t, context.Background(), recovering, agent.RunConfig{}, drainRun)
+
+	if root.Status.Code != codes.Ok {
+		t.Fatalf("root status = %s, want Ok: the run answered after the error event", root.Status.Code)
+	}
+}
+
 func TestRunFailureIsNotMarkedCancelledWhenTheCallerStopsOnTheError(t *testing.T) {
 	providerErr := errors.New("provider unavailable")
 	failing := funcModel(func(_ context.Context, yield func(*model.LLMResponse, error) bool) {

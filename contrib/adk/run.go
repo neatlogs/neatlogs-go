@@ -63,26 +63,36 @@ func Run(
 			root.RecordError(err)
 			root.SetStatus(codes.Error, err.Error())
 		}
+		// ADK reports blocked responses and remote-agent failures as an event
+		// with a nil error. The run failed only if it ended on one: a run that
+		// goes on to answer (a retry, another agent) recovered, and the failed
+		// step keeps its own Error span.
+		var eventErr error
 		for event, err := range r.Run(traceCtx, userID, sessionID, message, config, options...) {
 			if err != nil {
 				report(err)
 			}
 			if event != nil {
-				// ADK reports blocked responses and remote-agent failures as
-				// an event with a nil error; the run still failed.
-				if eventErr := responseError(&event.LLMResponse); eventErr != nil {
-					report(eventErr)
-				}
+				answered := false
 				if event.Content != nil {
 					if output := contentText(event.Content); output != "" && (event.IsFinalResponse() || finalOutput == "") {
 						finalOutput = output
+						answered = event.IsFinalResponse()
 					}
+				}
+				if failure := responseError(&event.LLMResponse); failure != nil {
+					eventErr = failure
+				} else if answered {
+					eventErr = nil
 				}
 			}
 			if !yield(event, err) {
 				cancelled = true
 				break
 			}
+		}
+		if eventErr != nil {
+			report(eventErr)
 		}
 		if finalOutput != "" {
 			_ = neatlogs.SetTraceOutput(root, boundedText(finalOutput))
