@@ -14,6 +14,10 @@ import (
 	"google.golang.org/genai"
 )
 
+// runKey carries the Run root's span ID to the A2A callbacks, so Run can end
+// the A2A spans it owns.
+type runKey struct{}
+
 // Run executes an ADK turn inside a Neatlogs WORKFLOW span. Use it in place of
 // runner.Run so wrapped models and tool callbacks inherit the same private
 // trace without changing the process-global OpenTelemetry provider.
@@ -37,6 +41,8 @@ func Run(
 		})
 		traceCtx, root, end := neatlogs.Trace(ctx, "google.adk.run")
 		defer end()
+		run := root.SpanContext().SpanID()
+		traceCtx = context.WithValue(traceCtx, runKey{}, run)
 		root.SetAttributes(
 			attribute.String("neatlogs.framework", "google_adk"),
 			attribute.String("neatlogs.session.id", sessionID),
@@ -47,6 +53,7 @@ func Run(
 
 		var finalOutput string
 		failed, cancelled := false, false
+		defer func() { endOpenA2ACalls(run, cancelled && !failed) }()
 		report := func(err error) {
 			if isCallerCancellation(traceCtx, err) {
 				cancelled = true

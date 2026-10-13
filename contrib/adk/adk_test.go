@@ -11,6 +11,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/a2aproject/a2a-go/v2/a2a"
 	neatlogs "github.com/neatlogs/neatlogs-go"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -659,6 +660,179 @@ func TestRunCancelledByCallerIsNotAnError(t *testing.T) {
 				assertStringAttribute(t, root.Attributes, "neatlogs.trace.output", `"first answer"`)
 			}
 		})
+	}
+}
+
+// remoteStep is one after-callback of a remote A2A call: the converted event,
+// or the error a custom converter returns instead of one.
+type remoteStep struct {
+	text         string
+	thought      bool
+	partial      bool
+	turnComplete bool
+	errorMessage string
+	err          error
+}
+
+// remoteCallAgent replays the callback sequence of ADK's remote A2A agent: one
+// before-callback, then one after-callback per remote event (per streamed
+// event in SSE mode). The real remote agent is not imported because it would
+// add indirect requirements to this module.
+func remoteCallAgent(t *testing.T, steps []remoteStep) agent.Agent {
+	t.Helper()
+	remote, err := agent.New(agent.Config{
+		Name: "remote_agent",
+		Run: func(ic agent.InvocationContext) iter.Seq2[*session.Event, error] {
+			return func(yield func(*session.Event, error) bool) {
+				callbackCtx := agent.NewCallbackContextWithArtifactTracking(ic, nil)
+				req := &a2a.SendMessageRequest{Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("hello"))}
+				_, _ = A2ABeforeRequest(callbackCtx, req)
+				for _, step := range steps {
+					var event *session.Event
+					if step.err == nil {
+						event = session.NewEvent(ic.InvocationID())
+						event.Author = ic.Agent().Name()
+						event.Partial = step.partial
+						event.TurnComplete = step.turnComplete
+						event.ErrorMessage = step.errorMessage
+						if step.text != "" {
+							event.Content = &genai.Content{Role: genai.RoleModel, Parts: []*genai.Part{{Text: step.text, Thought: step.thought}}}
+						}
+					}
+					_, _ = A2AAfterRequest(callbackCtx, req, event, step.err)
+					if !yield(event, step.err) {
+						return
+					}
+				}
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return remote
+}
+
+func TestA2ACallIsOneSpanWithTheOutcomeOfTheWholeCall(t *testing.T) {
+	// ADK's converter emits non-terminal status updates as partial thoughts,
+	// artifact chunks as partial text, and failures as a terminal error event
+	// with a nil callback error.
+	working := remoteStep{text: "working...", thought: true, partial: true}
+	first := remoteStep{text: "Hello", partial: true}
+	second := remoteStep{text: ", world!", partial: true}
+	completed := remoteStep{turnComplete: true}
+	transportErr := errors.New("connection reset by peer")
+
+	for _, test := range []struct {
+		name           string
+		steps          []remoteStep
+		wantStatus     codes.Code
+		wantMessage    string
+		wantOutput     string
+		wantIncomplete bool
+		wantRoot       codes.Code
+	}{
+		{
+			name:       "streamed_call_completes",
+			steps:      []remoteStep{working, first, second, completed},
+			wantStatus: codes.Ok, wantOutput: "Hello, world!", wantRoot: codes.Ok,
+		},
+		{
+			name:       "stream_breaks_after_partial_output",
+			steps:      []remoteStep{working, first, {errorMessage: transportErr.Error(), turnComplete: true}},
+			wantStatus: codes.Error, wantMessage: transportErr.Error(), wantOutput: "Hello", wantRoot: codes.Error,
+		},
+		{
+			name:       "remote_task_fails",
+			steps:      []remoteStep{working, first, {text: "remote tool crashed", errorMessage: "remote tool crashed", turnComplete: true}},
+			wantStatus: codes.Error, wantMessage: "remote tool crashed", wantOutput: "Hello", wantRoot: codes.Error,
+		},
+		{
+			name:       "converter_returns_an_error",
+			steps:      []remoteStep{first, {err: transportErr}},
+			wantStatus: codes.Error, wantMessage: transportErr.Error(), wantOutput: "Hello", wantRoot: codes.Error,
+		},
+		{
+			name:       "stream_ends_without_a_terminal_event",
+			steps:      []remoteStep{working, first},
+			wantStatus: codes.Unset, wantOutput: "Hello", wantIncomplete: true, wantRoot: codes.Ok,
+		},
+		{
+			name:       "single_response",
+			steps:      []remoteStep{{text: "Hi!", turnComplete: true}},
+			wantStatus: codes.Ok, wantOutput: "Hi!", wantRoot: codes.Ok,
+		},
+		{
+			name:       "single_request_fails",
+			steps:      []remoteStep{{errorMessage: transportErr.Error(), turnComplete: true}},
+			wantStatus: codes.Error, wantMessage: transportErr.Error(), wantRoot: codes.Error,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root, sink := runAgent(t, context.Background(), remoteCallAgent(t, test.steps), agent.RunConfig{StreamingMode: agent.StreamingModeSSE}, drainRun)
+
+			spans := findSpans(sink, "google.adk.a2a")
+			if len(spans) != 1 {
+				t.Fatalf("A2A spans = %d, want one for the whole remote call", len(spans))
+			}
+			span := spans[0]
+			if span.Status.Code != test.wantStatus {
+				t.Fatalf("A2A status = %s (%q), want %s", span.Status.Code, span.Status.Description, test.wantStatus)
+			}
+			if span.Status.Description != test.wantMessage {
+				t.Fatalf("A2A status message = %q, want %q", span.Status.Description, test.wantMessage)
+			}
+			if test.wantStatus == codes.Error {
+				assertExceptionRecorded(t, span)
+			}
+			if test.wantOutput != "" {
+				assertStringAttribute(t, span.Attributes, "neatlogs.output.value", test.wantOutput)
+			}
+			if test.wantIncomplete {
+				assertBoolAttribute(t, span.Attributes, "neatlogs.stream.incomplete", true)
+			} else {
+				assertAttributeAbsent(t, span.Attributes, "neatlogs.stream.incomplete")
+			}
+			assertStringAttribute(t, span.Attributes, "neatlogs.input.value", "hello")
+			if span.Parent.SpanID() != root.SpanContext.SpanID() {
+				t.Fatalf("A2A span parent = %s, want the Run root %s", span.Parent.SpanID(), root.SpanContext.SpanID())
+			}
+			if root.Status.Code != test.wantRoot {
+				t.Fatalf("root status = %s (%q), want %s", root.Status.Code, root.Status.Description, test.wantRoot)
+			}
+		})
+	}
+}
+
+// Without Run nothing can end a span that never sees a terminal event, so
+// every callback ends its span instead of leaving one open.
+func TestA2ACallbacksLeaveNoSpanOpenWithoutRun(t *testing.T) {
+	ctx := context.Background()
+	client, sink := newTestClient(t, "a2a-without-run")
+	r, err := runner.New(runner.Config{
+		AppName: "a2a-without-run", Agent: remoteCallAgent(t, []remoteStep{{text: "Hello", partial: true}}),
+		SessionService: session.InMemoryService(), AutoCreateSession: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, runErr := range r.Run(
+		client.Context(ctx), "user-1", "session-1",
+		genai.NewContentFromText("hello", genai.RoleUser), agent.RunConfig{StreamingMode: agent.StreamingModeSSE},
+	) {
+		if runErr != nil {
+			t.Fatal(runErr)
+		}
+	}
+	if err := client.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if open := len(activeA2ACalls.entries); open != 0 {
+		t.Fatalf("%d A2A spans left open", open)
+	}
+	if spans := findSpans(sink, "google.adk.a2a"); len(spans) != 1 {
+		t.Fatalf("A2A spans = %d, want the one callback's span ended", len(spans))
 	}
 }
 
