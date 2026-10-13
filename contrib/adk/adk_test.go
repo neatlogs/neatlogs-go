@@ -518,6 +518,150 @@ func TestWrapModelOverGeminiSSEStream(t *testing.T) {
 	}
 }
 
+// funcModel is an ADK model whose stream is scripted by a function, for cases
+// the fixed-response fakes cannot express (cancelling a context mid-call).
+type funcModel func(ctx context.Context, yield func(*model.LLMResponse, error) bool)
+
+func (m funcModel) Name() string { return "gemini-func" }
+
+func (m funcModel) GenerateContent(ctx context.Context, _ *model.LLMRequest, _ bool) iter.Seq2[*model.LLMResponse, error] {
+	return func(yield func(*model.LLMResponse, error) bool) { m(ctx, yield) }
+}
+
+// runAgent drives Run over one agent and returns the exported root span.
+// consume receives each item and returns false to stop early.
+func runAgent(
+	t *testing.T,
+	ctx context.Context,
+	adkAgent agent.Agent,
+	config agent.RunConfig,
+	consume func(*session.Event, error) bool,
+) (tracetest.SpanStub, *tracetest.InMemoryExporter) {
+	t.Helper()
+	client, sink := newTestClient(t, "adk-run-outcomes")
+	r, err := runner.New(runner.Config{
+		AppName: "adk-run-outcomes", Agent: adkAgent,
+		SessionService: session.InMemoryService(), AutoCreateSession: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for event, runErr := range Run(
+		client.Context(ctx), r, "user-1", "session-1",
+		genai.NewContentFromText("hello", genai.RoleUser), config,
+	) {
+		if !consume(event, runErr) {
+			break
+		}
+	}
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if open := len(activeA2ACalls.entries); open != 0 {
+		t.Fatalf("%d A2A spans left open after Run", open)
+	}
+	return findSpan(t, sink, "google.adk.run"), sink
+}
+
+func modelAgent(t *testing.T, llm model.LLM) agent.Agent {
+	t.Helper()
+	adkAgent, err := llmagent.New(InstrumentConfig(llmagent.Config{Name: "outcome_agent", Model: llm}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return adkAgent
+}
+
+func drainRun(*session.Event, error) bool { return true }
+
+func TestRunMarksRootFailedWhenAnEventCarriesAnError(t *testing.T) {
+	// ADK reports a blocked response as an event; Run never sees a Go error.
+	blocked := funcModel(func(_ context.Context, yield func(*model.LLMResponse, error) bool) {
+		yield(&model.LLMResponse{ErrorCode: "SAFETY", ErrorMessage: "response blocked"}, nil)
+	})
+	sawErrorEvent := false
+	root, _ := runAgent(t, context.Background(), modelAgent(t, blocked), agent.RunConfig{}, func(event *session.Event, err error) bool {
+		if err != nil {
+			t.Fatalf("Run yielded a Go error, want an error event: %v", err)
+		}
+		sawErrorEvent = sawErrorEvent || (event != nil && event.ErrorCode == "SAFETY")
+		return true
+	})
+
+	if !sawErrorEvent {
+		t.Fatal("ADK did not deliver the blocked response as an error event")
+	}
+	if root.Status.Code != codes.Error {
+		t.Fatalf("root status = %s, want Error", root.Status.Code)
+	}
+	if want := "SAFETY: response blocked"; root.Status.Description != want {
+		t.Fatalf("root status message = %q, want %q", root.Status.Description, want)
+	}
+	assertExceptionRecorded(t, root)
+	assertAttributeAbsent(t, root.Attributes, "neatlogs.stream.cancelled")
+}
+
+func TestRunFailureIsNotMarkedCancelledWhenTheCallerStopsOnTheError(t *testing.T) {
+	providerErr := errors.New("provider unavailable")
+	failing := funcModel(func(_ context.Context, yield func(*model.LLMResponse, error) bool) {
+		yield(nil, providerErr)
+	})
+	root, sink := runAgent(t, context.Background(), modelAgent(t, failing), agent.RunConfig{}, func(_ *session.Event, err error) bool {
+		return err == nil
+	})
+
+	if root.Status.Code != codes.Error {
+		t.Fatalf("root status = %s, want Error", root.Status.Code)
+	}
+	assertAttributeAbsent(t, root.Attributes, "neatlogs.stream.cancelled")
+	llm := findSpan(t, sink, "google.adk.generate_content")
+	if llm.Status.Code != codes.Error {
+		t.Fatalf("LLM status = %s, want Error", llm.Status.Code)
+	}
+	assertAttributeAbsent(t, llm.Attributes, "neatlogs.stream.cancelled")
+}
+
+func TestRunCancelledByCallerIsNotAnError(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		// cancelContext makes the model cancel the caller's context and yield
+		// its error; otherwise the consumer stops after the first event.
+		cancelContext bool
+	}{
+		{name: "context_cancelled", cancelContext: true},
+		{name: "iteration_stopped"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			llm := funcModel(func(modelCtx context.Context, yield func(*model.LLMResponse, error) bool) {
+				if test.cancelContext {
+					cancel()
+					yield(nil, modelCtx.Err())
+					return
+				}
+				yield(textResponse("first answer", false), nil)
+			})
+			root, sink := runAgent(t, ctx, modelAgent(t, llm), agent.RunConfig{}, func(_ *session.Event, err error) bool {
+				return test.cancelContext && err == nil
+			})
+
+			if root.Status.Code != codes.Unset {
+				t.Fatalf("root status = %s (%q), want Unset", root.Status.Code, root.Status.Description)
+			}
+			assertBoolAttribute(t, root.Attributes, "neatlogs.stream.cancelled", true)
+			llmSpan := findSpan(t, sink, "google.adk.generate_content")
+			if llmSpan.Status.Code != codes.Unset {
+				t.Fatalf("LLM status = %s (%q), want Unset", llmSpan.Status.Code, llmSpan.Status.Description)
+			}
+			assertBoolAttribute(t, llmSpan.Attributes, "neatlogs.stream.cancelled", true)
+			if !test.cancelContext {
+				assertStringAttribute(t, root.Attributes, "neatlogs.trace.output", `"first answer"`)
+			}
+		})
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return fn(req) }

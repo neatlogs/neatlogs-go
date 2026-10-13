@@ -46,30 +46,46 @@ func Run(
 		}
 
 		var finalOutput string
-		failed := false
+		failed, cancelled := false, false
+		report := func(err error) {
+			if isCallerCancellation(traceCtx, err) {
+				cancelled = true
+				return
+			}
+			failed = true
+			root.RecordError(err)
+			root.SetStatus(codes.Error, err.Error())
+		}
 		for event, err := range r.Run(traceCtx, userID, sessionID, message, config, options...) {
 			if err != nil {
-				failed = true
-				root.RecordError(err)
-				root.SetStatus(codes.Error, err.Error())
+				report(err)
 			}
-			if event != nil && event.Content != nil {
-				if output := contentText(event.Content); output != "" && (event.IsFinalResponse() || finalOutput == "") {
-					finalOutput = output
+			if event != nil {
+				// ADK reports blocked responses and remote-agent failures as
+				// an event with a nil error; the run still failed.
+				if eventErr := responseError(&event.LLMResponse); eventErr != nil {
+					report(eventErr)
+				}
+				if event.Content != nil {
+					if output := contentText(event.Content); output != "" && (event.IsFinalResponse() || finalOutput == "") {
+						finalOutput = output
+					}
 				}
 			}
 			if !yield(event, err) {
-				root.SetAttributes(attribute.Bool("neatlogs.stream.cancelled", true))
-				if finalOutput != "" {
-					_ = neatlogs.SetTraceOutput(root, boundedText(finalOutput))
-				}
-				return
+				cancelled = true
+				break
 			}
 		}
 		if finalOutput != "" {
 			_ = neatlogs.SetTraceOutput(root, boundedText(finalOutput))
 		}
-		if !failed {
+		switch {
+		case failed:
+			// Status is already Error; a failed run is not a cancelled one.
+		case cancelled:
+			root.SetAttributes(attribute.Bool(streamCancelled, true))
+		default:
 			root.SetStatus(codes.Ok, "")
 		}
 	}
