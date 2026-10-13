@@ -19,11 +19,13 @@ import (
 )
 
 const (
-	inputMsgPrefix  = "neatlogs.llm.input_messages."
-	outputMsgPrefix = "neatlogs.llm.output_messages."
-	toolCallPrefix  = "neatlogs.llm.tool_calls."
-	maxOutputBytes  = 1 << 20
-	maxToolCalls    = 128
+	inputMsgPrefix   = "neatlogs.llm.input_messages."
+	outputMsgPrefix  = "neatlogs.llm.output_messages."
+	toolCallPrefix   = "neatlogs.llm.tool_calls."
+	streamCancelled  = "neatlogs.stream.cancelled"
+	streamIncomplete = "neatlogs.stream.incomplete"
+	maxOutputBytes   = 1 << 20
+	maxToolCalls     = 128
 )
 
 // instrumentedModel wraps an ADK model.LLM, adding I/O capture onto the active
@@ -67,23 +69,59 @@ func (m *instrumentedModel) GenerateContent(ctx context.Context, req *model.LLMR
 
 		capture := responseCapture{}
 		for resp, err := range m.inner.GenerateContent(spanCtx, req, stream) {
-			if err != nil {
+			switch {
+			case err == nil:
+				capture.add(span, resp)
+			case isCallerCancellation(spanCtx, err):
+				capture.cancelled = true
+			default:
 				span.RecordError(err)
 				span.SetStatus(codes.Error, err.Error())
 				capture.failed = true
-			} else {
-				capture.add(span, resp)
 			}
 			if !yield(resp, err) {
-				span.SetAttributes(attribute.Bool("neatlogs.stream.cancelled", true))
 				capture.cancelled = true
 				break
 			}
 		}
 		capture.apply(span)
-		if !capture.failed && !capture.cancelled {
+		switch {
+		case capture.failed:
+			// Status is already Error; a failed call is not a cancelled one.
+		case capture.cancelled:
+			span.SetAttributes(attribute.Bool(streamCancelled, true))
+		case stream && !capture.finished:
+			// The model never said the response was complete, so the span must
+			// not claim success.
+			span.SetAttributes(attribute.Bool(streamIncomplete, true))
+		default:
 			span.SetStatus(codes.Ok, "")
 		}
+	}
+}
+
+// isCallerCancellation reports a deliberate stop by the caller. An expired
+// deadline is a real failure and stays an error.
+func isCallerCancellation(ctx context.Context, err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	return errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled)
+}
+
+// responseError returns the failure an ADK response reports in its error
+// fields, or nil. ADK delivers these with a nil Go error.
+func responseError(resp *model.LLMResponse) error {
+	code, message := strings.TrimSpace(resp.ErrorCode), strings.TrimSpace(resp.ErrorMessage)
+	switch {
+	case code == "" && message == "":
+		return nil
+	case message == "":
+		return errors.New(code)
+	case code == "":
+		return errors.New(message)
+	default:
+		return errors.New(code + ": " + message)
 	}
 }
 
@@ -92,6 +130,8 @@ type responseCapture struct {
 	toolCalls    []string
 	toolCallKeys map[string]int
 	truncated    bool
+	partialText  bool
+	finished     bool
 	failed       bool
 	cancelled    bool
 	usage        *genai.GenerateContentResponseUsageMetadata
@@ -112,8 +152,10 @@ func (c *responseCapture) add(span trace.Span, resp *model.LLMResponse) {
 	if resp.FinishReason != "" {
 		c.finishReason = string(resp.FinishReason)
 	}
-	if resp.ErrorCode != "" || resp.ErrorMessage != "" {
-		err := errors.New(strings.TrimSpace(resp.ErrorCode + ": " + resp.ErrorMessage))
+	if resp.FinishReason != "" || resp.TurnComplete {
+		c.finished = true
+	}
+	if err := responseError(resp); err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 		c.failed = true
@@ -121,17 +163,34 @@ func (c *responseCapture) add(span trace.Span, resp *model.LLMResponse) {
 	if resp.Content == nil {
 		return
 	}
+	// In streaming mode ADK yields partial deltas and then one aggregated
+	// response that repeats their text, so the aggregate replaces them.
+	if !resp.Partial && c.partialText && hasOutputText(resp.Content) {
+		c.output.Reset()
+		c.truncated = false
+		c.partialText = false
+	}
 	for _, part := range resp.Content.Parts {
 		if part == nil {
 			continue
 		}
 		if part.Text != "" && !part.Thought {
 			c.appendOutput(part.Text)
+			c.partialText = c.partialText || resp.Partial
 		}
 		if part.FunctionCall != nil {
 			c.addToolCall(span, part.FunctionCall)
 		}
 	}
+}
+
+func hasOutputText(content *genai.Content) bool {
+	for _, part := range content.Parts {
+		if part != nil && part.Text != "" && !part.Thought {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *responseCapture) appendOutput(value string) {
