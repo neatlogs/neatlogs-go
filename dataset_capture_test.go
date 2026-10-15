@@ -179,6 +179,81 @@ func TestDatasetCaptureEnvironmentGuard(t *testing.T) {
 	}
 }
 
+func TestDatasetCaptureChecksLiveStatusBeforeReplayingCachedRegistration(t *testing.T) {
+	telemetry, err := NewClient(context.Background(), Config{}, WithExporter(tracetest.NewInMemoryExporter()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer telemetry.Shutdown(context.Background())
+	state := "recording"
+	registrations, statusReads, completions, callbacks := 0, 0, 0, 0
+	client := datasetTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/public/dataset-capture-jobs/"+datasetCaptureTestID:
+			statusReads++
+			var version *string
+			if state == "completed" {
+				value := datasetTestVersion
+				version = &value
+			}
+			json.NewEncoder(w).Encode(map[string]any{"success": true, "data": map[string]any{
+				"job":      DatasetCaptureStatus{CaptureID: datasetCaptureTestID, DatasetID: datasetTestID, State: state, DatasetVersionID: version},
+				"failures": []any{}, "nextCursor": nil,
+			}})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/public/dataset-capture-jobs":
+			registrations++
+			if r.Header.Get("Idempotency-Key") != datasetTestVersion {
+				t.Error("registration key changed")
+			}
+			// The public API replays this original response after the job completes.
+			datasetCaptureReply(w, "recording")
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/complete"):
+			completions++
+			state = "completed"
+			datasetCaptureReply(w, state)
+		default:
+			t.Errorf("unexpected capture mutation %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	options := CaptureDatasetOptions{Environment: "ci", Destination: DatasetDestination{DatasetID: datasetTestID}, IdempotencyKey: datasetTestVersion}
+	execute := func(ctx context.Context) error { callbacks++; _, _, end := Trace(ctx, "root"); end(); return nil }
+	if receipt, err := client.Capture(context.Background(), telemetry, options, execute); err != nil || receipt.State != "completed" {
+		t.Fatalf("first capture: %+v %v", receipt, err)
+	}
+	receipt, err := client.Capture(context.Background(), telemetry, options, execute)
+	var captureErr *DatasetCaptureError
+	if !errors.As(err, &captureErr) || captureErr.Phase != "registration" || captureErr.Completion != nil || receipt.State != "completed" || captureErr.Receipt.State != "completed" {
+		t.Fatalf("replayed capture: %+v %v", receipt, err)
+	}
+	if callbacks != 1 || registrations != 2 || statusReads != 2 || completions != 1 {
+		t.Fatalf("callbacks=%d registrations=%d statusReads=%d completions=%d", callbacks, registrations, statusReads, completions)
+	}
+}
+
+func TestDatasetCaptureDoesNotExecuteWhenRegistrationStatusFails(t *testing.T) {
+	telemetry, err := NewClient(context.Background(), Config{}, WithExporter(tracetest.NewInMemoryExporter()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer telemetry.Shutdown(context.Background())
+	client := datasetTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		if r.URL.Path != "/api/v1/public/dataset-capture-jobs" {
+			t.Error("mutated existing job after status failed")
+		}
+		datasetCaptureReply(w, "recording")
+	})
+	_, err = client.Capture(context.Background(), telemetry, CaptureDatasetOptions{Environment: "ci", Destination: DatasetDestination{DatasetID: datasetTestID}, IdempotencyKey: datasetTestVersion}, func(context.Context) error { t.Error("executed with unknown registration status"); return nil })
+	var apiErr *DatasetAPIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusForbidden {
+		t.Fatal(err)
+	}
+}
+
 func TestDatasetCaptureWaitPublicationAndFailure(t *testing.T) {
 	for _, state := range []string{"completed", "failed", "needs_review", "cancelled"} {
 		t.Run(state, func(t *testing.T) {

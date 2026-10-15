@@ -244,6 +244,11 @@ If completion returns a `*neatlogs.DatasetCaptureError` with a non-nil
 manifest and idempotency key, then call `Wait`. This recovery never reruns the
 agent. Do not rerun `Capture` to recover a failed completion.
 
+When you supply a capture registration `IdempotencyKey`, `Capture` checks the
+job's current status before executing the callback. Reusing a sealed job's key
+is rejected even if the registration API replays an older `recording` receipt.
+This check does not serialize concurrent `Capture` calls with the same key.
+
 Set an outcome only on its intended case by calling `UpdateOutcomes` with the
 published base version and each case's revision ID. `NewDatasetOutcome(value)`
 creates a human draft outcome. A nil `Outcome` clears that case's outcome;

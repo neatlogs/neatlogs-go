@@ -187,6 +187,20 @@ func (c *DatasetClient) Capture(ctx context.Context, telemetry *Client, options 
 		// Replayed registration may already be sealed. It must never execute again.
 		return receipt, &DatasetCaptureError{Phase: "registration", Receipt: receipt, Err: errors.New("neatlogs: registration is already sealed; inspect its status instead of rerunning execution")}
 	}
+	if options.IdempotencyKey != "" {
+		// Admission receipts are cached by idempotency key, so their state can be stale.
+		status, statusErr := c.Status(ctx, receipt.CaptureID)
+		if statusErr != nil {
+			return receipt, &DatasetCaptureError{Phase: "registration", Receipt: receipt, Err: statusErr}
+		}
+		if status.DatasetID != receipt.DatasetID {
+			return receipt, &DatasetCaptureError{Phase: "registration", Receipt: receipt, Err: errors.New("neatlogs: dataset capture status changed destination")}
+		}
+		receipt.State = status.State
+		if receipt.State != "recording" {
+			return receipt, &DatasetCaptureError{Phase: "registration", Receipt: receipt, Err: errors.New("neatlogs: registration is already sealed; inspect its status instead of rerunning execution")}
+		}
+	}
 	abort := func(reason string, cause error) (DatasetCaptureReceipt, error) {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
