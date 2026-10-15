@@ -185,6 +185,79 @@ Large media bytes are staged outside span data in a per-pipeline store capped at
 25 MiB and 32 unique items; masks see only canonical metadata plus an opaque
 token, and shutdown or any dropped span releases its staged bytes.
 
+## Datasets
+
+Dataset writes use a public API user or service account token with
+`evaluation:write` and project access. Keep this token separate from the
+telemetry ingestion key. Creation works without initializing telemetry:
+
+```go
+datasets, err := neatlogs.NewDatasetClient(neatlogs.DatasetConfig{
+    Endpoint: "https://app.neatlogs.com",
+    Token: publicToken,
+    ProjectID: projectID,
+})
+if err != nil { return err }
+dataset, err := datasets.Create(ctx, neatlogs.CreateDatasetOptions{Name: "Support cases"})
+if err != nil { return err }
+```
+
+Capture an execution with an existing telemetry client. Pass the callback context
+through your normal wrappers and helpers, and join child goroutines before
+returning. Each root trace becomes a separate unlabeled case:
+
+```go
+receipt, err := datasets.Capture(ctx, telemetry, neatlogs.CaptureDatasetOptions{
+    Environment: "local",
+    Destination: neatlogs.DatasetDestination{DatasetID: dataset.DatasetID},
+}, func(ctx context.Context) error {
+    agentCtx, root, end := neatlogs.Trace(ctx, "support request")
+    defer end()
+    if err := neatlogs.SetTraceInput(root, question); err != nil { return err }
+    answer, err := runAgent(agentCtx)
+    if err != nil { return err }
+    return neatlogs.SetTraceOutput(root, answer)
+})
+if err != nil { return err }
+status, err := datasets.Wait(ctx, receipt.CaptureID)
+if err != nil { return err }
+publishedVersion := *status.DatasetVersionID
+```
+
+Use the child context returned by `Trace` when the agent should create child
+spans under that root. Pass a nil telemetry client to select the client already
+bound to `ctx`, or the running `Init` pipeline. Named destinations require
+`CreateIfMissing: true` to create a dataset. `Environment` must be `local`, `ci`,
+or `production`; production also requires `AllowProduction: true`. The workload
+environment is independent of the backend hostname.
+
+Capture requires full sampling and enabled export. It rejects open spans,
+queue or mask drops, truncated evidence, failed uploads, and missing final
+export acknowledgments. Cancellation before sealing aborts the recording.
+Callback errors remain available through `errors.Is`, and complete failed
+executions can still publish. Use `Status` to inspect progress or `Abort` to
+cancel an unfinished recording. `Wait` accepts a context deadline and reports
+failed, cancelled, or review-required jobs as errors.
+
+If completion returns a `*neatlogs.DatasetCaptureError` with a non-nil
+`Completion`, call `captureError.Completion.Retry(ctx)` to resend the same
+manifest and idempotency key, then call `Wait`. This recovery never reruns the
+agent. Do not rerun `Capture` to recover a failed completion.
+
+When you supply a capture registration `IdempotencyKey`, `Capture` checks the
+job's current status before executing the callback. Reusing a sealed job's key
+is rejected even if the registration API replays an older `recording` receipt.
+This check does not serialize concurrent `Capture` calls with the same key.
+
+Set an outcome only on its intended case by calling `UpdateOutcomes` with the
+published base version and each case's revision ID. `NewDatasetOutcome(value)`
+creates a human draft outcome. A nil `Outcome` clears that case's outcome;
+cases absent from `Changes` retain their outcomes. Each update publishes a new
+immutable version. Creation and outcome options accept an `IdempotencyKey`
+UUID for retrying the same logical write. Requests, including capture manifests,
+must fit within 64 KiB. Capture retains at most 2,000 span IDs per scope and
+32 concurrent scopes per telemetry client.
+
 ## Status
 
 v0.1 — Google Gemini (`google.golang.org/genai`) active wrapping, direct

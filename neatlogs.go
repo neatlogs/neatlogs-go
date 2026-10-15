@@ -455,15 +455,17 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 			return nil, nil, false, fmt.Errorf("neatlogs: sample rate must be between 0 and 1, got %v", sampleRate)
 		}
 	}
+	datasetCaptures := newDatasetCaptureRegistry()
 	var tpOpts []sdktrace.TracerProviderOption
 	tpOpts = append(
 		tpOpts,
 		sdktrace.WithResource(buildResource(ctx, cfg, io.doctorProbe)),
-		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(sampleRate))),
+		sdktrace.WithSampler(datasetCaptureSampler{base: sdktrace.ParentBased(sdktrace.TraceIDRatioBased(sampleRate)), registry: datasetCaptures}),
 	)
 
 	var mediaStore *internalmedia.Store
 	var captures *doctorCaptureStore
+	tpOpts = append(tpOpts, sdktrace.WithSpanProcessor(datasetCaptures))
 	if io.doctorProbe {
 		captures = newDoctorCaptureStore(16)
 	}
@@ -493,7 +495,7 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 		batchProcessor := sdktrace.NewBatchSpanProcessor(
 			&normalizingExporter{
 				next: byteLimited, mapper: attributes.Default(), mask: cfg.Mask,
-				delivery: delivery, uploads: uploads, captures: captures, release: queue.release,
+				delivery: delivery, uploads: uploads, captures: captures, release: queue.release, datasetCaptures: datasetCaptures,
 				emitCompletionMarkers: true,
 			},
 			sdktrace.WithMaxQueueSize(defaultMaxQueueSize),
@@ -511,7 +513,10 @@ func buildSDKRuntime(ctx context.Context, cfg Config, io initOptions) (*sdkRunti
 	lifecycle := newActiveSpanRegistry()
 	tp.RegisterSpanProcessor(lifecycle)
 	tp.RegisterSpanProcessor(&identityProcessor{})
-	return newSDKRuntime(tp, lifecycle, resolvedWorkflowNameFrom(cfg), io.delivery, mediaStore, captures), base, !disable, nil
+	runtime := newSDKRuntime(tp, lifecycle, resolvedWorkflowNameFrom(cfg), io.delivery, mediaStore, captures)
+	runtime.datasetCaptures = datasetCaptures
+	runtime.datasetCaptureEnabled = !disable && sampleRate == 1
+	return runtime, base, !disable, nil
 }
 
 func resolveUploadsEnabled(cfg Config) (bool, error) {
