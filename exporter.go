@@ -34,6 +34,7 @@ type normalizingExporter struct {
 	delivery              *deliveryDiagnostics
 	uploads               uploadAuthority
 	captures              *doctorCaptureStore
+	datasetCaptures       *datasetCaptureRegistry
 	release               func(int)
 	emitCompletionMarkers bool
 	maskOnce              sync.Once
@@ -177,6 +178,7 @@ func (e *normalizingExporter) ExportSpans(ctx context.Context, spans []trace.Rea
 		}
 		return newUploadFailure("typed_media", "one_or_more_uploads_failed", false)
 	}
+	e.datasetCaptures.acknowledge(rewritten)
 	return nil
 }
 
