@@ -45,7 +45,7 @@ func TestDatasetCaptureExportsExactContextAndPreservesCallbackError(t *testing.T
 	callbackErr := errors.New("agent failed")
 	_, _, outsideEnd := Trace(telemetry.Context(context.Background()), "outside")
 	outsideEnd()
-	receipt, err := client.Capture(context.Background(), telemetry, CaptureDatasetOptions{Destination: DatasetDestination{DatasetID: datasetTestID}}, func(ctx context.Context) error {
+	receipt, err := client.Capture(context.Background(), telemetry, CaptureDatasetOptions{Environment: "ci", Destination: DatasetDestination{DatasetID: datasetTestID}}, func(ctx context.Context) error {
 		for range 2 {
 			rootCtx, _, end := Trace(ctx, "root")
 			_, _, childEnd := StartSpan(rootCtx, "tool", "TOOL")
@@ -79,7 +79,7 @@ func TestDatasetCaptureAbortsOpenSpansAndCancellation(t *testing.T) {
 			})
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			_, err := client.Capture(ctx, telemetry, CaptureDatasetOptions{Destination: DatasetDestination{Name: "test", CreateIfMissing: true}}, func(ctx context.Context) error {
+			_, err := client.Capture(ctx, telemetry, CaptureDatasetOptions{Environment: "ci", Destination: DatasetDestination{Name: "test", CreateIfMissing: true}}, func(ctx context.Context) error {
 				_, _, _ = Trace(ctx, "open")
 				if cancelled {
 					cancel()
@@ -102,7 +102,7 @@ func TestDatasetCaptureRequiresEnabledFullSampling(t *testing.T) {
 		telemetry, _ := NewClient(context.Background(), cfg, WithExporter(tracetest.NewInMemoryExporter()))
 		defer telemetry.Shutdown(context.Background())
 		client := datasetTestClient(t, func(http.ResponseWriter, *http.Request) { t.Error("invalid client registered capture") })
-		_, err := client.Capture(context.Background(), telemetry, CaptureDatasetOptions{Destination: DatasetDestination{DatasetID: datasetTestID}}, func(context.Context) error { t.Error("callback executed"); return nil })
+		_, err := client.Capture(context.Background(), telemetry, CaptureDatasetOptions{Environment: "ci", Destination: DatasetDestination{DatasetID: datasetTestID}}, func(context.Context) error { t.Error("callback executed"); return nil })
 		if err == nil {
 			t.Fatal("accepted incomplete pipeline")
 		}
@@ -123,10 +123,59 @@ func TestDatasetCaptureCompletionUncertaintyDoesNotAbortOrRerun(t *testing.T) {
 		}
 		datasetCaptureReply(w, "recording")
 	})
-	receipt, err := client.Capture(context.Background(), telemetry, CaptureDatasetOptions{Destination: DatasetDestination{DatasetID: datasetTestID}}, func(ctx context.Context) error { calls++; _, _, end := Trace(ctx, "root"); end(); return nil })
+	receipt, err := client.Capture(context.Background(), telemetry, CaptureDatasetOptions{Environment: "ci", Destination: DatasetDestination{DatasetID: datasetTestID}}, func(ctx context.Context) error { calls++; _, _, end := Trace(ctx, "root"); end(); return nil })
 	var captureErr *DatasetCaptureError
 	if !errors.As(err, &captureErr) || !captureErr.CompletionUncertain || calls != 1 || receipt.CaptureID != datasetCaptureTestID {
 		t.Fatalf("receipt=%+v err=%v calls=%d", receipt, err, calls)
+	}
+}
+
+func TestDatasetCaptureCompletionRecoveryRetainsExactRequest(t *testing.T) {
+	telemetry, _ := NewClient(context.Background(), Config{}, WithExporter(tracetest.NewInMemoryExporter()))
+	defer telemetry.Shutdown(context.Background())
+	attempts, calls := 0, 0
+	var key, body string
+	client := datasetTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/complete") {
+			attempts++
+			var value json.RawMessage
+			json.NewDecoder(r.Body).Decode(&value)
+			if key == "" {
+				key = r.Header.Get("Idempotency-Key")
+				body = string(value)
+			}
+			if key != r.Header.Get("Idempotency-Key") || body != string(value) {
+				t.Error("completion recovery changed sealed request")
+			}
+			if attempts <= 3 {
+				w.WriteHeader(503)
+				return
+			}
+			datasetCaptureReply(w, "queued")
+			return
+		}
+		datasetCaptureReply(w, "recording")
+	})
+	_, err := client.Capture(telemetry.Context(context.Background()), nil, CaptureDatasetOptions{Environment: "ci", Destination: DatasetDestination{DatasetID: datasetTestID}}, func(ctx context.Context) error { calls++; _, _, end := Trace(ctx, "root"); end(); return nil })
+	var captureErr *DatasetCaptureError
+	if !errors.As(err, &captureErr) || captureErr.Completion == nil {
+		t.Fatalf("missing completion recovery: %v", err)
+	}
+	receipt, err := captureErr.Completion.Retry(context.Background())
+	if err != nil || receipt.State != "queued" || calls != 1 || attempts != 4 {
+		t.Fatalf("%+v %v calls=%d attempts=%d", receipt, err, calls, attempts)
+	}
+}
+
+func TestDatasetCaptureEnvironmentGuard(t *testing.T) {
+	telemetry, _ := NewClient(context.Background(), Config{}, WithExporter(tracetest.NewInMemoryExporter()))
+	defer telemetry.Shutdown(context.Background())
+	client := datasetTestClient(t, func(http.ResponseWriter, *http.Request) { t.Error("invalid workload reached API") })
+	for _, environment := range []string{"", "test", "production"} {
+		_, err := client.Capture(context.Background(), telemetry, CaptureDatasetOptions{Environment: environment, Destination: DatasetDestination{DatasetID: datasetTestID}}, func(context.Context) error { t.Error("invalid workload executed"); return nil })
+		if err == nil {
+			t.Fatalf("accepted environment %q", environment)
+		}
 	}
 }
 

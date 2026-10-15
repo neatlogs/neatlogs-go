@@ -24,6 +24,9 @@ type DatasetDestination struct {
 
 type CaptureDatasetOptions struct {
 	Destination DatasetDestination
+	// Environment describes the workload, independently of the API hostname.
+	Environment     string
+	AllowProduction bool
 	// Reuse only for the same registration. An agent callback is never retried.
 	IdempotencyKey string
 }
@@ -40,6 +43,7 @@ type DatasetCaptureError struct {
 	Receipt             DatasetCaptureReceipt
 	Phase               string
 	CompletionUncertain bool
+	Completion          *DatasetCaptureCompletion
 	Err                 error
 }
 
@@ -47,6 +51,35 @@ func (e *DatasetCaptureError) Error() string {
 	return fmt.Sprintf("neatlogs: dataset capture %s failed: %v", e.Phase, e.Err)
 }
 func (e *DatasetCaptureError) Unwrap() error { return e.Err }
+
+// DatasetCaptureCompletion retains an immutable manifest and idempotency key.
+// Retry only resends completion; it never executes the application callback.
+type DatasetCaptureCompletion struct {
+	client   *DatasetClient
+	receipt  DatasetCaptureReceipt
+	key      string
+	manifest []DatasetTraceManifest
+}
+
+func (p *DatasetCaptureCompletion) Retry(ctx context.Context) (DatasetCaptureReceipt, error) {
+	if p == nil || p.client == nil {
+		return DatasetCaptureReceipt{}, errors.New("neatlogs: missing dataset capture completion")
+	}
+	var completed DatasetCaptureReceipt
+	err := p.client.request(ctx, http.MethodPost, "/dataset-capture-jobs/"+p.receipt.CaptureID+"/complete", p.key, struct {
+		Traces []DatasetTraceManifest `json:"traces"`
+	}{p.manifest}, &completed)
+	if err == nil {
+		err = validateDatasetReceipt(&completed, p.receipt.CaptureID)
+	}
+	if err == nil && (completed.DatasetID != p.receipt.DatasetID || completed.State == "recording") {
+		err = errors.New("neatlogs: invalid sealed dataset capture response")
+	}
+	if err != nil {
+		return p.receipt, &DatasetCaptureError{Phase: "completion", Receipt: p.receipt, CompletionUncertain: true, Completion: p, Err: err}
+	}
+	return completed, nil
+}
 
 func datasetDestinationBody(destination DatasetDestination) (any, error) {
 	if destination.DatasetID != "" {
@@ -95,8 +128,26 @@ func validateDatasetReceipt(receipt *DatasetCaptureReceipt, captureID string) er
 // Pass its context into all helpers and join child goroutines before returning.
 // A callback error is preserved while complete failed executions can still publish.
 func (c *DatasetClient) Capture(ctx context.Context, telemetry *Client, options CaptureDatasetOptions, execute func(context.Context) error) (receipt DatasetCaptureReceipt, err error) {
+	if telemetry == nil {
+		telemetry, _ = ClientFromContext(ctx)
+		if telemetry == nil {
+			global.mu.Lock()
+			if global.state == stateRunning && global.runtime != nil {
+				telemetry = &Client{runtime: global.runtime}
+			}
+			global.mu.Unlock()
+		}
+	}
 	if c == nil || telemetry == nil || telemetry.runtime == nil || execute == nil {
 		return receipt, errors.New("neatlogs: dataset capture requires dataset and telemetry clients and an execution callback")
+	}
+	switch options.Environment {
+	case "local", "ci", "production":
+	default:
+		return receipt, errors.New("neatlogs: set capture environment explicitly to local, ci, or production")
+	}
+	if options.Environment == "production" && !options.AllowProduction {
+		return receipt, errors.New("neatlogs: production dataset capture requires AllowProduction")
 	}
 	if existing, _ := ctx.Value(datasetScopeKey{}).(*datasetCaptureScope); existing != nil {
 		return receipt, errors.New("neatlogs: nested dataset captures are not supported")
@@ -128,6 +179,9 @@ func (c *DatasetClient) Capture(ctx context.Context, telemetry *Client, options 
 	}
 	if err = validateDatasetReceipt(&receipt, ""); err != nil {
 		return receipt, &DatasetCaptureError{Phase: "registration", Receipt: receipt, Err: err}
+	}
+	if options.Destination.DatasetID != "" && receipt.DatasetID != strings.ToLower(options.Destination.DatasetID) {
+		return receipt, &DatasetCaptureError{Phase: "registration", Receipt: receipt, Err: errors.New("neatlogs: dataset capture response changed destination")}
 	}
 	if receipt.State != "recording" {
 		// Replayed registration may already be sealed. It must never execute again.
@@ -182,17 +236,9 @@ func (c *DatasetClient) Capture(ctx context.Context, telemetry *Client, options 
 	if err != nil {
 		return abort("incomplete_execution", errors.Join(executionErr, err))
 	}
-	var completed DatasetCaptureReceipt
-	if err := c.request(ctx, http.MethodPost, "/dataset-capture-jobs/"+receipt.CaptureID+"/complete", completeKey, body, &completed); err != nil {
-		return receipt, &DatasetCaptureError{Phase: "completion", Receipt: receipt, CompletionUncertain: true, Err: errors.Join(executionErr, err)}
-	}
-	if err := validateDatasetReceipt(&completed, receipt.CaptureID); err != nil || completed.DatasetID != receipt.DatasetID {
-		if err == nil {
-			err = errors.New("neatlogs: dataset capture response changed destination")
-		}
-		return receipt, &DatasetCaptureError{Phase: "completion", Receipt: receipt, CompletionUncertain: true, Err: errors.Join(executionErr, err)}
-	}
-	return completed, executionErr
+	completion := &DatasetCaptureCompletion{client: c, receipt: receipt, key: completeKey, manifest: manifest}
+	completed, err := completion.Retry(ctx)
+	return completed, errors.Join(executionErr, err)
 }
 
 // Abort cancels an unfinished recording. It never cancels an already sealed job.
