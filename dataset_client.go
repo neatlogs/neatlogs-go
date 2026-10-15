@@ -291,6 +291,11 @@ func (c *DatasetClient) request(ctx context.Context, method, path, key string, b
 		if err := json.Unmarshal(envelope.Data, result); err != nil {
 			return errors.New("neatlogs: invalid dataset API response")
 		}
+		if path == "/dataset-capture-jobs" && resp.Header.Get("Idempotency-Replayed") == "true" {
+			if receipt, ok := result.(*DatasetCaptureReceipt); ok {
+				receipt.replayed = true
+			}
+		}
 		return nil
 	}
 	return errors.New("neatlogs: dataset API request failed")

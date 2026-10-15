@@ -254,6 +254,45 @@ func TestDatasetCaptureDoesNotExecuteWhenRegistrationStatusFails(t *testing.T) {
 	}
 }
 
+func TestDatasetCaptureNeverExecutesReplayedRecordingReceipt(t *testing.T) {
+	telemetry, err := NewClient(context.Background(), Config{}, WithExporter(tracetest.NewInMemoryExporter()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer telemetry.Shutdown(context.Background())
+	callbacks, statusReads, completions := 0, 0, 0
+	client := datasetTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/public/dataset-capture-jobs":
+			w.Header().Set("Idempotency-Replayed", "true")
+			datasetCaptureReply(w, "recording")
+		case r.Method == http.MethodGet:
+			statusReads++
+			json.NewEncoder(w).Encode(map[string]any{"success": true, "data": map[string]any{
+				"job": DatasetCaptureStatus{CaptureID: datasetCaptureTestID, DatasetID: datasetTestID, State: "recording"},
+				"failures": []any{}, "nextCursor": nil,
+			}})
+		case strings.HasSuffix(r.URL.Path, "/complete"):
+			completions++
+			t.Error("completed a replayed registration")
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	})
+	options := CaptureDatasetOptions{Environment: "ci", Destination: DatasetDestination{DatasetID: datasetTestID}, IdempotencyKey: datasetTestVersion}
+	receipt, err := client.Capture(context.Background(), telemetry, options, func(context.Context) error {
+		callbacks++
+		return nil
+	})
+	var captureErr *DatasetCaptureError
+	if !errors.As(err, &captureErr) || captureErr.Phase != "registration" || receipt.State != "recording" {
+		t.Fatalf("receipt=%+v err=%v", receipt, err)
+	}
+	if callbacks != 0 || statusReads != 1 || completions != 0 {
+		t.Fatalf("callbacks=%d statusReads=%d completions=%d", callbacks, statusReads, completions)
+	}
+}
+
 func TestDatasetCaptureWaitPublicationAndFailure(t *testing.T) {
 	for _, state := range []string{"completed", "failed", "needs_review", "cancelled"} {
 		t.Run(state, func(t *testing.T) {
