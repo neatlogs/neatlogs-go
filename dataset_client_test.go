@@ -140,3 +140,32 @@ func TestDatasetCancellationAndRedirect(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestDatasetRejectsRemoteHTTP(t *testing.T) {
+	for _, endpoint := range []string{"http://example.com", "http://192.168.1.2", "http://localhost.example.com"} {
+		if _, err := NewDatasetClient(DatasetConfig{Endpoint: endpoint, Token: "secret", ProjectID: datasetTestID}); err == nil {
+			t.Errorf("accepted insecure endpoint %s", endpoint)
+		}
+	}
+}
+
+func TestDatasetCanonicalizesUUIDs(t *testing.T) {
+	id := "abcdefab-abcd-4abc-8abc-abcdefabcdef"
+	client := datasetTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, id) || r.Header.Get("Idempotency-Key") != id {
+			t.Errorf("UUIDs not canonical: %s %s", r.URL.Path, r.Header.Get("Idempotency-Key"))
+		}
+		w.Write([]byte(`{"success":true,"data":{"datasetId":"` + id + `","versionId":"` + datasetTestVersion + `"}}`))
+	})
+	changes := []DatasetOutcomeChange{{CaseID: strings.ToUpper(id), RevisionID: strings.ToUpper(id)}}
+	if _, err := client.UpdateOutcomes(context.Background(), strings.ToUpper(id), UpdateDatasetOutcomesOptions{BaseVersionID: strings.ToUpper(id), Changes: changes, IdempotencyKey: strings.ToUpper(id)}); err != nil {
+		t.Fatal(err)
+	}
+	if changes[0].CaseID != strings.ToUpper(id) {
+		t.Fatal("mutated caller changes")
+	}
+	_, err := client.UpdateOutcomes(context.Background(), id, UpdateDatasetOutcomesOptions{BaseVersionID: id, Changes: append(changes, DatasetOutcomeChange{CaseID: id, RevisionID: id})})
+	if err == nil {
+		t.Fatal("accepted duplicate case with different UUID casing")
+	}
+}

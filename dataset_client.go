@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -41,6 +42,12 @@ func NewDatasetClient(cfg DatasetConfig) (*DatasetClient, error) {
 	if err != nil || base == nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" {
 		return nil, errors.New("neatlogs: dataset endpoint must be an HTTP(S) base URL")
 	}
+	if base.Scheme == "http" && !strings.EqualFold(base.Hostname(), "localhost") {
+		ip := net.ParseIP(base.Hostname())
+		if ip == nil || !ip.IsLoopback() {
+			return nil, errors.New("neatlogs: dataset endpoint requires HTTPS except on loopback")
+		}
+	}
 	path := strings.TrimRight(base.Path, "/")
 	if path != "" && path != "/api/v1" {
 		return nil, errors.New("neatlogs: dataset endpoint must be a base URL or end in /api/v1")
@@ -59,7 +66,7 @@ func NewDatasetClient(cfg DatasetConfig) (*DatasetClient, error) {
 	// Public API credentials must never follow a redirect to another authority.
 	isolated := *client
 	isolated.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	return &DatasetClient{endpoint: strings.TrimRight(base.String(), "/"), token: cfg.Token, projectID: cfg.ProjectID, http: &isolated}, nil
+	return &DatasetClient{endpoint: strings.TrimRight(base.String(), "/"), token: cfg.Token, projectID: strings.ToLower(cfg.ProjectID), http: &isolated}, nil
 }
 
 // DatasetPublication identifies a dataset and its immutable published version.
@@ -121,6 +128,8 @@ func (c *DatasetClient) Create(ctx context.Context, options CreateDatasetOptions
 	}
 	options.IdempotencyKey = key
 	err = c.request(ctx, http.MethodPost, "/datasets", key, options, &result)
+	result.DatasetID = strings.ToLower(result.DatasetID)
+	result.VersionID = strings.ToLower(result.VersionID)
 	if err == nil && (!datasetUUID.MatchString(result.DatasetID) || !datasetUUID.MatchString(result.VersionID)) {
 		err = errors.New("neatlogs: invalid dataset publication response")
 	}
@@ -143,6 +152,9 @@ type UpdateDatasetOutcomesOptions struct {
 
 func (c *DatasetClient) UpdateOutcomes(ctx context.Context, datasetID string, options UpdateDatasetOutcomesOptions) (DatasetPublication, error) {
 	var result DatasetPublication
+	datasetID = strings.ToLower(datasetID)
+	options.BaseVersionID = strings.ToLower(options.BaseVersionID)
+	options.Changes = append([]DatasetOutcomeChange(nil), options.Changes...)
 	if !datasetUUID.MatchString(datasetID) || !datasetUUID.MatchString(options.BaseVersionID) {
 		return result, errors.New("neatlogs: dataset and base version IDs must be UUIDs")
 	}
@@ -150,7 +162,10 @@ func (c *DatasetClient) UpdateOutcomes(ctx context.Context, datasetID string, op
 		return result, errors.New("neatlogs: provide 1 to 2000 outcome changes")
 	}
 	seen := make(map[string]bool, len(options.Changes))
-	for _, change := range options.Changes {
+	for i := range options.Changes {
+		options.Changes[i].CaseID = strings.ToLower(options.Changes[i].CaseID)
+		options.Changes[i].RevisionID = strings.ToLower(options.Changes[i].RevisionID)
+		change := options.Changes[i]
 		if !datasetUUID.MatchString(change.CaseID) || !datasetUUID.MatchString(change.RevisionID) || seen[change.CaseID] {
 			return result, errors.New("neatlogs: outcome changes require unique case UUIDs and revision UUIDs")
 		}
@@ -165,6 +180,8 @@ func (c *DatasetClient) UpdateOutcomes(ctx context.Context, datasetID string, op
 	}
 	options.IdempotencyKey = key
 	err = c.request(ctx, http.MethodPost, "/datasets/"+datasetID+"/versions", key, options, &result)
+	result.DatasetID = strings.ToLower(result.DatasetID)
+	result.VersionID = strings.ToLower(result.VersionID)
 	if err == nil && (result.DatasetID != datasetID || !datasetUUID.MatchString(result.VersionID)) {
 		err = errors.New("neatlogs: invalid dataset publication response")
 	}
@@ -194,7 +211,7 @@ func datasetIdempotencyKey(key string) (string, error) {
 		if !datasetUUID.MatchString(key) {
 			return "", errors.New("neatlogs: idempotency key must be a UUID")
 		}
-		return key, nil
+		return strings.ToLower(key), nil
 	}
 	var id [16]byte
 	if _, err := rand.Read(id[:]); err != nil {
