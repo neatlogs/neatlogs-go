@@ -12,11 +12,45 @@ concurrency:
   group: weekly-go-release
   cancel-in-progress: false
 
+# plan runs daily without secrets. Only when a release is due does release wait
+# for approval in the `release` environment (main only, required reviewers),
+# which holds RELEASE_APP_PRIVATE_KEY. For Go, pushing the tag is the release.
 jobs:
-  release:
+  plan:
+    name: Decide whether a release is due
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      action: ${{ steps.plan.outputs.action }}
+      plan: ${{ steps.plan.outputs.plan }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Plan the three module releases
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/release/weekly.py > "$RUNNER_TEMP/release-plan.json"
+          cat "$RUNNER_TEMP/release-plan.json"
+          action=$(jq -r .action "$RUNNER_TEMP/release-plan.json")
+          echo "action=$action" >> "$GITHUB_OUTPUT"
+          echo "plan=$(jq -cS . "$RUNNER_TEMP/release-plan.json")" >> "$GITHUB_OUTPUT"
+          if [[ "$action" == publish ]]; then
+            echo "Release due: $(jq -r '[.root, .adk, .genai] | map(select(.release) | .version) | join(", ")' "$RUNNER_TEMP/release-plan.json"). Approve the \`release\` deployment to tag it." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  release:
+    name: Tag the approved release
+    needs: plan
+    if: needs.plan.outputs.action == 'publish'
+    runs-on: ubuntu-latest
     timeout-minutes: 60
+    environment: release
     outputs:
       action: ${{ steps.plan.outputs.action }}
       root_release: ${{ steps.plan.outputs.root_release }}
@@ -36,13 +70,19 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Plan the three module releases
+      - name: Re-plan and confirm the approved releases
         id: plan
         shell: bash
+        env:
+          APPROVED_PLAN: ${{ needs.plan.outputs.plan }}
         run: |
           set -euo pipefail
           python3 scripts/release/weekly.py > "$RUNNER_TEMP/release-plan.json"
           cat "$RUNNER_TEMP/release-plan.json"
+          if [[ "$(jq -cS . "$RUNNER_TEMP/release-plan.json")" != "$APPROVED_PLAN" ]]; then
+            echo "::error::The release plan changed after approval; rerun the workflow" >&2
+            exit 1
+          fi
           for field in action root.release root.version adk.release adk.version genai.release genai.version; do
             key=${field//./_}
             echo "$key=$(jq -r ".$field" "$RUNNER_TEMP/release-plan.json")" >> "$GITHUB_OUTPUT"
