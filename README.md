@@ -211,10 +211,10 @@ receipt, err := datasets.Capture(ctx, telemetry, neatlogs.CaptureDatasetOptions{
     Environment: "local",
     Destination: neatlogs.DatasetDestination{DatasetID: dataset.DatasetID},
 }, func(ctx context.Context) error {
-    _, root, end := neatlogs.Trace(ctx, "support request")
+    agentCtx, root, end := neatlogs.Trace(ctx, "support request")
     defer end()
     if err := neatlogs.SetTraceInput(root, question); err != nil { return err }
-    answer, err := runAgent(ctx)
+    answer, err := runAgent(agentCtx)
     if err != nil { return err }
     return neatlogs.SetTraceOutput(root, answer)
 })
