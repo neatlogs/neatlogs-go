@@ -166,15 +166,27 @@ func (g *GenAIModels) GenerateContentStream(ctx context.Context, model string, c
 				break // consumer stopped early
 			}
 		}
-		if ctx.Err() != nil {
+		// The stream can end without yielding the context error, so the
+		// context is checked once more. A finished response is not failed by a
+		// deadline that expires after it.
+		switch ctxErr := ctx.Err(); {
+		case ctxErr == nil || cancelled:
+		case errors.Is(ctxErr, context.Canceled):
 			cancelled = true
+		case !acc.finished():
+			sawError = true
+			recordError(span, ctxErr)
 		}
 	}
 }
 
+// isContextCancellation reports a deliberate stop by the caller. An expired
+// deadline is a real failure and stays an error.
 func isContextCancellation(ctx context.Context, err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
-		errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded)
+	if errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	return errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled)
 }
 
 // EmbedContent traces an embedding call.
@@ -714,6 +726,10 @@ func finalizeResponse(span trace.Span, resp *genai.GenerateContentResponse) {
 	acc := newResponseAccumulator(span)
 	acc.add(resp)
 	acc.apply(span)
+	if err := acc.blockedPrompt(); err != nil {
+		recordError(span, err)
+		return
+	}
 	span.SetStatus(codes.Ok, "")
 }
 
@@ -738,12 +754,14 @@ type accumulatedChoice struct {
 }
 
 type responseAccumulator struct {
-	choices    map[int]*accumulatedChoice
-	span       trace.Span
-	usage      *genai.GenerateContentResponseUsageMetadata
-	responseID string
-	chunkCount int
-	mediaCount int
+	choices      map[int]*accumulatedChoice
+	span         trace.Span
+	usage        *genai.GenerateContentResponseUsageMetadata
+	responseID   string
+	blockReason  genai.BlockedReason
+	blockMessage string
+	chunkCount   int
+	mediaCount   int
 }
 
 func newResponseAccumulator(spans ...trace.Span) *responseAccumulator {
@@ -863,6 +881,10 @@ func (a *responseAccumulator) add(resp *genai.GenerateContentResponse) {
 			choice.finish = cand.FinishReason
 		}
 	}
+	if resp.PromptFeedback != nil && resp.PromptFeedback.BlockReason != "" {
+		a.blockReason = resp.PromptFeedback.BlockReason
+		a.blockMessage = resp.PromptFeedback.BlockReasonMessage
+	}
 	if resp.UsageMetadata != nil {
 		a.usage = resp.UsageMetadata
 	}
@@ -870,6 +892,29 @@ func (a *responseAccumulator) add(resp *genai.GenerateContentResponse) {
 		a.responseID = resp.ResponseID
 	}
 	a.chunkCount++
+}
+
+// blockedPrompt returns the provider's block as an error when the prompt was
+// rejected before any candidate was generated. A block that arrives with
+// content is not a failed call.
+func (a *responseAccumulator) blockedPrompt() error {
+	if a.blockReason == "" || len(a.choices) > 0 {
+		return nil
+	}
+	if a.blockMessage != "" {
+		return fmt.Errorf("prompt blocked: %s: %s", a.blockReason, a.blockMessage)
+	}
+	return fmt.Errorf("prompt blocked: %s", a.blockReason)
+}
+
+// finished reports whether the provider sent a finish reason for any choice.
+func (a *responseAccumulator) finished() bool {
+	for _, choice := range a.choices {
+		if choice.finish != "" {
+			return true
+		}
+	}
+	return false
 }
 
 type jsonPathSegment struct {
@@ -1248,6 +1293,9 @@ func (a *responseAccumulator) apply(span trace.Span) {
 			toolIndex++
 		}
 	}
+	if a.blockedPrompt() != nil {
+		span.SetAttributes(attribute.String(attrs.LLMFinishReason, string(a.blockReason)))
+	}
 	if a.responseID != "" {
 		span.SetAttributes(attribute.String(attrs.LLMResponseID, a.responseID))
 	}
@@ -1255,6 +1303,11 @@ func (a *responseAccumulator) apply(span trace.Span) {
 }
 
 const maxSemanticStreamEvents = 128
+
+// streamIncomplete marks a stream that ended without an error and without a
+// finish reason. It is declared here, not in the root attributes package, so
+// this module builds against the released root module.
+const streamIncomplete = "neatlogs.stream.incomplete"
 
 func recordStreamChunk(span trace.Span, acc *responseAccumulator, resp *genai.GenerateContentResponse) {
 	chunkIndex := acc.chunkCount
@@ -1277,8 +1330,19 @@ func finalizeStream(span trace.Span, acc *responseAccumulator, cancelled, sawErr
 	if sawError {
 		return
 	}
+	if err := acc.blockedPrompt(); err != nil {
+		recordError(span, err)
+		return
+	}
 	if cancelled {
 		span.SetAttributes(attribute.Bool(attrs.StreamCancelled, true))
+		span.SetStatus(codes.Unset, "")
+		return
+	}
+	if !acc.finished() {
+		// The provider never said the response was complete, so the span must
+		// not claim success.
+		span.SetAttributes(attribute.Bool(streamIncomplete, true))
 		span.SetStatus(codes.Unset, "")
 		return
 	}

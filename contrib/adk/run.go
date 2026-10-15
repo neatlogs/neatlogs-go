@@ -14,6 +14,10 @@ import (
 	"google.golang.org/genai"
 )
 
+// runKey carries the Run root's span ID to the A2A callbacks, so Run can end
+// the A2A spans it owns.
+type runKey struct{}
+
 // Run executes an ADK turn inside a Neatlogs WORKFLOW span. Use it in place of
 // runner.Run so wrapped models and tool callbacks inherit the same private
 // trace without changing the process-global OpenTelemetry provider.
@@ -37,6 +41,8 @@ func Run(
 		})
 		traceCtx, root, end := neatlogs.Trace(ctx, "google.adk.run")
 		defer end()
+		run := root.SpanContext().SpanID()
+		traceCtx = context.WithValue(traceCtx, runKey{}, run)
 		root.SetAttributes(
 			attribute.String("neatlogs.framework", "google_adk"),
 			attribute.String("neatlogs.session.id", sessionID),
@@ -46,30 +52,57 @@ func Run(
 		}
 
 		var finalOutput string
-		failed := false
+		failed, cancelled := false, false
+		defer func() { endOpenA2ACalls(run, cancelled && !failed) }()
+		report := func(err error) {
+			if isCallerCancellation(traceCtx, err) {
+				cancelled = true
+				return
+			}
+			failed = true
+			root.RecordError(err)
+			root.SetStatus(codes.Error, err.Error())
+		}
+		// ADK reports blocked responses and remote-agent failures as an event
+		// with a nil error. The run failed only if it ended on one: a run that
+		// goes on to answer (a retry, another agent) recovered, and the failed
+		// step keeps its own Error span.
+		var eventErr error
 		for event, err := range r.Run(traceCtx, userID, sessionID, message, config, options...) {
 			if err != nil {
-				failed = true
-				root.RecordError(err)
-				root.SetStatus(codes.Error, err.Error())
+				report(err)
 			}
-			if event != nil && event.Content != nil {
-				if output := contentText(event.Content); output != "" && (event.IsFinalResponse() || finalOutput == "") {
-					finalOutput = output
+			if event != nil {
+				answered := false
+				if event.Content != nil {
+					if output := contentText(event.Content); output != "" && (event.IsFinalResponse() || finalOutput == "") {
+						finalOutput = output
+						answered = event.IsFinalResponse()
+					}
+				}
+				if failure := responseError(&event.LLMResponse); failure != nil {
+					eventErr = failure
+				} else if answered {
+					eventErr = nil
 				}
 			}
 			if !yield(event, err) {
-				root.SetAttributes(attribute.Bool("neatlogs.stream.cancelled", true))
-				if finalOutput != "" {
-					_ = neatlogs.SetTraceOutput(root, boundedText(finalOutput))
-				}
-				return
+				cancelled = true
+				break
 			}
+		}
+		if eventErr != nil {
+			report(eventErr)
 		}
 		if finalOutput != "" {
 			_ = neatlogs.SetTraceOutput(root, boundedText(finalOutput))
 		}
-		if !failed {
+		switch {
+		case failed:
+			// Status is already Error; a failed run is not a cancelled one.
+		case cancelled:
+			root.SetAttributes(attribute.Bool(streamCancelled, true))
+		default:
 			root.SetStatus(codes.Ok, "")
 		}
 	}

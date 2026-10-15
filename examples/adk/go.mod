@@ -7,7 +7,7 @@ require (
 	github.com/neatlogs/neatlogs-go v0.1.12
 	github.com/neatlogs/neatlogs-go/contrib/adk v0.0.0-00010101000000-000000000000
 	google.golang.org/adk v1.4.0
-	google.golang.org/genai v1.61.0
+	google.golang.org/genai v1.71.0
 )
 
 require (

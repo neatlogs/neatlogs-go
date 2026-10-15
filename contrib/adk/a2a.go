@@ -10,6 +10,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/adk/agent"
 	"google.golang.org/adk/session"
 )
@@ -85,11 +86,10 @@ func A2ABeforeRequest(ctx agent.CallbackContext, req *a2a.SendMessageRequest) (*
 	if req == nil {
 		return nil, nil
 	}
-	_, span, end := neatlogs.StartProviderSpan(ctx, "google.adk.a2a", "agent")
-	span.SetAttributes(attribute.String("neatlogs.span.kind", "agent"))
+	call := startA2ACall(ctx)
 	if req.Message != nil {
 		if text := a2aMessageText(req.Message); text != "" {
-			span.SetAttributes(
+			call.span.SetAttributes(
 				attribute.String("neatlogs.input.value", text),
 				attribute.String(inputMsgPrefix+"0.role", "user"),
 				attribute.String(inputMsgPrefix+"0.content", text),
@@ -97,42 +97,119 @@ func A2ABeforeRequest(ctx agent.CallbackContext, req *a2a.SendMessageRequest) (*
 		}
 	}
 	endEvicted(
-		activeA2ACalls.put(a2aCallKey(req), activeCall{span: span, end: end}),
+		activeA2ACalls.put(a2aCallKey(req), call),
 		"superseded or abandoned ADK A2A callback",
 	)
 	return nil, nil
+}
+
+func startA2ACall(ctx agent.CallbackContext) activeCall {
+	_, span, end := neatlogs.StartProviderSpan(ctx, "google.adk.a2a", "agent")
+	span.SetAttributes(attribute.String("neatlogs.span.kind", "agent"))
+	run, _ := ctx.Value(runKey{}).(trace.SpanID)
+	return activeCall{span: span, end: end, run: run}
 }
 
 // A2AAfterRequest records the remote agent's response on the active span. It
 // sets neatlogs.output.value (read by the backend for AGENT spans — the indexed
 // output_messages form is only reconstructed for LLM spans) plus the indexed
 // form for completeness.
+//
+// In streaming mode ADK calls it once per remote event. Under Run the span
+// stays open until the event that completes the turn, an error, or the end of
+// Run. Without Run nothing could end a span left open, so it ends on each call.
 func A2AAfterRequest(ctx agent.CallbackContext, req *a2a.SendMessageRequest, resp *session.Event, callErr error) (*session.Event, error) {
 	var call activeCall
 	if req != nil {
 		call, _ = activeA2ACalls.take(a2aCallKey(req))
 	}
 	if call.span == nil {
-		_, call.span, call.end = neatlogs.StartProviderSpan(ctx, "google.adk.a2a", "agent")
-		call.span.SetAttributes(attribute.String("neatlogs.span.kind", "agent"))
+		call = startA2ACall(ctx)
 	}
-	defer call.end()
-	if callErr != nil {
-		call.span.RecordError(callErr)
-		call.span.SetStatus(codes.Error, callErr.Error())
-	} else {
-		call.span.SetStatus(codes.Ok, "")
-	}
-	if resp != nil && resp.Content != nil {
-		if text := contentText(resp.Content); text != "" {
-			call.span.SetAttributes(
-				attribute.String("neatlogs.output.value", text),
-				attribute.String(outputMsgPrefix+"0.role", "assistant"),
-				attribute.String(outputMsgPrefix+"0.content", text),
-			)
+	// ADK turns transport and remote-task failures into an error event with a
+	// nil callErr; both forms are a failed call.
+	failure := callErr
+	if resp != nil {
+		eventErr := responseError(&resp.LLMResponse)
+		if failure == nil {
+			failure = eventErr
+		}
+		// The text of an error event is the error itself; it must not replace
+		// the output received before it.
+		if eventErr == nil {
+			call.addOutput(resp)
 		}
 	}
+	if failure == nil && resp != nil && !resp.TurnComplete && call.run.IsValid() && a2aSends(req) {
+		endEvicted(
+			activeA2ACalls.put(a2aCallKey(req), call),
+			"superseded or abandoned ADK A2A callback",
+		)
+		return nil, nil
+	}
+	defer call.end()
+	switch {
+	case failure == nil:
+		call.span.SetStatus(codes.Ok, "")
+	case isCallerCancellation(ctx, failure):
+		call.span.SetAttributes(attribute.Bool(streamCancelled, true))
+	default:
+		call.span.RecordError(failure)
+		call.span.SetStatus(codes.Error, failure.Error())
+	}
 	return nil, nil
+}
+
+// addOutput keeps the response text on the span as events arrive, so it
+// survives a span that is ended early: the last complete response, or the
+// partial deltas while no complete response has arrived.
+func (c *activeCall) addOutput(resp *session.Event) {
+	text := contentText(resp.Content)
+	if text == "" {
+		return
+	}
+	hasText := hasOutputText(resp.Content)
+	switch {
+	case resp.Partial && hasText:
+		c.partial = boundedText(c.partial + text)
+	case !resp.Partial && (hasText || c.output == ""):
+		c.output = text
+	}
+	text = c.output
+	if text == "" {
+		text = c.partial
+	}
+	if text == "" {
+		return
+	}
+	c.span.SetAttributes(
+		attribute.String("neatlogs.output.value", text),
+		attribute.String(outputMsgPrefix+"0.role", "assistant"),
+		attribute.String(outputMsgPrefix+"0.content", text),
+	)
+}
+
+// endOpenA2ACalls ends the A2A spans of one Run that never saw an event
+// completing the turn, so they are exported instead of staying open. They
+// carry no success status because the remote call was not seen to finish.
+func endOpenA2ACalls(run trace.SpanID, cancelled bool) {
+	if !run.IsValid() {
+		return
+	}
+	for _, call := range activeA2ACalls.takeRun(run) {
+		if cancelled {
+			call.span.SetAttributes(attribute.Bool(streamCancelled, true))
+		} else {
+			call.span.SetAttributes(attribute.Bool(streamIncomplete, true))
+		}
+		call.end()
+	}
+}
+
+// a2aSends reports whether ADK sends req to the remote agent. It skips an
+// empty message, so no later event follows the first callback.
+func a2aSends(req *a2a.SendMessageRequest) bool {
+	return req != nil && req.Message != nil && len(req.Message.Parts) > 0
 }
 
 func a2aCallKey(req *a2a.SendMessageRequest) string {
