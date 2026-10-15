@@ -68,7 +68,7 @@ func TestDatasetScopeIsolatesConcurrentAndForeignRegistries(t *testing.T) {
 }
 
 func TestDatasetScopeRejectsDroppedAndTruncatedEvidence(t *testing.T) {
-	for _, attrs := range [][]attribute.KeyValue{{attribute.Bool("neatlogs.input.truncated", true)}, {attribute.String("neatlogs.input.0.state", "upload-failed")}} {
+	for _, attrs := range [][]attribute.KeyValue{{attribute.Bool("neatlogs.input.truncated", true)}, {attribute.String("neatlogs.input.0.state", "failed"), attribute.String("neatlogs.input.0.id", "nl_media_test")}, {attribute.Bool(interruptedAttribute, true)}} {
 		registry := newDatasetCaptureRegistry()
 		scope, _ := registry.begin()
 		sink := tracetest.NewInMemoryExporter()
@@ -81,6 +81,32 @@ func TestDatasetScopeRejectsDroppedAndTruncatedEvidence(t *testing.T) {
 		}
 		tp.Shutdown(context.Background())
 		scope.release()
+	}
+}
+
+func TestDatasetScopeRejectsFinalPendingMediaAcrossAttributes(t *testing.T) {
+	values := []attribute.KeyValue{attribute.String("neatlogs.input.0.id", "nl_media_test"), attribute.String("neatlogs.input.0.state", "pending-upload")}
+	if datasetIncompleteAttributes(values, false) || !datasetIncompleteAttributes(values, true) {
+		t.Fatal("pending media must be resolved at final export")
+	}
+	if datasetIncompleteAttributes([]attribute.KeyValue{attribute.String("business.state", "error")}, true) {
+		t.Fatal("business states are not media failures")
+	}
+}
+
+func TestDatasetCaptureSamplerObservesUnsampledParent(t *testing.T) {
+	registry := newDatasetCaptureRegistry()
+	scope, _ := registry.begin()
+	defer scope.release()
+	parent := trace.NewSpanContext(trace.SpanContextConfig{TraceID: trace.TraceID{1}, SpanID: trace.SpanID{1}})
+	ctx := trace.ContextWithSpanContext(context.Background(), parent)
+	ctx = context.WithValue(ctx, datasetScopeKey{}, scope)
+	sampler := datasetCaptureSampler{base: sdktrace.ParentBased(sdktrace.AlwaysSample()), registry: registry}
+	if result := sampler.ShouldSample(sdktrace.SamplingParameters{ParentContext: ctx}); result.Decision != sdktrace.RecordAndSample {
+		t.Fatal("capture inherited unsampled parent")
+	}
+	if result := sampler.ShouldSample(sdktrace.SamplingParameters{ParentContext: trace.ContextWithSpanContext(context.Background(), parent)}); result.Decision != sdktrace.Drop {
+		t.Fatal("ordinary sampling changed")
 	}
 }
 

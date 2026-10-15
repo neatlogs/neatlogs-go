@@ -44,6 +44,21 @@ type DatasetTraceManifest struct {
 	SpanIDs []string `json:"spanIds"`
 }
 
+type datasetCaptureSampler struct {
+	base     sdktrace.Sampler
+	registry *datasetCaptureRegistry
+}
+
+func (s datasetCaptureSampler) ShouldSample(parameters sdktrace.SamplingParameters) sdktrace.SamplingResult {
+	scope, _ := parameters.ParentContext.Value(datasetScopeKey{}).(*datasetCaptureScope)
+	if scope != nil && scope.registry == s.registry {
+		return sdktrace.AlwaysSample().ShouldSample(parameters)
+	}
+	return s.base.ShouldSample(parameters)
+}
+
+func (s datasetCaptureSampler) Description() string { return s.base.Description() }
+
 func newDatasetCaptureRegistry() *datasetCaptureRegistry {
 	return &datasetCaptureRegistry{scopes: make(map[*datasetCaptureScope]struct{}), bySpan: make(map[datasetSpanKey]*datasetCaptureScope)}
 }
@@ -106,26 +121,46 @@ func (p *datasetCaptureRegistry) OnEnd(span sdktrace.ReadOnlySpan) {
 		return
 	}
 	scope.spans[key].ended = true
-	if span.DroppedAttributes() > 0 || span.DroppedEvents() > 0 || span.DroppedLinks() > 0 || datasetIncompleteAttributes(span.Attributes()) {
+	if datasetIncompleteSpan(span, false) {
 		scope.err = errors.New("neatlogs: dataset capture contains dropped or incomplete span evidence")
-	}
-	for _, event := range span.Events() {
-		if event.DroppedAttributeCount > 0 || datasetIncompleteAttributes(event.Attributes) {
-			scope.err = errors.New("neatlogs: dataset capture contains dropped or incomplete event evidence")
-		}
 	}
 }
 
-func datasetIncompleteAttributes(values []attribute.KeyValue) bool {
+func datasetIncompleteSpan(span sdktrace.ReadOnlySpan, final bool) bool {
+	if span.DroppedAttributes() > 0 || span.DroppedEvents() > 0 || span.DroppedLinks() > 0 || datasetIncompleteAttributes(span.Attributes(), final) {
+		return true
+	}
+	for _, event := range span.Events() {
+		if event.DroppedAttributeCount > 0 || datasetIncompleteAttributes(event.Attributes, final) {
+			return true
+		}
+	}
+	for _, link := range span.Links() {
+		if link.DroppedAttributeCount > 0 || datasetIncompleteAttributes(link.Attributes, final) {
+			return true
+		}
+	}
+	return span.Resource() != nil && datasetIncompleteAttributes(span.Resource().Attributes(), final)
+}
+
+func datasetIncompleteAttributes(values []attribute.KeyValue, final bool) bool {
 	for _, value := range values {
 		key := strings.ToLower(string(value.Key))
+		if !strings.HasPrefix(key, "neatlogs.") {
+			continue
+		}
+		if key == interruptedAttribute && value.Value.Type() == attribute.BOOL && value.Value.AsBool() {
+			return true
+		}
 		if strings.Contains(key, "truncat") && ((value.Value.Type() == attribute.BOOL && value.Value.AsBool()) || (value.Value.Type() == attribute.INT64 && value.Value.AsInt64() > 0) || (value.Value.Type() == attribute.STRING && value.Value.AsString() != "" && value.Value.AsString() != "false")) {
 			return true
 		}
-		if value.Value.Type() == attribute.STRING && strings.HasSuffix(key, ".state") {
+		if value.Value.Type() == attribute.STRING && strings.HasSuffix(key, ".state") && canonicalMediaReference(values, strings.TrimSuffix(key, "state")) {
 			switch value.Value.AsString() {
-			case "upload-failed", "truncated", "error":
+			case "failed", "upload-failed", "truncated", "error":
 				return true
+			case "pending-upload":
+				return final
 			}
 		}
 	}
@@ -142,7 +177,7 @@ func (p *datasetCaptureRegistry) acknowledge(spans []sdktrace.ReadOnlySpan) {
 		key := datasetKey(span.SpanContext())
 		if scope := p.bySpan[key]; scope != nil {
 			scope.spans[key].acknowledged = true
-			if datasetIncompleteAttributes(span.Attributes()) {
+			if datasetIncompleteSpan(span, true) {
 				scope.err = errors.New("neatlogs: exported dataset evidence is incomplete")
 			}
 		}
@@ -164,6 +199,7 @@ func (s *datasetCaptureScope) release() {
 	for key := range s.spans {
 		delete(p.bySpan, key)
 	}
+	s.spans = nil
 }
 
 func (s *datasetCaptureScope) manifest() ([]DatasetTraceManifest, error) {
