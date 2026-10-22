@@ -12,29 +12,23 @@ concurrency:
   group: weekly-go-release
   cancel-in-progress: false
 
+# plan runs daily without secrets. Only when a release is due does release wait
+# for approval in the `release` environment (main only, required reviewers),
+# which holds RELEASE_APP_PRIVATE_KEY. For Go, pushing the tag is the release.
 jobs:
-  release:
+  plan:
+    name: Decide whether a release is due
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 10
     outputs:
       action: ${{ steps.plan.outputs.action }}
-      root_release: ${{ steps.plan.outputs.root_release }}
-      root_version: ${{ steps.plan.outputs.root_version }}
-      adk_release: ${{ steps.plan.outputs.adk_release }}
-      adk_version: ${{ steps.plan.outputs.adk_version }}
-      genai_release: ${{ steps.plan.outputs.genai_release }}
-      genai_version: ${{ steps.plan.outputs.genai_version }}
+      plan: ${{ steps.plan.outputs.plan }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
-
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
 
       - name: Plan the three module releases
         id: plan
@@ -43,6 +37,55 @@ jobs:
           set -euo pipefail
           python3 scripts/release/weekly.py > "$RUNNER_TEMP/release-plan.json"
           cat "$RUNNER_TEMP/release-plan.json"
+          action=$(jq -r .action "$RUNNER_TEMP/release-plan.json")
+          echo "action=$action" >> "$GITHUB_OUTPUT"
+          echo "plan=$(jq -cS . "$RUNNER_TEMP/release-plan.json")" >> "$GITHUB_OUTPUT"
+          if [[ "$action" == publish ]]; then
+            echo "Release due: $(jq -r '[.root, .adk, .genai] | map(select(.release) | .version) | join(", ")' "$RUNNER_TEMP/release-plan.json"). Approve the \`release\` deployment to tag it." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  release:
+    name: Tag the approved release
+    needs: plan
+    if: needs.plan.outputs.action == 'publish'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: release
+    outputs:
+      action: ${{ steps.plan.outputs.action }}
+      root_release: ${{ steps.plan.outputs.root_release }}
+      root_version: ${{ steps.plan.outputs.root_version }}
+      adk_release: ${{ steps.plan.outputs.adk_release }}
+      adk_version: ${{ steps.plan.outputs.adk_version }}
+      genai_release: ${{ steps.plan.outputs.genai_release }}
+      genai_version: ${{ steps.plan.outputs.genai_version }}
+    # This job holds the release App key, so every action is pinned to a commit.
+    steps:
+      # actions/checkout v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # actions/setup-go v6.5.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Re-plan and confirm the approved releases
+        id: plan
+        shell: bash
+        env:
+          APPROVED_PLAN: ${{ needs.plan.outputs.plan }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release/weekly.py > "$RUNNER_TEMP/release-plan.json"
+          cat "$RUNNER_TEMP/release-plan.json"
+          if [[ "$(jq -cS . "$RUNNER_TEMP/release-plan.json")" != "$APPROVED_PLAN" ]]; then
+            echo "::error::The release plan changed after approval; rerun the workflow" >&2
+            exit 1
+          fi
           for field in action root.release root.version adk.release adk.version genai.release genai.version; do
             key=${field//./_}
             echo "$key=$(jq -r ".$field" "$RUNNER_TEMP/release-plan.json")" >> "$GITHUB_OUTPUT"
@@ -61,7 +104,8 @@ jobs:
       - name: Create a repository-scoped release token
         if: steps.plan.outputs.action == 'publish'
         id: release-token
-        uses: actions/create-github-app-token@v2
+        # actions/create-github-app-token v2.2.2
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
         with:
           app-id: ${{ secrets.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
@@ -82,6 +126,14 @@ jobs:
           git config user.email 'neatlogs-release[bot]@users.noreply.github.com'
           git remote set-url origin "https://x-access-token:${RELEASE_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git tag -a "$ROOT_VERSION" -m "Release root module $ROOT_VERSION"
+          # Both jobs check out the event's commit, and main can move while the
+          # release waits for approval. Tag only the commit main still points to.
+          planned=$(git rev-parse HEAD)
+          remote_main=$(git ls-remote --exit-code origin refs/heads/main | awk '$2 == "refs/heads/main" { print $1 }')
+          if [[ "$remote_main" != "$planned" ]]; then
+            echo "::error::main moved to ${remote_main:-an unknown commit} after this release was planned at ${planned}; rerun the workflow" >&2
+            exit 1
+          fi
           git push origin "refs/tags/${ROOT_VERSION}"
 
       - name: Update and test contrib and example modules
@@ -138,6 +190,15 @@ jobs:
             git commit -m 'chore(release): update module root dependencies'
             # A concurrent merge stops this release before any contrib tag is made.
             git push origin HEAD:refs/heads/main
+          else
+            # Without a commit, no fast-forward push guards these tags, so
+            # check that main still points to the planned commit.
+            planned=$(git rev-parse HEAD)
+            remote_main=$(git ls-remote --exit-code origin refs/heads/main | awk '$2 == "refs/heads/main" { print $1 }')
+            if [[ "$remote_main" != "$planned" ]]; then
+              echo "::error::main moved to ${remote_main:-an unknown commit} after this release was planned at ${planned}; rerun the workflow" >&2
+              exit 1
+            fi
           fi
           git diff --exit-code
           if [[ "$ADK_RELEASE" == true ]]; then
