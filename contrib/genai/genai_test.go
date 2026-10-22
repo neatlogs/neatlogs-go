@@ -1011,6 +1011,333 @@ func TestGenerateContentStreamIsLazyUntilFirstConsumption(t *testing.T) {
 	}
 }
 
+type fakeStream = func(context.Context, string, []*google.Content, *google.GenerateContentConfig) iter.Seq2[*google.GenerateContentResponse, error]
+
+func textChunk(text string, finish google.FinishReason) *google.GenerateContentResponse {
+	return &google.GenerateContentResponse{Candidates: []*google.Candidate{{
+		FinishReason: finish,
+		Content:      &google.Content{Role: "model", Parts: []*google.Part{{Text: text}}},
+	}}}
+}
+
+// exportedStreamSpan runs one wrapped stream against a fake provider stream and
+// returns the LLM span it exported.
+func exportedStreamSpan(
+	t *testing.T,
+	ctx context.Context,
+	stream fakeStream,
+	consume func(iter.Seq2[*google.GenerateContentResponse, error]),
+) tracetest.SpanStub {
+	t.Helper()
+	baseCtx := context.Background()
+	sink := tracetest.NewInMemoryExporter()
+	shutdown, err := neatlogs.Init(baseCtx, neatlogs.Config{WorkflowName: "stream-status"}, neatlogs.WithExporter(sink))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdown(baseCtx)
+
+	models := &GenAIModels{provider: geminiProvider, system: geminiSystem, stream: stream}
+	consume(models.GenerateContentStream(ctx, "gemini", nil, nil))
+	if err := neatlogs.Flush(baseCtx); err != nil {
+		t.Fatal(err)
+	}
+	for _, got := range sink.GetSpans() {
+		if got.Name == "google_genai.models.generate_content" {
+			return got
+		}
+	}
+	t.Fatal("stream span not exported")
+	return tracetest.SpanStub{}
+}
+
+func drain(sequence iter.Seq2[*google.GenerateContentResponse, error]) {
+	for range sequence {
+	}
+}
+
+func assertAttributeAbsent(t *testing.T, values []attribute.KeyValue, key string) {
+	t.Helper()
+	if value, ok := findAttribute(values, key); ok {
+		t.Fatalf("attribute %s = %v, want it absent", key, value.AsInterface())
+	}
+}
+
+func assertExceptionRecorded(t *testing.T, span tracetest.SpanStub) {
+	t.Helper()
+	for _, event := range span.Events {
+		if event.Name == "exception" {
+			return
+		}
+	}
+	t.Fatalf("no exception event recorded on %q: %v", span.Name, span.Events)
+}
+
+func TestStreamFailureIsErrorAndKeepsPartialOutput(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		// fail ends the fake stream after its first chunk; it returns the
+		// error the provider yields, or nil when the stream just stops.
+		fail func(streamCtx context.Context) error
+		// timeout bounds the caller context; zero means no deadline.
+		timeout time.Duration
+	}{
+		{name: "provider_error", fail: func(context.Context) error { return errors.New("connection reset by peer") }},
+		{name: "deadline_error", fail: func(context.Context) error {
+			return fmt.Errorf("read response body: %w", context.DeadlineExceeded)
+		}},
+		{name: "deadline_swallowed_by_provider", timeout: 20 * time.Millisecond, fail: func(streamCtx context.Context) error {
+			<-streamCtx.Done()
+			return nil
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			if test.timeout > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, test.timeout)
+				defer cancel()
+			}
+			got := exportedStreamSpan(t, ctx, func(streamCtx context.Context, _ string, _ []*google.Content, _ *google.GenerateContentConfig) iter.Seq2[*google.GenerateContentResponse, error] {
+				return func(yield func(*google.GenerateContentResponse, error) bool) {
+					if !yield(textChunk("partial", ""), nil) {
+						return
+					}
+					if err := test.fail(streamCtx); err != nil {
+						yield(nil, err)
+					}
+				}
+			}, drain)
+
+			if got.Status.Code != codes.Error {
+				t.Fatalf("failed stream status = %v, want ERROR", got.Status.Code)
+			}
+			assertExceptionRecorded(t, got)
+			assertAttributeAbsent(t, got.Attributes, attrs.StreamCancelled)
+			assertStringAttribute(t, got.Attributes, attrs.LLMOutputMessagePrefix+"0.content", "partial")
+			assertIntAttribute(t, got.Attributes, attrs.StreamChunkCount, 1)
+		})
+	}
+}
+
+func TestStreamStoppedByCallerIsCancelledNotError(t *testing.T) {
+	got := exportedStreamSpan(t, context.Background(), func(context.Context, string, []*google.Content, *google.GenerateContentConfig) iter.Seq2[*google.GenerateContentResponse, error] {
+		return func(yield func(*google.GenerateContentResponse, error) bool) {
+			if !yield(textChunk("partial", ""), nil) {
+				return
+			}
+			t.Error("stream continued after the caller stopped")
+		}
+	}, func(sequence iter.Seq2[*google.GenerateContentResponse, error]) {
+		for range sequence {
+			break
+		}
+	})
+
+	if got.Status.Code != codes.Unset {
+		t.Fatalf("stopped stream status = %v, want UNSET", got.Status.Code)
+	}
+	assertBoolAttribute(t, got.Attributes, attrs.StreamCancelled, true)
+	assertAttributeAbsent(t, got.Attributes, streamIncomplete)
+	assertStringAttribute(t, got.Attributes, attrs.LLMOutputMessagePrefix+"0.content", "partial")
+}
+
+func TestStreamWithoutFinishReasonIsIncompleteNotOK(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		chunks []*google.GenerateContentResponse
+	}{
+		{name: "chunks_then_silence", chunks: []*google.GenerateContentResponse{textChunk("partial", "")}},
+		{name: "no_chunks"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := exportedStreamSpan(t, context.Background(), func(context.Context, string, []*google.Content, *google.GenerateContentConfig) iter.Seq2[*google.GenerateContentResponse, error] {
+				return func(yield func(*google.GenerateContentResponse, error) bool) {
+					for _, chunk := range test.chunks {
+						if !yield(chunk, nil) {
+							return
+						}
+					}
+				}
+			}, drain)
+
+			if got.Status.Code != codes.Unset {
+				t.Fatalf("incomplete stream status = %v, want UNSET", got.Status.Code)
+			}
+			assertBoolAttribute(t, got.Attributes, streamIncomplete, true)
+			assertAttributeAbsent(t, got.Attributes, attrs.StreamCancelled)
+			if len(test.chunks) > 0 {
+				assertStringAttribute(t, got.Attributes, attrs.LLMOutputMessagePrefix+"0.content", "partial")
+			}
+		})
+	}
+}
+
+func TestFinishedStreamIsOKEvenWhenDeadlinePassesAfterwards(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	got := exportedStreamSpan(t, ctx, func(streamCtx context.Context, _ string, _ []*google.Content, _ *google.GenerateContentConfig) iter.Seq2[*google.GenerateContentResponse, error] {
+		return func(yield func(*google.GenerateContentResponse, error) bool) {
+			if !yield(textChunk("done", google.FinishReasonStop), nil) {
+				return
+			}
+			<-streamCtx.Done()
+		}
+	}, drain)
+
+	if got.Status.Code != codes.Ok {
+		t.Fatalf("finished stream status = %v, want OK", got.Status.Code)
+	}
+	assertAttributeAbsent(t, got.Attributes, streamIncomplete)
+	assertAttributeAbsent(t, got.Attributes, attrs.StreamCancelled)
+}
+
+func TestBlockedPromptStreamIsError(t *testing.T) {
+	blocked := &google.GenerateContentResponse{PromptFeedback: &google.GenerateContentResponsePromptFeedback{
+		BlockReason:        google.BlockedReasonSafety,
+		BlockReasonMessage: "prompt violates the safety policy",
+	}}
+	for _, test := range []struct {
+		name    string
+		consume func(iter.Seq2[*google.GenerateContentResponse, error])
+	}{
+		{name: "drained", consume: drain},
+		{name: "caller_stops_on_the_block", consume: func(sequence iter.Seq2[*google.GenerateContentResponse, error]) {
+			for range sequence {
+				break
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := exportedStreamSpan(t, context.Background(), func(context.Context, string, []*google.Content, *google.GenerateContentConfig) iter.Seq2[*google.GenerateContentResponse, error] {
+				return func(yield func(*google.GenerateContentResponse, error) bool) {
+					yield(blocked, nil)
+				}
+			}, test.consume)
+
+			if got.Status.Code != codes.Error {
+				t.Fatalf("blocked prompt status = %v, want ERROR", got.Status.Code)
+			}
+			if want := "prompt blocked: SAFETY: prompt violates the safety policy"; got.Status.Description != want {
+				t.Fatalf("status message = %q, want %q", got.Status.Description, want)
+			}
+			assertExceptionRecorded(t, got)
+			assertStringAttribute(t, got.Attributes, attrs.LLMFinishReason, string(google.BlockedReasonSafety))
+			assertAttributeAbsent(t, got.Attributes, attrs.StreamCancelled)
+			assertAttributeAbsent(t, got.Attributes, streamIncomplete)
+		})
+	}
+}
+
+func TestBlockingFinishReasonWithContentIsNotAnError(t *testing.T) {
+	got := exportedStreamSpan(t, context.Background(), func(context.Context, string, []*google.Content, *google.GenerateContentConfig) iter.Seq2[*google.GenerateContentResponse, error] {
+		return func(yield func(*google.GenerateContentResponse, error) bool) {
+			yield(textChunk("partial answer", google.FinishReasonSafety), nil)
+		}
+	}, drain)
+
+	if got.Status.Code != codes.Ok {
+		t.Fatalf("status = %v, want OK", got.Status.Code)
+	}
+	assertStringAttribute(t, got.Attributes, attrs.LLMFinishReason, string(google.FinishReasonSafety))
+	assertStringAttribute(t, got.Attributes, attrs.LLMOutputMessagePrefix+"0.content", "partial answer")
+}
+
+// The two tests below drive the real genai client against a local server, so
+// they cover what the pinned provider SDK actually hands the wrapper.
+
+func localGenAIModels(t *testing.T, handler http.HandlerFunc) (*GenAIModels, *tracetest.InMemoryExporter) {
+	t.Helper()
+	ctx := context.Background()
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	sink := tracetest.NewInMemoryExporter()
+	shutdown, err := neatlogs.Init(ctx, neatlogs.Config{WorkflowName: "local-genai"}, neatlogs.WithExporter(sink))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = shutdown(ctx) })
+	client, err := google.NewClient(ctx, &google.ClientConfig{
+		APIKey:      "test-google-key",
+		Backend:     google.BackendGeminiAPI,
+		HTTPOptions: google.HTTPOptions{BaseURL: server.URL},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return WrapGenAI(client), sink
+}
+
+func exportedLLMSpan(t *testing.T, sink *tracetest.InMemoryExporter) tracetest.SpanStub {
+	t.Helper()
+	if err := neatlogs.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, got := range sink.GetSpans() {
+		if got.Name == "google_genai.models.generate_content" {
+			return got
+		}
+	}
+	t.Fatal("LLM span not exported")
+	return tracetest.SpanStub{}
+}
+
+func TestBlockedPromptResponseIsError(t *testing.T) {
+	models, sink := localGenAIModels(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"promptFeedback":{"blockReason":"SAFETY"}}`)
+	})
+	contents := []*google.Content{google.NewContentFromText("hello", google.RoleUser)}
+	if _, err := models.GenerateContent(context.Background(), "gemini-test", contents, nil); err != nil {
+		t.Fatalf("a blocked prompt is a response, not a Go error: %v", err)
+	}
+
+	got := exportedLLMSpan(t, sink)
+	if got.Status.Code != codes.Error {
+		t.Fatalf("blocked prompt status = %v, want ERROR", got.Status.Code)
+	}
+	if want := "prompt blocked: SAFETY"; got.Status.Description != want {
+		t.Fatalf("status message = %q, want %q", got.Status.Description, want)
+	}
+	assertExceptionRecorded(t, got)
+	assertStringAttribute(t, got.Attributes, attrs.LLMFinishReason, string(google.BlockedReasonSafety))
+}
+
+func TestStreamCutByTheServerIsNeverOK(t *testing.T) {
+	models, sink := localGenAIModels(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"candidates":[{"content":{"role":"model","parts":[{"text":"partial"}]}}]}`+"\n\n")
+		w.(http.Flusher).Flush()
+		// Drop the connection before the provider sends a finish reason.
+		panic(http.ErrAbortHandler)
+	})
+	contents := []*google.Content{google.NewContentFromText("hello", google.RoleUser)}
+	var text strings.Builder
+	for response, err := range models.GenerateContentStream(context.Background(), "gemini-test", contents, nil) {
+		if err != nil {
+			break
+		}
+		text.WriteString(response.Text())
+	}
+	if text.String() != "partial" {
+		t.Fatalf("received text = %q, want the chunk sent before the cut", text.String())
+	}
+
+	got := exportedLLMSpan(t, sink)
+	// Provider SDK releases differ: older ones end the stream silently, newer
+	// ones yield the read error. Neither may be recorded as a success.
+	switch got.Status.Code {
+	case codes.Error:
+		assertExceptionRecorded(t, got)
+	case codes.Unset:
+		assertBoolAttribute(t, got.Attributes, streamIncomplete, true)
+	default:
+		t.Fatalf("cut stream status = %v, want ERROR or UNSET", got.Status.Code)
+	}
+	assertAttributeAbsent(t, got.Attributes, attrs.StreamCancelled)
+	assertStringAttribute(t, got.Attributes, attrs.LLMOutputMessagePrefix+"0.content", "partial")
+}
+
 func findAttribute(values []attribute.KeyValue, key string) (attribute.Value, bool) {
 	for _, value := range values {
 		if string(value.Key) == key {

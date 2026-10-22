@@ -64,6 +64,7 @@ func (t *ToolSpan) SetError(err error) {
 	if t == nil || err == nil {
 		return
 	}
+	t.span.RecordError(err)
 	t.span.SetStatus(codes.Error, err.Error())
 	t.span.SetAttributes(attribute.String(attrs.ToolOutput, err.Error()))
 }

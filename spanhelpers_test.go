@@ -71,7 +71,8 @@ func TestStartToolSpanFromHeaders_ContinuesTraceAndRecordsIO(t *testing.T) {
 	}
 }
 
-// SetError marks the tool span failed and records the error as output.
+// SetError marks the tool span failed and records the error as an exception
+// event and as output.
 func TestStartToolSpanFromHeaders_SetError(t *testing.T) {
 	ctx := context.Background()
 	sink := tracetest.NewInMemoryExporter()
@@ -96,6 +97,9 @@ func TestStartToolSpanFromHeaders_SetError(t *testing.T) {
 	}
 	if v, _ := attrString(span.Attributes, attrs.ToolOutput); v != "kaboom" {
 		t.Errorf("tool output = %q, want error text", v)
+	}
+	if len(span.Events) != 1 || span.Events[0].Name != "exception" {
+		t.Errorf("events = %v, want the error recorded as one exception event", span.Events)
 	}
 	var sawRoot bool
 	for _, candidate := range sink.GetSpans() {
