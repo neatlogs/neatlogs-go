@@ -51,3 +51,21 @@ func TestSchemaBytesReturnsDefensiveCopy(t *testing.T) {
 		t.Fatal("SchemaBytes exposed mutable embedded contract storage")
 	}
 }
+
+func TestCanonicalTelemetryContractIncludesEvaluator(t *testing.T) {
+	t.Parallel()
+
+	schema, err := Schema()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defs := schema["$defs"].(map[string]any)
+	spanKind := defs["spanKind"].(map[string]any)
+	values := spanKind["enum"].([]any)
+	for _, value := range values {
+		if value == "EVALUATOR" {
+			return
+		}
+	}
+	t.Fatal("canonical spanKind enum is missing EVALUATOR")
+}

@@ -30,14 +30,16 @@ const (
 type sdkRuntime struct {
 	mu sync.Mutex
 
-	state        sdkState
-	provider     *sdktrace.TracerProvider
-	tracer       trace.Tracer
-	lifecycle    *activeSpanRegistry
-	workflowName string
-	delivery     *deliveryDiagnostics
-	media        *internalmedia.Store
-	captures     *doctorCaptureStore
+	state                 sdkState
+	provider              *sdktrace.TracerProvider
+	tracer                trace.Tracer
+	lifecycle             *activeSpanRegistry
+	workflowName          string
+	delivery              *deliveryDiagnostics
+	media                 *internalmedia.Store
+	captures              *doctorCaptureStore
+	datasetCaptures       *datasetCaptureRegistry
+	datasetCaptureEnabled bool
 
 	done        chan struct{}
 	shutdownErr error
@@ -75,7 +77,7 @@ func (r *sdkRuntime) startSpan(
 ) (context.Context, trace.Span, func()) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.state != stateRunning {
+	if r.state != stateRunning || (r.datasetCaptures != nil && !r.datasetCaptures.allows(ctx)) {
 		return startNoopSpan(ctx, name, options...)
 	}
 	_, span := r.tracer.Start(privateStartContext(ctx, r), name, options...)
@@ -88,7 +90,7 @@ func (r *sdkRuntime) startSpan(
 func (r *sdkRuntime) startProviderSpan(ctx context.Context, name, kind string) (context.Context, trace.Span, func()) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.state != stateRunning {
+	if r.state != stateRunning || (r.datasetCaptures != nil && !r.datasetCaptures.allows(ctx)) {
 		return startNoopSpan(ctx, name)
 	}
 

@@ -3,9 +3,9 @@ module neatlogs-go-example-genai
 go 1.25.0
 
 require (
-	github.com/neatlogs/neatlogs-go v0.1.9
+	github.com/neatlogs/neatlogs-go v0.1.12
 	github.com/neatlogs/neatlogs-go/contrib/genai v0.0.0
-	google.golang.org/genai v1.61.0
+	google.golang.org/genai v1.71.0
 )
 
 require (
