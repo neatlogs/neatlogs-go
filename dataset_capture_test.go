@@ -269,7 +269,7 @@ func TestDatasetCaptureNeverExecutesReplayedRecordingReceipt(t *testing.T) {
 		case r.Method == http.MethodGet:
 			statusReads++
 			json.NewEncoder(w).Encode(map[string]any{"success": true, "data": map[string]any{
-				"job": DatasetCaptureStatus{CaptureID: datasetCaptureTestID, DatasetID: datasetTestID, State: "recording"},
+				"job":      DatasetCaptureStatus{CaptureID: datasetCaptureTestID, DatasetID: datasetTestID, State: "recording"},
 				"failures": []any{}, "nextCursor": nil,
 			}})
 		case strings.HasSuffix(r.URL.Path, "/complete"):
