@@ -12,6 +12,11 @@ const maxActiveCalls = 1024
 type activeCall struct {
 	span trace.Span
 	end  func()
+	// run is the adk.Run root that owns an A2A call; output and partial hold
+	// its response text between streamed events.
+	run     trace.SpanID
+	output  string
+	partial string
 }
 
 // activeCallRegistry bounds callback state when an upstream framework omits a
@@ -53,6 +58,20 @@ func (r *activeCallRegistry) take(key string) (activeCall, bool) {
 		delete(r.entries, key)
 	}
 	return call, ok
+}
+
+// takeRun removes and returns every call started under the given adk.Run root.
+func (r *activeCallRegistry) takeRun(run trace.SpanID) []activeCall {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var calls []activeCall
+	for key, call := range r.entries {
+		if call.run == run {
+			calls = append(calls, call)
+			delete(r.entries, key)
+		}
+	}
+	return calls
 }
 
 func endEvicted(calls []activeCall, reason string) {

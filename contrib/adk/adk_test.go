@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"iter"
 	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 
+	"github.com/a2aproject/a2a-go/v2/a2a"
 	neatlogs "github.com/neatlogs/neatlogs-go"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -17,6 +20,7 @@ import (
 	"google.golang.org/adk/agent"
 	"google.golang.org/adk/agent/llmagent"
 	"google.golang.org/adk/model"
+	"google.golang.org/adk/model/gemini"
 	"google.golang.org/adk/runner"
 	"google.golang.org/adk/session"
 	"google.golang.org/adk/tool"
@@ -79,6 +83,8 @@ func TestWrapModelExportsPrivateADKSpanWithContentUsageAndTools(t *testing.T) {
 	}
 	defer client.Shutdown(ctx)
 
+	// ADK's SSE mode yields each delta as a partial response and then one
+	// aggregated response that repeats the whole text.
 	inner := &fakeModel{name: "gemini-default", responses: []responseItem{
 		{response: &model.LLMResponse{
 			Content: &genai.Content{Role: "model", Parts: []*genai.Part{{Text: "Hel"}}},
@@ -87,6 +93,13 @@ func TestWrapModelExportsPrivateADKSpanWithContentUsageAndTools(t *testing.T) {
 		{response: &model.LLMResponse{
 			Content: &genai.Content{Role: "model", Parts: []*genai.Part{
 				{Text: "lo"},
+				{FunctionCall: &genai.FunctionCall{ID: "call-1", Name: "weather", Args: map[string]any{"city": "Paris"}}},
+			}},
+			Partial: true,
+		}},
+		{response: &model.LLMResponse{
+			Content: &genai.Content{Role: "model", Parts: []*genai.Part{
+				{Text: "Hello"},
 				{FunctionCall: &genai.FunctionCall{ID: "call-1", Name: "weather", Args: map[string]any{"city": "Paris"}}},
 			}},
 			ModelVersion: "gemini-2.5-flash-001",
@@ -121,7 +134,11 @@ func TestWrapModelExportsPrivateADKSpanWithContentUsageAndTools(t *testing.T) {
 	assertStringAttribute(t, span.Attributes, "neatlogs.llm.input_messages.0.content", "hello")
 	assertStringAttribute(t, span.Attributes, "neatlogs.llm.output_messages.0.content", "Hello")
 	assertStringAttribute(t, span.Attributes, "neatlogs.llm.tool_calls.0.name", "weather")
+	assertAttributeAbsent(t, span.Attributes, "neatlogs.llm.tool_calls.1.name")
 	assertIntAttribute(t, span.Attributes, "neatlogs.llm.token_count.total", 18)
+	if span.Status.Code != codes.Ok {
+		t.Fatalf("completed stream status = %s, want Ok", span.Status.Code)
+	}
 	if inner.seenCtx == nil {
 		t.Fatal("wrapped model did not receive the Neatlogs-derived context")
 	}
@@ -281,6 +298,574 @@ func TestActiveCallRegistryBoundsAbandonedCallbacks(t *testing.T) {
 	}
 }
 
+func textResponse(text string, partial bool) *model.LLMResponse {
+	return &model.LLMResponse{
+		Content: &genai.Content{Role: genai.RoleModel, Parts: []*genai.Part{{Text: text}}},
+		Partial: partial,
+	}
+}
+
+func newTestClient(t *testing.T, workflow string) (*neatlogs.Client, *tracetest.InMemoryExporter) {
+	t.Helper()
+	ctx := context.Background()
+	sink := tracetest.NewInMemoryExporter()
+	client, err := neatlogs.NewClient(ctx, neatlogs.Config{WorkflowName: workflow}, neatlogs.WithExporter(sink))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Shutdown(ctx) })
+	return client, sink
+}
+
+func assertBoolAttribute(t *testing.T, attributes []attribute.KeyValue, key string, want bool) {
+	t.Helper()
+	for _, item := range attributes {
+		if string(item.Key) == key {
+			if got := item.Value.AsBool(); got != want {
+				t.Fatalf("%s = %v, want %v", key, got, want)
+			}
+			return
+		}
+	}
+	t.Fatalf("attribute %q not found", key)
+}
+
+func assertAttributeAbsent(t *testing.T, attributes []attribute.KeyValue, key string) {
+	t.Helper()
+	for _, item := range attributes {
+		if string(item.Key) == key {
+			t.Fatalf("%s = %v, want it absent", key, item.Value.AsInterface())
+		}
+	}
+}
+
+func assertExceptionRecorded(t *testing.T, span tracetest.SpanStub) {
+	t.Helper()
+	for _, event := range span.Events {
+		if event.Name == "exception" {
+			return
+		}
+	}
+	t.Fatalf("no exception event recorded on %q: %v", span.Name, span.Events)
+}
+
+func TestWrapModelStreamOutcomes(t *testing.T) {
+	providerErr := errors.New("connection reset by peer")
+	deadlineErr := fmt.Errorf("read response body: %w", context.DeadlineExceeded)
+	for _, test := range []struct {
+		name      string
+		responses []responseItem
+		stream    bool
+		// stopAfter stops the consumer after that many items; zero drains.
+		stopAfter      int
+		wantStatus     codes.Code
+		wantMessage    string
+		wantOutput     string
+		wantCancelled  bool
+		wantIncomplete bool
+	}{
+		{
+			// The ADK flow stops iterating as soon as the model yields an error.
+			name:       "error_after_partial_text",
+			responses:  []responseItem{{response: textResponse("Hel", true)}, {err: providerErr}},
+			stream:     true,
+			stopAfter:  2,
+			wantStatus: codes.Error, wantMessage: providerErr.Error(), wantOutput: "Hel",
+		},
+		{
+			name:       "deadline_exceeded",
+			responses:  []responseItem{{response: textResponse("Hel", true)}, {err: deadlineErr}},
+			stream:     true,
+			wantStatus: codes.Error, wantMessage: deadlineErr.Error(), wantOutput: "Hel",
+		},
+		{
+			name:       "caller_cancels_context",
+			responses:  []responseItem{{response: textResponse("Hel", true)}, {err: context.Canceled}},
+			stream:     true,
+			wantStatus: codes.Unset, wantOutput: "Hel", wantCancelled: true,
+		},
+		{
+			name:       "caller_stops_early",
+			responses:  []responseItem{{response: textResponse("Hel", true)}, {response: textResponse("lo", true)}},
+			stream:     true,
+			stopAfter:  1,
+			wantStatus: codes.Unset, wantOutput: "Hel", wantCancelled: true,
+		},
+		{
+			name:       "stream_ends_without_finish_reason",
+			responses:  []responseItem{{response: textResponse("Hel", true)}, {response: textResponse("lo", true)}},
+			stream:     true,
+			wantStatus: codes.Unset, wantOutput: "Hello", wantIncomplete: true,
+		},
+		{
+			// Only a stream can end early; a single response has no finish
+			// reason with models that do not report one.
+			name:       "single_response_without_finish_reason",
+			responses:  []responseItem{{response: textResponse("Hello", false)}},
+			wantStatus: codes.Ok, wantOutput: "Hello",
+		},
+		{
+			name:       "response_error_fields",
+			responses:  []responseItem{{response: &model.LLMResponse{ErrorCode: "SAFETY", ErrorMessage: "response blocked"}}},
+			wantStatus: codes.Error, wantMessage: "SAFETY: response blocked",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			client, sink := newTestClient(t, "adk-stream-outcomes")
+			inner := &fakeModel{name: "gemini", responses: test.responses}
+			seen := 0
+			for range WrapModel(inner).GenerateContent(client.Context(ctx), &model.LLMRequest{}, test.stream) {
+				if seen++; seen == test.stopAfter {
+					break
+				}
+			}
+			if err := client.Flush(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			span := findSpan(t, sink, "google.adk.generate_content")
+			if span.Status.Code != test.wantStatus {
+				t.Fatalf("status = %s, want %s", span.Status.Code, test.wantStatus)
+			}
+			if span.Status.Description != test.wantMessage {
+				t.Fatalf("status message = %q, want %q", span.Status.Description, test.wantMessage)
+			}
+			if test.wantStatus == codes.Error {
+				assertExceptionRecorded(t, span)
+			}
+			if test.wantOutput != "" {
+				assertStringAttribute(t, span.Attributes, "neatlogs.llm.output_messages.0.content", test.wantOutput)
+			}
+			if test.wantCancelled {
+				assertBoolAttribute(t, span.Attributes, "neatlogs.stream.cancelled", true)
+			} else {
+				assertAttributeAbsent(t, span.Attributes, "neatlogs.stream.cancelled")
+			}
+			if test.wantIncomplete {
+				assertBoolAttribute(t, span.Attributes, "neatlogs.stream.incomplete", true)
+			} else {
+				assertAttributeAbsent(t, span.Attributes, "neatlogs.stream.incomplete")
+			}
+		})
+	}
+}
+
+// This test drives ADK's own Gemini model against a local server, so it
+// covers what ADK's SSE mode actually hands the wrapper: partial deltas, then
+// one aggregate, and a stream that the pinned provider SDK may end silently.
+func TestWrapModelOverGeminiSSEStream(t *testing.T) {
+	const first = `data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Hel"}]}}]}` + "\n\n"
+	const last = `data: {"candidates":[{"content":{"role":"model","parts":[{"text":"lo"}]},"finishReason":"STOP"}],` +
+		`"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":2,"totalTokenCount":5}}` + "\n\n"
+	for _, test := range []struct {
+		name string
+		// cut drops the connection before the last chunk.
+		cut        bool
+		wantOutput string
+	}{
+		{name: "complete", wantOutput: "Hello"},
+		{name: "cut_by_the_server", cut: true, wantOutput: "Hel"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, first)
+				w.(http.Flusher).Flush()
+				if test.cut {
+					panic(http.ErrAbortHandler)
+				}
+				_, _ = io.WriteString(w, last)
+			}))
+			defer server.Close()
+			llm, err := gemini.NewModel(ctx, "gemini-test", &genai.ClientConfig{
+				APIKey:      "test-google-key",
+				Backend:     genai.BackendGeminiAPI,
+				HTTPOptions: genai.HTTPOptions{BaseURL: server.URL},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			client, sink := newTestClient(t, "adk-gemini-sse")
+			req := &model.LLMRequest{Contents: []*genai.Content{genai.NewContentFromText("hello", genai.RoleUser)}}
+			for range WrapModel(llm).GenerateContent(client.Context(ctx), req, true) {
+			}
+			if err := client.Flush(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			span := findSpan(t, sink, "google.adk.generate_content")
+			assertStringAttribute(t, span.Attributes, "neatlogs.llm.output_messages.0.content", test.wantOutput)
+			assertAttributeAbsent(t, span.Attributes, "neatlogs.stream.cancelled")
+			if !test.cut {
+				if span.Status.Code != codes.Ok {
+					t.Fatalf("completed stream status = %s, want Ok", span.Status.Code)
+				}
+				assertIntAttribute(t, span.Attributes, "neatlogs.llm.token_count.total", 5)
+				return
+			}
+			// Provider SDK releases differ: older ones end the stream silently,
+			// newer ones yield the read error. Neither may be a success.
+			switch span.Status.Code {
+			case codes.Error:
+				assertExceptionRecorded(t, span)
+			case codes.Unset:
+				assertBoolAttribute(t, span.Attributes, "neatlogs.stream.incomplete", true)
+			default:
+				t.Fatalf("cut stream status = %s, want Error or Unset", span.Status.Code)
+			}
+		})
+	}
+}
+
+// funcModel is an ADK model whose stream is scripted by a function, for cases
+// the fixed-response fakes cannot express (cancelling a context mid-call).
+type funcModel func(ctx context.Context, yield func(*model.LLMResponse, error) bool)
+
+func (m funcModel) Name() string { return "gemini-func" }
+
+func (m funcModel) GenerateContent(ctx context.Context, _ *model.LLMRequest, _ bool) iter.Seq2[*model.LLMResponse, error] {
+	return func(yield func(*model.LLMResponse, error) bool) { m(ctx, yield) }
+}
+
+// runAgent drives Run over one agent and returns the exported root span.
+// consume receives each item and returns false to stop early.
+func runAgent(
+	t *testing.T,
+	ctx context.Context,
+	adkAgent agent.Agent,
+	config agent.RunConfig,
+	consume func(*session.Event, error) bool,
+) (tracetest.SpanStub, *tracetest.InMemoryExporter) {
+	t.Helper()
+	client, sink := newTestClient(t, "adk-run-outcomes")
+	r, err := runner.New(runner.Config{
+		AppName: "adk-run-outcomes", Agent: adkAgent,
+		SessionService: session.InMemoryService(), AutoCreateSession: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for event, runErr := range Run(
+		client.Context(ctx), r, "user-1", "session-1",
+		genai.NewContentFromText("hello", genai.RoleUser), config,
+	) {
+		if !consume(event, runErr) {
+			break
+		}
+	}
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if open := len(activeA2ACalls.entries); open != 0 {
+		t.Fatalf("%d A2A spans left open after Run", open)
+	}
+	return findSpan(t, sink, "google.adk.run"), sink
+}
+
+func modelAgent(t *testing.T, llm model.LLM) agent.Agent {
+	t.Helper()
+	adkAgent, err := llmagent.New(InstrumentConfig(llmagent.Config{Name: "outcome_agent", Model: llm}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return adkAgent
+}
+
+func drainRun(*session.Event, error) bool { return true }
+
+func TestRunMarksRootFailedWhenAnEventCarriesAnError(t *testing.T) {
+	// ADK reports a blocked response as an event; Run never sees a Go error.
+	blocked := funcModel(func(_ context.Context, yield func(*model.LLMResponse, error) bool) {
+		yield(&model.LLMResponse{ErrorCode: "SAFETY", ErrorMessage: "response blocked"}, nil)
+	})
+	sawErrorEvent := false
+	root, _ := runAgent(t, context.Background(), modelAgent(t, blocked), agent.RunConfig{}, func(event *session.Event, err error) bool {
+		if err != nil {
+			t.Fatalf("Run yielded a Go error, want an error event: %v", err)
+		}
+		sawErrorEvent = sawErrorEvent || (event != nil && event.ErrorCode == "SAFETY")
+		return true
+	})
+
+	if !sawErrorEvent {
+		t.Fatal("ADK did not deliver the blocked response as an error event")
+	}
+	if root.Status.Code != codes.Error {
+		t.Fatalf("root status = %s, want Error", root.Status.Code)
+	}
+	if want := "SAFETY: response blocked"; root.Status.Description != want {
+		t.Fatalf("root status message = %q, want %q", root.Status.Description, want)
+	}
+	assertExceptionRecorded(t, root)
+	assertAttributeAbsent(t, root.Attributes, "neatlogs.stream.cancelled")
+}
+
+func TestRunThatAnswersAfterAnErrorEventIsNotFailed(t *testing.T) {
+	// A remote agent fails, then the run still produces its answer.
+	recovering, err := agent.New(agent.Config{
+		Name: "recovering_agent",
+		Run: func(ic agent.InvocationContext) iter.Seq2[*session.Event, error] {
+			return func(yield func(*session.Event, error) bool) {
+				failed := session.NewEvent(ic.InvocationID())
+				failed.Author = ic.Agent().Name()
+				failed.ErrorMessage = "a2a task failed"
+				if !yield(failed, nil) {
+					return
+				}
+				answer := session.NewEvent(ic.InvocationID())
+				answer.Author = ic.Agent().Name()
+				answer.TurnComplete = true
+				answer.Content = genai.NewContentFromText("done without the remote agent", genai.RoleModel)
+				yield(answer, nil)
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, _ := runAgent(t, context.Background(), recovering, agent.RunConfig{}, drainRun)
+
+	if root.Status.Code != codes.Ok {
+		t.Fatalf("root status = %s, want Ok: the run answered after the error event", root.Status.Code)
+	}
+}
+
+func TestRunFailureIsNotMarkedCancelledWhenTheCallerStopsOnTheError(t *testing.T) {
+	providerErr := errors.New("provider unavailable")
+	failing := funcModel(func(_ context.Context, yield func(*model.LLMResponse, error) bool) {
+		yield(nil, providerErr)
+	})
+	root, sink := runAgent(t, context.Background(), modelAgent(t, failing), agent.RunConfig{}, func(_ *session.Event, err error) bool {
+		return err == nil
+	})
+
+	if root.Status.Code != codes.Error {
+		t.Fatalf("root status = %s, want Error", root.Status.Code)
+	}
+	assertAttributeAbsent(t, root.Attributes, "neatlogs.stream.cancelled")
+	llm := findSpan(t, sink, "google.adk.generate_content")
+	if llm.Status.Code != codes.Error {
+		t.Fatalf("LLM status = %s, want Error", llm.Status.Code)
+	}
+	assertAttributeAbsent(t, llm.Attributes, "neatlogs.stream.cancelled")
+}
+
+func TestRunCancelledByCallerIsNotAnError(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		// cancelContext makes the model cancel the caller's context and yield
+		// its error; otherwise the consumer stops after the first event.
+		cancelContext bool
+	}{
+		{name: "context_cancelled", cancelContext: true},
+		{name: "iteration_stopped"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			llm := funcModel(func(modelCtx context.Context, yield func(*model.LLMResponse, error) bool) {
+				if test.cancelContext {
+					cancel()
+					yield(nil, modelCtx.Err())
+					return
+				}
+				yield(textResponse("first answer", false), nil)
+			})
+			root, sink := runAgent(t, ctx, modelAgent(t, llm), agent.RunConfig{}, func(_ *session.Event, err error) bool {
+				return test.cancelContext && err == nil
+			})
+
+			if root.Status.Code != codes.Unset {
+				t.Fatalf("root status = %s (%q), want Unset", root.Status.Code, root.Status.Description)
+			}
+			assertBoolAttribute(t, root.Attributes, "neatlogs.stream.cancelled", true)
+			llmSpan := findSpan(t, sink, "google.adk.generate_content")
+			if llmSpan.Status.Code != codes.Unset {
+				t.Fatalf("LLM status = %s (%q), want Unset", llmSpan.Status.Code, llmSpan.Status.Description)
+			}
+			assertBoolAttribute(t, llmSpan.Attributes, "neatlogs.stream.cancelled", true)
+			if !test.cancelContext {
+				assertStringAttribute(t, root.Attributes, "neatlogs.trace.output", `"first answer"`)
+			}
+		})
+	}
+}
+
+// remoteStep is one after-callback of a remote A2A call: the converted event,
+// or the error a custom converter returns instead of one.
+type remoteStep struct {
+	text         string
+	thought      bool
+	partial      bool
+	turnComplete bool
+	errorMessage string
+	err          error
+}
+
+// remoteCallAgent replays the callback sequence of ADK's remote A2A agent: one
+// before-callback, then one after-callback per remote event (per streamed
+// event in SSE mode). The real remote agent is not imported because it would
+// add indirect requirements to this module.
+func remoteCallAgent(t *testing.T, steps []remoteStep) agent.Agent {
+	t.Helper()
+	remote, err := agent.New(agent.Config{
+		Name: "remote_agent",
+		Run: func(ic agent.InvocationContext) iter.Seq2[*session.Event, error] {
+			return func(yield func(*session.Event, error) bool) {
+				callbackCtx := agent.NewCallbackContextWithArtifactTracking(ic, nil)
+				req := &a2a.SendMessageRequest{Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("hello"))}
+				_, _ = A2ABeforeRequest(callbackCtx, req)
+				for _, step := range steps {
+					var event *session.Event
+					if step.err == nil {
+						event = session.NewEvent(ic.InvocationID())
+						event.Author = ic.Agent().Name()
+						event.Partial = step.partial
+						event.TurnComplete = step.turnComplete
+						event.ErrorMessage = step.errorMessage
+						if step.text != "" {
+							event.Content = &genai.Content{Role: genai.RoleModel, Parts: []*genai.Part{{Text: step.text, Thought: step.thought}}}
+						}
+					}
+					_, _ = A2AAfterRequest(callbackCtx, req, event, step.err)
+					if !yield(event, step.err) {
+						return
+					}
+				}
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return remote
+}
+
+func TestA2ACallIsOneSpanWithTheOutcomeOfTheWholeCall(t *testing.T) {
+	// ADK's converter emits non-terminal status updates as partial thoughts,
+	// artifact chunks as partial text, and failures as a terminal error event
+	// with a nil callback error.
+	working := remoteStep{text: "working...", thought: true, partial: true}
+	first := remoteStep{text: "Hello", partial: true}
+	second := remoteStep{text: ", world!", partial: true}
+	completed := remoteStep{turnComplete: true}
+	transportErr := errors.New("connection reset by peer")
+
+	for _, test := range []struct {
+		name           string
+		steps          []remoteStep
+		wantStatus     codes.Code
+		wantMessage    string
+		wantOutput     string
+		wantIncomplete bool
+		wantRoot       codes.Code
+	}{
+		{
+			name:       "streamed_call_completes",
+			steps:      []remoteStep{working, first, second, completed},
+			wantStatus: codes.Ok, wantOutput: "Hello, world!", wantRoot: codes.Ok,
+		},
+		{
+			name:       "stream_breaks_after_partial_output",
+			steps:      []remoteStep{working, first, {errorMessage: transportErr.Error(), turnComplete: true}},
+			wantStatus: codes.Error, wantMessage: transportErr.Error(), wantOutput: "Hello", wantRoot: codes.Error,
+		},
+		{
+			name:       "remote_task_fails",
+			steps:      []remoteStep{working, first, {text: "remote tool crashed", errorMessage: "remote tool crashed", turnComplete: true}},
+			wantStatus: codes.Error, wantMessage: "remote tool crashed", wantOutput: "Hello", wantRoot: codes.Error,
+		},
+		{
+			name:       "converter_returns_an_error",
+			steps:      []remoteStep{first, {err: transportErr}},
+			wantStatus: codes.Error, wantMessage: transportErr.Error(), wantOutput: "Hello", wantRoot: codes.Error,
+		},
+		{
+			name:       "stream_ends_without_a_terminal_event",
+			steps:      []remoteStep{working, first},
+			wantStatus: codes.Unset, wantOutput: "Hello", wantIncomplete: true, wantRoot: codes.Ok,
+		},
+		{
+			name:       "single_response",
+			steps:      []remoteStep{{text: "Hi!", turnComplete: true}},
+			wantStatus: codes.Ok, wantOutput: "Hi!", wantRoot: codes.Ok,
+		},
+		{
+			name:       "single_request_fails",
+			steps:      []remoteStep{{errorMessage: transportErr.Error(), turnComplete: true}},
+			wantStatus: codes.Error, wantMessage: transportErr.Error(), wantRoot: codes.Error,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root, sink := runAgent(t, context.Background(), remoteCallAgent(t, test.steps), agent.RunConfig{StreamingMode: agent.StreamingModeSSE}, drainRun)
+
+			spans := findSpans(sink, "google.adk.a2a")
+			if len(spans) != 1 {
+				t.Fatalf("A2A spans = %d, want one for the whole remote call", len(spans))
+			}
+			span := spans[0]
+			if span.Status.Code != test.wantStatus {
+				t.Fatalf("A2A status = %s (%q), want %s", span.Status.Code, span.Status.Description, test.wantStatus)
+			}
+			if span.Status.Description != test.wantMessage {
+				t.Fatalf("A2A status message = %q, want %q", span.Status.Description, test.wantMessage)
+			}
+			if test.wantStatus == codes.Error {
+				assertExceptionRecorded(t, span)
+			}
+			if test.wantOutput != "" {
+				assertStringAttribute(t, span.Attributes, "neatlogs.output.value", test.wantOutput)
+			}
+			if test.wantIncomplete {
+				assertBoolAttribute(t, span.Attributes, "neatlogs.stream.incomplete", true)
+			} else {
+				assertAttributeAbsent(t, span.Attributes, "neatlogs.stream.incomplete")
+			}
+			assertStringAttribute(t, span.Attributes, "neatlogs.input.value", "hello")
+			if span.Parent.SpanID() != root.SpanContext.SpanID() {
+				t.Fatalf("A2A span parent = %s, want the Run root %s", span.Parent.SpanID(), root.SpanContext.SpanID())
+			}
+			if root.Status.Code != test.wantRoot {
+				t.Fatalf("root status = %s (%q), want %s", root.Status.Code, root.Status.Description, test.wantRoot)
+			}
+		})
+	}
+}
+
+// Without Run nothing can end a span that never sees a terminal event, so
+// every callback ends its span instead of leaving one open.
+func TestA2ACallbacksLeaveNoSpanOpenWithoutRun(t *testing.T) {
+	ctx := context.Background()
+	client, sink := newTestClient(t, "a2a-without-run")
+	r, err := runner.New(runner.Config{
+		AppName: "a2a-without-run", Agent: remoteCallAgent(t, []remoteStep{{text: "Hello", partial: true}}),
+		SessionService: session.InMemoryService(), AutoCreateSession: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, runErr := range r.Run(
+		client.Context(ctx), "user-1", "session-1",
+		genai.NewContentFromText("hello", genai.RoleUser), agent.RunConfig{StreamingMode: agent.StreamingModeSSE},
+	) {
+		if runErr != nil {
+			t.Fatal(runErr)
+		}
+	}
+	if err := client.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if open := len(activeA2ACalls.entries); open != 0 {
+		t.Fatalf("%d A2A spans left open", open)
+	}
+	if spans := findSpans(sink, "google.adk.a2a"); len(spans) != 1 {
+		t.Fatalf("A2A spans = %d, want the one callback's span ended", len(spans))
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return fn(req) }
@@ -330,4 +915,16 @@ func assertIntAttribute(t *testing.T, attributes []attribute.KeyValue, key strin
 		}
 	}
 	t.Fatalf("attribute %q not found", key)
+}
+
+func TestToolCallArgumentsJSONNormalizesNilToEmptyObject(t *testing.T) {
+	if got := toolCallArgumentsJSON(nil); got != `{}` {
+		t.Fatalf("toolCallArgumentsJSON(nil) = %s, want {}", got)
+	}
+	if got := toolCallArgumentsJSON(map[string]any{}); got != `{}` {
+		t.Fatalf("toolCallArgumentsJSON(empty) = %s, want {}", got)
+	}
+	if got := toolCallArgumentsJSON(map[string]any{"city": "Paris"}); got != `{"city":"Paris"}` {
+		t.Fatalf("toolCallArgumentsJSON(populated) = %s", got)
+	}
 }

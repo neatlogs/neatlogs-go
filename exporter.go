@@ -34,6 +34,7 @@ type normalizingExporter struct {
 	delivery              *deliveryDiagnostics
 	uploads               uploadAuthority
 	captures              *doctorCaptureStore
+	datasetCaptures       *datasetCaptureRegistry
 	release               func([]trace.ReadOnlySpan)
 	emitCompletionMarkers bool
 	maskOnce              sync.Once
@@ -74,6 +75,7 @@ func (e *normalizingExporter) ExportSpans(ctx context.Context, spans []trace.Rea
 		}
 		stub := tracetest.SpanStubFromReadOnlySpan(s)
 		stub.Attributes = e.mapper.Normalize(stub.Attributes)
+		stub.Attributes = computeOperationalMetrics(stub, stub.Attributes)
 		stubs = append(stubs, stub)
 		if err := ctx.Err(); err != nil {
 			e.discardAndRecord(spans, nil)
@@ -176,6 +178,7 @@ func (e *normalizingExporter) ExportSpans(ctx context.Context, spans []trace.Rea
 		}
 		return newUploadFailure("typed_media", "one_or_more_uploads_failed", false)
 	}
+	e.datasetCaptures.acknowledge(rewritten)
 	return nil
 }
 

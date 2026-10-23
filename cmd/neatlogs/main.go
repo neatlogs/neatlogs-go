@@ -17,6 +17,9 @@ import (
 func main() { os.Exit(run(os.Args[1:])) }
 
 func run(arguments []string) int {
+	if len(arguments) > 0 && arguments[0] == "trace" {
+		return runTrace(arguments, defaultTraceIO())
+	}
 	jsonOutput := false
 	mode := ""
 	for _, argument := range arguments {

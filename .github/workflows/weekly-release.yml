@@ -1,0 +1,215 @@
+name: Daily Go module release
+
+on:
+  schedule:
+    - cron: '31 8 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: weekly-go-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      action: ${{ steps.plan.outputs.action }}
+      root_release: ${{ steps.plan.outputs.root_release }}
+      root_version: ${{ steps.plan.outputs.root_version }}
+      adk_release: ${{ steps.plan.outputs.adk_release }}
+      adk_version: ${{ steps.plan.outputs.adk_version }}
+      genai_release: ${{ steps.plan.outputs.genai_release }}
+      genai_version: ${{ steps.plan.outputs.genai_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Plan the three module releases
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/release/weekly.py > "$RUNNER_TEMP/release-plan.json"
+          cat "$RUNNER_TEMP/release-plan.json"
+          for field in action root.release root.version adk.release adk.version genai.release genai.version; do
+            key=${field//./_}
+            echo "$key=$(jq -r ".$field" "$RUNNER_TEMP/release-plan.json")" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Check release App configuration
+        if: steps.plan.outputs.action == 'publish'
+        shell: bash
+        env:
+          RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+        run: |
+          test -n "$RELEASE_APP_ID" || { echo 'RELEASE_APP_ID is missing' >&2; exit 1; }
+          test -n "$RELEASE_APP_PRIVATE_KEY" || { echo 'RELEASE_APP_PRIVATE_KEY is missing' >&2; exit 1; }
+
+      - name: Create a repository-scoped release token
+        if: steps.plan.outputs.action == 'publish'
+        id: release-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+
+      - name: Validate and tag the root module first
+        if: steps.plan.outputs.root_release == 'true'
+        shell: bash
+        env:
+          RELEASE_TOKEN: ${{ steps.release-token.outputs.token }}
+          ROOT_VERSION: ${{ steps.plan.outputs.root_version }}
+        run: |
+          set -euo pipefail
+          GOWORK=off go test -mod=readonly ./...
+          GOWORK=off go vet ./...
+          go build ./cmd/neatlogs
+          git config user.name 'neatlogs-release[bot]'
+          git config user.email 'neatlogs-release[bot]@users.noreply.github.com'
+          git remote set-url origin "https://x-access-token:${RELEASE_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git tag -a "$ROOT_VERSION" -m "Release root module $ROOT_VERSION"
+          git push origin "refs/tags/${ROOT_VERSION}"
+
+      - name: Update and test contrib and example modules
+        if: steps.plan.outputs.adk_release == 'true' || steps.plan.outputs.genai_release == 'true'
+        shell: bash
+        env:
+          ROOT_VERSION: ${{ steps.plan.outputs.root_version }}
+          ADK_RELEASE: ${{ steps.plan.outputs.adk_release }}
+          GENAI_RELEASE: ${{ steps.plan.outputs.genai_release }}
+        run: |
+          set -euo pipefail
+          for module in adk genai; do
+            if [[ "$module" == adk && "$ADK_RELEASE" != true ]] ||
+               [[ "$module" == genai && "$GENAI_RELEASE" != true ]]; then
+              continue
+            fi
+            (
+              cd "contrib/$module"
+              go mod edit -require="github.com/neatlogs/neatlogs-go@${ROOT_VERSION}"
+              GOWORK=off GOPROXY=direct go mod tidy
+              GOWORK=off GOPROXY=direct go test -mod=readonly ./...
+              GOWORK=off GOPROXY=direct go vet ./...
+            )
+          done
+          for module in adk genai; do
+            (
+              cd "examples/$module"
+              go mod edit -require="github.com/neatlogs/neatlogs-go@${ROOT_VERSION}"
+              GOWORK=off GOPROXY=direct go mod tidy
+              GOWORK=off GOPROXY=direct go test -mod=readonly ./...
+              GOWORK=off GOPROXY=direct go vet ./...
+            )
+          done
+          git diff --check
+          git diff --name-only | awk '/^(contrib|examples)\/(adk|genai)\/go\.(mod|sum)$/ {next} {print; bad=1} END {exit bad}'
+
+      - name: Commit updated dependencies and tag contrib modules
+        if: steps.plan.outputs.adk_release == 'true' || steps.plan.outputs.genai_release == 'true'
+        shell: bash
+        env:
+          RELEASE_TOKEN: ${{ steps.release-token.outputs.token }}
+          ADK_RELEASE: ${{ steps.plan.outputs.adk_release }}
+          ADK_VERSION: ${{ steps.plan.outputs.adk_version }}
+          GENAI_RELEASE: ${{ steps.plan.outputs.genai_release }}
+          GENAI_VERSION: ${{ steps.plan.outputs.genai_version }}
+        run: |
+          set -euo pipefail
+          git config user.name 'neatlogs-release[bot]'
+          git config user.email 'neatlogs-release[bot]@users.noreply.github.com'
+          git remote set-url origin "https://x-access-token:${RELEASE_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git add contrib/adk/go.mod contrib/adk/go.sum contrib/genai/go.mod contrib/genai/go.sum examples/adk/go.mod examples/adk/go.sum examples/genai/go.mod examples/genai/go.sum
+          if ! git diff --cached --quiet; then
+            git diff --cached --check
+            git commit -m 'chore(release): update module root dependencies'
+            # A concurrent merge stops this release before any contrib tag is made.
+            git push origin HEAD:refs/heads/main
+          fi
+          git diff --exit-code
+          if [[ "$ADK_RELEASE" == true ]]; then
+            tag="contrib/adk/${ADK_VERSION}"
+            git tag -a "$tag" -m "Release ADK module ${ADK_VERSION}"
+            git push origin "refs/tags/${tag}"
+          fi
+          if [[ "$GENAI_RELEASE" == true ]]; then
+            tag="contrib/genai/${GENAI_VERSION}"
+            git tag -a "$tag" -m "Release GenAI module ${GENAI_VERSION}"
+            git push origin "refs/tags/${tag}"
+          fi
+
+      - name: Verify remote module tags
+        if: steps.plan.outputs.action == 'publish'
+        shell: bash
+        env:
+          ROOT_RELEASE: ${{ steps.plan.outputs.root_release }}
+          ROOT_VERSION: ${{ steps.plan.outputs.root_version }}
+          ADK_RELEASE: ${{ steps.plan.outputs.adk_release }}
+          ADK_VERSION: ${{ steps.plan.outputs.adk_version }}
+          GENAI_RELEASE: ${{ steps.plan.outputs.genai_release }}
+          GENAI_VERSION: ${{ steps.plan.outputs.genai_version }}
+        run: |
+          set -euo pipefail
+          if [[ "$ROOT_RELEASE" == true ]]; then
+            git ls-remote --exit-code --tags origin "refs/tags/${ROOT_VERSION}" >/dev/null
+          fi
+          if [[ "$ADK_RELEASE" == true ]]; then
+            git ls-remote --exit-code --tags origin "refs/tags/contrib/adk/${ADK_VERSION}" >/dev/null
+          fi
+          if [[ "$GENAI_RELEASE" == true ]]; then
+            git ls-remote --exit-code --tags origin "refs/tags/contrib/genai/${GENAI_VERSION}" >/dev/null
+          fi
+
+  notify:
+    name: Notify Slack after verified Go module tags
+    needs: release
+    if: needs.release.result == 'success' && needs.release.outputs.action == 'publish'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Post release notification
+        shell: bash
+        env:
+          # Incoming webhooks are channel-bound; configure this one for #released-artifacts (C0C6P2PU1UN).
+          SLACK_WEBHOOK_URL: ${{ secrets.RELEASE_SLACK_WEBHOOK_URL }}
+          ROOT_RELEASE: ${{ needs.release.outputs.root_release }}
+          ROOT_VERSION: ${{ needs.release.outputs.root_version }}
+          ADK_RELEASE: ${{ needs.release.outputs.adk_release }}
+          ADK_VERSION: ${{ needs.release.outputs.adk_version }}
+          GENAI_RELEASE: ${{ needs.release.outputs.genai_release }}
+          GENAI_VERSION: ${{ needs.release.outputs.genai_version }}
+        run: |
+          set -euo pipefail
+          test -n "$SLACK_WEBHOOK_URL" || { echo 'RELEASE_SLACK_WEBHOOK_URL is missing' >&2; exit 1; }
+          message=':white_check_mark: *Go SDK module release tags verified*'
+          if [[ "$ROOT_RELEASE" == true ]]; then
+            message+=$'\n'
+            message+="• <https://github.com/${GITHUB_REPOSITORY}/tree/${ROOT_VERSION}|Root ${ROOT_VERSION}>"
+          fi
+          if [[ "$ADK_RELEASE" == true ]]; then
+            message+=$'\n'
+            message+="• <https://github.com/${GITHUB_REPOSITORY}/tree/contrib%2Fadk%2F${ADK_VERSION}|ADK ${ADK_VERSION}>"
+          fi
+          if [[ "$GENAI_RELEASE" == true ]]; then
+            message+=$'\n'
+            message+="• <https://github.com/${GITHUB_REPOSITORY}/tree/contrib%2Fgenai%2F${GENAI_VERSION}|GenAI ${GENAI_VERSION}>"
+          fi
+          message+=$'\n'
+          message+="<https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}|Workflow run>"
+          payload=$(jq -n --arg text "$message" '{text: $text}')
+          response=$(curl --fail --silent --show-error --retry 2 --retry-all-errors --max-time 15 \
+            --header 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL")
+          test "$response" = ok || { echo "Slack webhook returned an unexpected response: $response" >&2; exit 1; }

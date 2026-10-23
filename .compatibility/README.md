@@ -37,10 +37,11 @@ Twice a day (at 00:47 and 12:47 UTC), the scheduled workflow:
 5. validates any proposed patch in a separate read-only job with no Gemini or
    write credentials, rerunning affected adapter suites at baseline and latest;
 6. opens or reuses a regular fix PR for human code review when the bounded patch
-   passes validation, then updates the review issue and Slack;
-7. alerts Slack when a release is
-   newer than the analyzed version lock. The same releases can trigger another
-   alert on later runs until the lock is updated after review.
+   passes validation, including a mechanical update of only that module's
+   analyzed version lock entry, then updates the review issue and Slack;
+7. alerts Slack for a mapped regression, incomplete verification, a fix PR, or
+   an automation failure. Passing mapped tests without a concrete fix stay in
+   the review issue and workflow artifact.
 
 The alert reports each module as pass, fail, blocked, or not tested. A fail means
 the mapped adapter suite passed at the baseline and failed at the new version;
@@ -74,7 +75,7 @@ Configure these GitHub Actions settings:
 Organization-level secrets scoped only to the SDK repositories are preferred.
 The credentials are used only by the scheduled/default-branch workflow and are
 never passed to pull-request jobs. Slack failures are non-blocking; alerts are
-sent for releases newer than the analyzed lock or for workflow failures.
+sent for actionable results or workflow failures.
 Gemini failures are recorded as an unavailable advisory and do not prevent
 deterministic evidence, adapter tests, or the review issue.
 

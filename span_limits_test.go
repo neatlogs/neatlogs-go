@@ -47,8 +47,8 @@ func TestSpanLimitsKeepSemanticAttributesBeyondOTelDefault(t *testing.T) {
 		t.Fatalf("DroppedAttributes = %d, want 0", chat.DroppedAttributes)
 	}
 	got := len(chat.Attributes)
-	if got != total+2 { // + token_count.total + neatlogs.span.kind
-		t.Fatalf("exported %d attributes, want %d (OTel default cap of 128 must not apply)", got, total+2)
+	if got != total+3 { // + token_count.total + neatlogs.span.kind + neatlogs.metrics.duration_ms (added at export on main)
+		t.Fatalf("exported %d attributes, want %d (OTel default cap of 128 must not apply)", got, total+3)
 	}
 }
 

@@ -3,9 +3,12 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -49,15 +52,142 @@ func TestGeminiSelectsNextUncoveredTestableModule(t *testing.T) {
 	}
 }
 
-func TestGeminiRotatesUncoveredModulesAcrossRuns(t *testing.T) {
+func TestGeminiGivesPersistentRegressionAndPassingModulesReviewSlots(t *testing.T) {
 	evidence := evidenceReport{Modules: []moduleEvidence{{Module: "example.com/first", LatestVersion: "v2"}, {Module: "example.com/second", LatestVersion: "v3"}, {Module: "example.com/third", LatestVersion: "v4"}}}
 	verification := json.RawMessage(`{"modules":[{"module":"example.com/first","status":"fail"},{"module":"example.com/second","status":"pass"},{"module":"example.com/third","status":"pass"}]}`)
-	want := []string{"example.com/first", "example.com/second", "example.com/third", "example.com/first"}
+	want := []string{"example.com/first", "example.com/second", "example.com/first", "example.com/third", "example.com/first", "example.com/second"}
 	for run, expected := range want {
 		_, _, got := selectedGeminiEvidence(evidence, verification, json.RawMessage(`[]`), run)
 		if got != expected {
 			t.Fatalf("run %d selected %q, want %q", run, got, expected)
 		}
+	}
+}
+
+func TestGeminiRotatesAmongUncoveredRegressions(t *testing.T) {
+	evidence := evidenceReport{Modules: []moduleEvidence{
+		{Module: "example.com/failing-a", LatestVersion: "v2"},
+		{Module: "example.com/passing", LatestVersion: "v3"},
+		{Module: "example.com/failing-b", LatestVersion: "v4"},
+	}}
+	verification := json.RawMessage(`{"modules":[{"module":"example.com/failing-a","status":"fail"},{"module":"example.com/passing","status":"pass"},{"module":"example.com/failing-b","status":"fail"}]}`)
+	want := []string{"example.com/failing-a", "example.com/passing", "example.com/failing-b", "example.com/passing", "example.com/failing-a"}
+	for run, expected := range want {
+		_, _, got := selectedGeminiEvidence(evidence, verification, json.RawMessage(`[]`), run)
+		if got != expected {
+			t.Fatalf("run %d selected %q, want %q", run, got, expected)
+		}
+	}
+}
+
+func TestGeminiRetriesTruncatedFlashAnalysisWithNoThinking(t *testing.T) {
+	budgets := make([]int, 0)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		var body struct {
+			GenerationConfig struct {
+				ThinkingConfig struct {
+					ThinkingBudget int `json:"thinkingBudget"`
+				} `json:"thinkingConfig"`
+			} `json:"generationConfig"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Errorf("decode Gemini request: %v", err)
+		}
+		budgets = append(budgets, body.GenerationConfig.ThinkingConfig.ThinkingBudget)
+		writer.Header().Set("Content-Type", "application/json")
+		if len(budgets) == 1 {
+			_, _ = writer.Write([]byte(`{"candidates":[{"finishReason":"MAX_TOKENS","content":{"parts":[]}}]}`))
+			return
+		}
+		_, _ = writer.Write([]byte(`{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"{\"decision\":\"review_only\",\"summary\":\"No mapped regression found\"}"}]}}]}`))
+	}))
+	defer server.Close()
+	analysis, err := requestGeminiAnalysis("review", "test-key", "gemini-2.5-flash", server.URL, server.Client())
+	if err != nil || analysis["decision"] != "review_only" || !reflect.DeepEqual(budgets, []int{1024, 0}) {
+		t.Fatalf("Gemini retry = %#v, %v; thinking budgets = %v", analysis, err, budgets)
+	}
+}
+
+func TestGeminiRepeatedTruncationFailsClosed(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests++
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"candidates":[{"finishReason":"MAX_TOKENS","content":{"parts":[{"text":"{\"decision\":\"propose_fix\"}"}]}}]}`))
+	}))
+	defer server.Close()
+	analysis, err := requestGeminiAnalysis("review", "test-key", "gemini-2.5-flash", server.URL, server.Client())
+	if err == nil || analysis != nil || requests != 2 || !strings.Contains(err.Error(), "output token limit") {
+		t.Fatalf("truncated Gemini result must fail closed: %#v, %v; requests = %d", analysis, err, requests)
+	}
+}
+
+func TestGeminiIncompleteButValidJSONIsNotACompletedReview(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"{}"}]}}]}`))
+	}))
+	defer server.Close()
+	analysis, err := requestGeminiAnalysis("review", "test-key", "gemini-2.5-flash", server.URL, server.Client())
+	if err == nil || analysis != nil || !strings.Contains(err.Error(), "incomplete") {
+		t.Fatalf("empty Gemini analysis must fail visibly: %#v, %v", analysis, err)
+	}
+}
+
+func TestADKReferencedAliasEvidenceAndDecision(t *testing.T) {
+	module := moduleEvidence{
+		Module: "google.golang.org/adk",
+		Integrations: []integrationEvidence{{AdapterSource: []sourceFile{{Path: "contrib/adk/tools.go", Content: `package adk
+import "google.golang.org/adk/tool"
+func BeforeTool(ctx tool.Context) { _ = ctx; _ = wrapper.field }
+`}}}},
+	}
+	module.AdapterReferencedAliases = adapterReferencedTypeAliases(module.Module, map[string]string{
+		"tool/tool.go": "package tool\nimport \"google.golang.org/adk/agent\"\ntype Context = agent.ToolContext\ntype Unused = agent.ToolContext\n",
+	}, module.Integrations)
+	want := []string{"tool/tool.go: type Context = agent.ToolContext"}
+	if !reflect.DeepEqual(module.AdapterReferencedAliases, want) {
+		t.Fatalf("adapterReferencedTypeAliases() = %#v, want %#v", module.AdapterReferencedAliases, want)
+	}
+	evidenceJSON, err := json.Marshal(evidenceReport{Modules: []moduleEvidence{module}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt := geminiPrompt(module.Module, json.RawMessage(`{"modules":[]}`), json.RawMessage(`[]`), evidenceJSON)
+	if !strings.Contains(prompt, want[0]) || !strings.Contains(prompt, "identical types") || !strings.Contains(prompt, "Use review_only") || !strings.Contains(prompt, "accept a fix only if the test passes at baseline, fails at latest") {
+		t.Fatalf("Gemini prompt omitted alias evidence or decision guidance: %s", prompt)
+	}
+	proposal := func() map[string]any {
+		return map[string]any{"decision": "propose_fix", "riskLevel": "high", "summary": "tool.Context changed to agent.ToolContext", "findings": []any{map[string]any{"description": "tool.Context must change to agent.ToolContext"}}, "proposedChanges": []any{
+			map[string]any{"path": "contrib/adk/tools.go", "oldText": `"google.golang.org/adk/tool"`, "newText": `"google.golang.org/adk/agent"` + "\n\t" + `"google.golang.org/adk/tool"`},
+			map[string]any{"path": "contrib/adk/tools.go", "oldText": "func BeforeTool(ctx tool.Context) {}", "newText": "func BeforeTool(ctx agent.ToolContext) {}"},
+			map[string]any{"path": "contrib/adk/tools.go", "oldText": "func AfterTool(ctx tool.Context) {}", "newText": "func AfterTool(ctx agent.ToolContext) {}"},
+			map[string]any{"path": "contrib/adk/tools.go", "oldText": "func toolCallKey(ctx tool.Context) {}", "newText": "func toolCallKey(ctx agent.ToolContext) {}"},
+		}}
+	}
+	aliasOnly := proposal()
+	discardADKAliasOnlyProposal(aliasOnly, module)
+	if aliasOnly["decision"] != "review_only" || aliasOnly["riskLevel"] != "low" || len(aliasOnly["proposedChanges"].([]any)) != 0 {
+		t.Fatalf("alias-only proposal was not downgraded: %#v", aliasOnly)
+	}
+	meaningful := proposal()
+	meaningful["proposedChanges"] = append(meaningful["proposedChanges"].([]any), map[string]any{"path": "contrib/adk/tools.go", "oldText": "return old", "newText": "return fixed"})
+	discardADKAliasOnlyProposal(meaningful, module)
+	if meaningful["decision"] != "propose_fix" {
+		t.Fatalf("meaningful fix was suppressed: %#v", meaningful)
+	}
+	separateFinding := proposal()
+	separateFinding["findings"] = append(separateFinding["findings"].([]any), map[string]any{"description": "An unrelated callback behavior changed"})
+	discardADKAliasOnlyProposal(separateFinding, module)
+	if separateFinding["decision"] != "propose_fix" {
+		t.Fatalf("a separate finding was suppressed: %#v", separateFinding)
+	}
+	noAlias := module
+	noAlias.AdapterReferencedAliases = nil
+	withoutEvidence := proposal()
+	discardADKAliasOnlyProposal(withoutEvidence, noAlias)
+	if withoutEvidence["decision"] != "propose_fix" {
+		t.Fatalf("proposal without published alias evidence was suppressed: %#v", withoutEvidence)
 	}
 }
 
