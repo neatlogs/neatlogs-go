@@ -25,15 +25,27 @@ func TestSuiteVerdictNeedsPassingBaselineToAttributeFailure(t *testing.T) {
 	}
 }
 
-func TestVerifyMarksNewerGoRequirementBlockedWithoutRunningTests(t *testing.T) {
+func TestVerifyRunsNewerGoRequirementWithAutoToolchain(t *testing.T) {
 	evidence := evidenceReport{}
 	evidence.Modules = append(evidence.Modules, struct {
 		Module               string `json:"module"`
 		ToolchainRequirement string `json:"toolchainRequirement"`
 	}{Module: "example.com/sdk", ToolchainRequirement: "requires go >= 1.26.0"})
 	result := verify(releaseReport{Changes: []releaseChange{{Module: "example.com/sdk", Latest: "v2.0.0", Integrations: []string{"a2a"}}}}, evidence, t.TempDir(), time.Second)
-	if len(result.Modules) != 1 || result.Modules[0].Status != "blocked" || !strings.Contains(result.Modules[0].Detail, "1.26.0") {
+	if len(result.Modules) != 1 {
 		t.Fatalf("verify() = %#v", result.Modules)
+	}
+	module := result.Modules[0]
+	if !strings.Contains(module.Detail, "1.26.0") || !strings.Contains(module.Detail, "go1.26.0 instead") {
+		t.Fatalf("requirement must stay reported with the auto-toolchain note: %#v", module)
+	}
+	if len(module.Suites) != 1 {
+		t.Fatalf("adapter tests must be attempted instead of skipped: %#v", module)
+	}
+	// The synthetic repository has no adapter go.mod, so the run blocks on
+	// reading files; the point is that testing was attempted, not skipped.
+	if module.Suites[0].Latest.Status != "blocked" || !strings.Contains(module.Suites[0].Latest.Detail, "go.mod") {
+		t.Fatalf("suite = %#v", module.Suites[0])
 	}
 }
 
