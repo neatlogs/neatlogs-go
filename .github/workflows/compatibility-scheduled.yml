@@ -106,6 +106,8 @@ jobs:
       - name: Test adapters against baseline and new releases
         id: verify
         continue-on-error: true
+        env:
+          GOTOOLCHAIN: auto
         run: go run ./scripts/compatibility/verify
       - uses: actions/upload-artifact@v4
         if: always()
@@ -301,6 +303,8 @@ jobs:
       - name: Reproduce a focused regression before changing SDK source
         id: focused
         if: steps.propose.outputs.focused == 'true'
+        env:
+          GOTOOLCHAIN: auto
         run: |
           go run ./scripts/compatibility/verify --output=compatibility-focused-verification.json
           go run ./scripts/compatibility/propose
@@ -308,6 +312,8 @@ jobs:
         id: retest
         if: steps.propose.outputs.candidate == 'true' && (steps.focused.outcome == 'success' || steps.focused.outcome == 'skipped')
         continue-on-error: true
+        env:
+          GOTOOLCHAIN: auto
         run: |
           go run ./scripts/compatibility/verify --output=compatibility-proposal-verification.json
           if jq -e '.testPath != null and .testPath != ""' compatibility-proposal.json >/dev/null; then
