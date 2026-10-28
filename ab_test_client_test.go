@@ -72,25 +72,85 @@ func TestABAssignmentProtocol(t *testing.T) {
 		t.Fatal("assignment threshold differs from other SDKs")
 	}
 }
-func TestABRefreshFailureFallsBackImmediately(t *testing.T) {
-	var failure atomic.Bool
-	client := abTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if failure.Load() {
-			w.WriteHeader(503)
-			return
-		}
-		abRespond(w, abFixture())
-	})
-	_ = client.Refresh(context.Background())
-	failure.Store(true)
-	if client.Refresh(context.Background()) == nil {
-		t.Fatal("expected refresh failure")
-	}
-	result := client.Assign(context.Background(), abTestKey, ABAssignmentOptions{Unit: "session:42", Fallback: ABParams{"model": "control"}})
-	if result.Arm != "a" || result.Reason != "unavailable" || result.Revision != nil || result.Params["model"] != "control" {
-		t.Fatalf("unsafe stale assignment %+v", result)
+func TestABTransientRefreshPreservesOriginalExpiry(t *testing.T) {
+	for _, status := range []int{408, 429, 500, 503, 0, -1} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			var failure atomic.Bool
+			client := abTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if !failure.Load() {
+					v := abFixture()
+					v["expiresAt"] = time.Now().Add(20 * time.Second).Format(time.RFC3339Nano)
+					abRespond(w, v)
+					return
+				}
+				if status <= 0 {
+					conn, _, err := w.(http.Hijacker).Hijack()
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					defer conn.Close()
+					if status == -1 {
+						_, _ = fmt.Fprint(conn, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"protocolVersion\":")
+					}
+					return
+				}
+				w.WriteHeader(status)
+			})
+			if err := client.Refresh(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			original := client.configs[abTestKey].expires
+			failure.Store(true)
+			if client.Refresh(context.Background()) == nil {
+				t.Fatal("expected refresh failure")
+			}
+			if choice := client.Choose(abTestKey, ABAssignmentOptions{Unit: "session:42"}); choice.Arm != "b" || choice.Reason != "assigned" {
+				t.Fatalf("lost still-valid assignment: %+v", choice)
+			}
+			if !client.configs[abTestKey].expires.Equal(original) {
+				t.Fatal("failure changed original expiry")
+			}
+			client.mu.Lock()
+			config := client.configs[abTestKey]
+			config.expires = time.Now()
+			client.configs[abTestKey] = config
+			client.mu.Unlock()
+			_ = client.Refresh(context.Background())
+			choice := client.Choose(abTestKey, ABAssignmentOptions{Unit: "session:42", Fallback: ABParams{"model": "control"}})
+			if choice.Reason != "unavailable" || choice.Params["model"] != "control" {
+				t.Fatalf("served expired settings: %+v", choice)
+			}
+		})
 	}
 }
+
+func TestABInvalidRefreshDiscardsUnexpiredCache(t *testing.T) {
+	for _, status := range []int{401, 403, 404, 302, 200} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			var failure atomic.Bool
+			client := abTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if !failure.Load() {
+					abRespond(w, abFixture())
+					return
+				}
+				w.WriteHeader(status)
+				abRespond(w, map[string]any{"invalid": true})
+			})
+			if err := client.Refresh(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			failure.Store(true)
+			if client.Refresh(context.Background()) == nil {
+				t.Fatal("accepted invalid refresh")
+			}
+			if client.Choose(abTestKey, ABAssignmentOptions{Unit: "session:42"}).Reason != "unavailable" {
+				t.Fatal("kept invalid settings")
+			}
+		})
+	}
+}
+
 func TestABShippedDefaultsAndExpiry(t *testing.T) {
 	client := abTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		v := abFixture()

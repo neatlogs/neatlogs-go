@@ -15,6 +15,8 @@ import (
 	"unicode/utf8"
 )
 
+var errABTransient = errors.New("neatlogs: A/B request temporarily unavailable")
+
 // ABTestConfig connects the A/B control API. Keys must be explicitly registered.
 type ABTestConfig struct {
 	Endpoint   string
@@ -138,6 +140,7 @@ func (c *ABTestClient) Refresh(ctx context.Context) error {
 			headers.Set("If-None-Match", previous.ETag)
 		}
 		status, responseHeaders, data, err := c.request(ctx, key, "config", nil, headers)
+		transient := errors.Is(err, errABTransient) || status == 408 || status == 429 || status >= 500
 		var config abConfiguration
 		if err == nil {
 			if status == http.StatusNotModified && exists {
@@ -158,7 +161,9 @@ func (c *ABTestClient) Refresh(ctx context.Context) error {
 		}
 		c.mu.Lock()
 		if err != nil {
-			delete(c.configs, key)
+			if !transient || !exists || !previous.expires.After(time.Now()) {
+				delete(c.configs, key)
+			}
 			result = errABConfiguration
 		} else if !c.closed {
 			c.configs[key] = config
@@ -231,14 +236,17 @@ func (c *ABTestClient) request(ctx context.Context, key, operation string, paylo
 	req.Header.Set("Content-Type", "application/json")
 	response, err := c.http.Do(req)
 	if err != nil {
-		return 0, nil, nil, errABConfiguration
+		return 0, nil, nil, errABTransient
 	}
 	defer response.Body.Close()
-	if response.StatusCode == http.StatusNotModified {
+	if response.StatusCode == http.StatusNotModified || operation == "config" && response.StatusCode != http.StatusOK {
 		return response.StatusCode, response.Header, nil, nil
 	}
 	data, err := io.ReadAll(io.LimitReader(response.Body, 64*1024+1))
-	if err != nil || len(data) > 64*1024 {
+	if err != nil {
+		return 0, nil, nil, errABTransient
+	}
+	if len(data) > 64*1024 {
 		return 0, nil, nil, errABConfiguration
 	}
 	return response.StatusCode, response.Header, data, nil
