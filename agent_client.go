@@ -21,6 +21,9 @@ type AgentClient struct {
 	configMu      sync.Mutex
 	publications  map[string]*agentConfiguration
 	leases        map[string]AgentDecision
+	servingLeases map[string]AgentDecision
+	observed      map[string]string
+	refreshCauses map[string]AgentDecisionCause
 	leaseOrder    []string
 	recorded      map[string]string
 	recordedOrder []string
@@ -32,7 +35,7 @@ func NewAgentClient(cfg ABTestConfig) (*AgentClient, error) {
 		return nil, err
 	}
 	transport.apiPath = "/api/v2/experiment-agents"
-	agent := &AgentClient{ABTestClient: transport, publications: map[string]*agentConfiguration{}, leases: map[string]AgentDecision{}, recorded: map[string]string{}}
+	agent := &AgentClient{ABTestClient: transport, publications: map[string]*agentConfiguration{}, leases: map[string]AgentDecision{}, servingLeases: map[string]AgentDecision{}, observed: map[string]string{}, refreshCauses: map[string]AgentDecisionCause{}, recorded: map[string]string{}}
 	transport.onAuthorizationFailure = func(key string) { agent.agentMu.Lock(); defer agent.agentMu.Unlock(); agent.revoke(key) }
 	return agent, nil
 }
@@ -62,9 +65,11 @@ func (c *AgentClient) Start(ctx context.Context) error {
 }
 func (c *AgentClient) revoke(key string) {
 	delete(c.publications, key)
-	for identity, lease := range c.leases {
-		if lease.AgentKey == key {
-			delete(c.leases, identity)
+	for _, leases := range []map[string]AgentDecision{c.leases, c.servingLeases} {
+		for identity, lease := range leases {
+			if lease.AgentKey == key {
+				delete(leases, identity)
+			}
 		}
 	}
 }
@@ -89,7 +94,7 @@ func (c *AgentClient) refreshAgent(ctx context.Context, key string) error {
 	c.agentMu.Lock()
 	previous := c.publications[key]
 	c.agentMu.Unlock()
-	headers := http.Header{}
+	headers := http.Header{agentCapabilityHeader: []string{agentProfile}}
 	if previous != nil && previous.etag != "" {
 		headers.Set("If-None-Match", previous.etag)
 	}
@@ -106,12 +111,16 @@ func (c *AgentClient) refreshAgent(ctx context.Context, key string) error {
 			err = errAgentProtocol
 		}
 	}
+	if err == nil && (config.Profile == agentProfile) != (responseHeaders.Get(agentCapabilityHeader) == agentProfile) {
+		err = errAgentProtocol
+	}
 	if err == nil {
 		err = config.validate(key, previous, time.Now())
 	}
 	c.agentMu.Lock()
 	defer c.agentMu.Unlock()
 	if err != nil {
+		c.refreshCauses[key] = agentFailureCause(err, status)
 		if !transient || previous == nil || !previous.expires.After(time.Now()) {
 			c.revoke(key)
 		}
@@ -136,7 +145,26 @@ func (c *AgentClient) refreshAgent(ctx context.Context, key string) error {
 	}
 	config.etag = responseHeaders.Get("ETag")
 	c.publications[key] = config
+	delete(c.refreshCauses, key)
 	return nil
+}
+
+func agentFailureCause(err error, status int) AgentDecisionCause {
+	if errors.Is(err, errAgentCanonical) {
+		return "unsupported_canonical_params"
+	}
+	if errors.Is(err, errABTransient) || status == 408 || status == 429 || status >= 500 {
+		return "transport_unavailable"
+	}
+	return "invalid_identity"
+}
+func agentDecisionCopy(value AgentDecision) AgentDecision {
+	value.Params = abCopyParams(value.Params)
+	if value.Serving != nil {
+		serving := *value.Serving
+		value.Serving = &serving
+	}
+	return value
 }
 
 // Choose admits a customer or session over HTTP when its lease is missing. Call before opening the root trace.
@@ -172,32 +200,53 @@ func (c *AgentClient) Choose(ctx context.Context, key string, options AgentChoic
 			c.agentMu.Unlock()
 		}
 		if config == nil || !config.expires.After(time.Now()) {
+			c.agentMu.Lock()
+			fallback.Cause = c.refreshCauses[key]
+			c.agentMu.Unlock()
 			return fallback
 		}
-		if config.Live == nil || config.Live.Status != "running" {
+		fallback.knownRevision = config.Revision
+		if config.Serving != nil {
+			fallback.knownUnit = config.Serving.Unit
+		} else if config.Live != nil {
+			fallback.knownUnit = config.Live.Unit
+		}
+		if (config.Live == nil || config.Live.Status != "running") && config.Serving == nil {
 			reason := "current"
 			if config.Live != nil {
 				reason = "paused"
 			}
-			return AgentDecision{agentAssignment: agentAssignment{ProtocolVersion: 2, AgentKey: key, Revision: config.Revision, ExpiresAt: config.ExpiresAt, Arm: "a", Reason: reason, Params: abCopyParams(config.Current.Params), Fingerprint: config.Current.Fingerprint}, UnitID: options.Unit, expires: config.expires}
+			return AgentDecision{agentAssignment: agentAssignment{ProtocolVersion: 2, Profile: config.Profile, AgentKey: key, Revision: config.Revision, ExpiresAt: config.ExpiresAt, Arm: "a", Reason: reason, Params: abCopyParams(config.Current.Params), Fingerprint: config.Current.Fingerprint}, UnitID: options.Unit, knownUnit: fallback.knownUnit, expires: config.expires}
+		}
+		servingIdentity := ""
+		if config.Serving != nil {
+			digest, err := agentAttributesDigest(options.Attributes, config.Serving.RequiredAttributeKeys)
+			if err != nil {
+				fallback.Cause = "unsupported_canonical_params"
+				return fallback
+			}
+			encoded, _ := json.Marshal([]any{key, config.Profile, config.Revision, config.Serving.RevisionID, config.Serving.Digest, options.Unit, digest})
+			servingIdentity = string(encoded)
 		}
 		c.agentMu.Lock()
 		lease, exists := c.leases[identity]
+		if !exists && servingIdentity != "" {
+			lease, exists = c.servingLeases[servingIdentity]
+		}
 		c.agentMu.Unlock()
 		if exists && lease.Revision == config.Revision && lease.expires.After(time.Now()) {
-			lease.Params = abCopyParams(lease.Params)
 			if config.expires.Before(lease.expires) {
 				lease.expires = config.expires
 				lease.ExpiresAt = config.expires.UTC().Format(time.RFC3339Nano)
 			}
-			return lease
+			return agentDecisionCopy(lease)
 		}
 		attrs := options.Attributes
 		if attrs == nil {
 			attrs = map[string]any{}
 		}
 		payload, _ := json.Marshal(map[string]any{"protocolVersion": 2, "revision": config.Revision, "unitId": options.Unit, "attributes": attrs})
-		status, _, data, err := c.request(ctx, key, "assignments", payload, nil)
+		status, responseHeaders, data, err := c.request(ctx, key, "assignments", payload, http.Header{agentCapabilityHeader: []string{agentProfile}})
 		var failure struct {
 			Code string `json:"code"`
 		}
@@ -209,6 +258,7 @@ func (c *AgentClient) Choose(ctx context.Context, key string, options AgentChoic
 			continue
 		}
 		if errors.Is(err, errABTransient) || status == 408 || status == 429 || status >= 500 {
+			fallback.Cause = "transport_unavailable"
 			return fallback
 		}
 		result := agentAssignment{}
@@ -217,12 +267,24 @@ func (c *AgentClient) Choose(ctx context.Context, key string, options AgentChoic
 		} else {
 			err = errAgentProtocol
 		}
+		if err == nil && (result.Profile == agentProfile) != (responseHeaders.Get(agentCapabilityHeader) == agentProfile) {
+			err = errAgentProtocol
+		}
 		var expires time.Time
 		if err == nil {
 			expires, err = result.validate(config, time.Now())
+			if err == nil && result.Reason == "published" {
+				digest, digestErr := agentAttributesDigest(options.Attributes, config.Serving.RequiredAttributeKeys)
+				if digestErr != nil {
+					err = digestErr
+				} else if result.WireUnitID != options.Unit || result.AttributesDigest != digest {
+					err = errAgentProtocol
+				}
+			}
 		}
 		c.agentMu.Lock()
 		if err != nil {
+			fallback.Cause = agentFailureCause(err, status)
 			c.revoke(key)
 			c.agentMu.Unlock()
 			return fallback
@@ -236,26 +298,32 @@ func (c *AgentClient) Choose(ctx context.Context, key string, options AgentChoic
 		}
 		selected := AgentDecision{agentAssignment: result, UnitID: options.Unit, expires: expires}
 		selected.ExpiresAt = expires.UTC().Format(time.RFC3339Nano)
-		if _, exists := c.leases[identity]; !exists {
-			c.leaseOrder = append(c.leaseOrder, identity)
-		}
-		c.leases[identity] = selected
-		if len(c.leaseOrder) > 1000 {
-			delete(c.leases, c.leaseOrder[0])
-			c.leaseOrder = c.leaseOrder[1:]
+		if servingIdentity != "" && selected.Reason != "assigned" {
+			c.servingLeases[servingIdentity] = selected
+			if len(c.servingLeases) > 1000 {
+				for key := range c.servingLeases {
+					delete(c.servingLeases, key)
+					break
+				}
+			}
+		} else {
+			if _, exists := c.leases[identity]; !exists {
+				c.leaseOrder = append(c.leaseOrder, identity)
+			}
+			c.leases[identity] = selected
+			if len(c.leaseOrder) > 1000 {
+				delete(c.leases, c.leaseOrder[0])
+				c.leaseOrder = c.leaseOrder[1:]
+			}
 		}
 		c.agentMu.Unlock()
-		selected.Params = abCopyParams(selected.Params)
-		return selected
+		return agentDecisionCopy(selected)
 	}
 	return fallback
 }
 
 // RecordRun tags the private root and queues exposure immediately before using decision.Params.
 func (c *AgentClient) RecordRun(ctx context.Context, decision AgentDecision) bool {
-	if decision.Reason != "assigned" {
-		return false
-	}
 	sc := privateSpanContext(ctx)
 	if !sc.IsValid() {
 		return false
@@ -273,17 +341,88 @@ func (c *AgentClient) RecordRun(ctx context.Context, decision AgentDecision) boo
 	identity := decision.AgentKey + ":" + traceID
 	c.agentMu.Lock()
 	defer c.agentMu.Unlock()
+	actual, canonicalErr := agentVersionFingerprint(decision.AgentKey, abCopyParams(decision.Params))
 	config := c.publications[decision.AgentKey]
+	revision, kind := decision.Revision, decision.Unit
+	if revision == 0 {
+		revision = decision.knownRevision
+	}
+	if kind == "" {
+		kind = decision.knownUnit
+	}
+	prefix := "neatlogs.agent." + decision.AgentKey + "."
+	cause := decision.Cause
+	strict := decision.Reason == "published" || config != nil && config.Live != nil && config.Live.AgentProfile == agentProfile
+	if cause == "" && canonicalErr != nil {
+		cause = "unsupported_canonical_params"
+	} else if cause == "" && strict && actual != decision.Fingerprint {
+		cause = "invalid_identity"
+	}
+	observation, _ := json.Marshal([]any{decision.Reason, actual, decision.UnitID, revision, kind})
+	signedPrior := c.recorded[identity]
+	observationPrior := c.observed[identity]
+	if decision.Reason == "assigned" && config != nil && config.Live != nil && config.Live.Status == "running" && config.Revision == decision.Revision && config.expires.After(time.Now()) && decision.expires.After(time.Now()) && !(strict && (canonicalErr != nil || actual != decision.Fingerprint)) && (signedPrior == "" || signedPrior == decision.AssignmentID) && (observationPrior == "" || observationPrior == string(observation)) {
+		// Establish the legacy signed identity before ordinary attributes use remaining slots.
+		root.SetAttributes(attribute.String(prefix+"assignment_id", decision.AssignmentID), attribute.String(prefix+"fingerprint", decision.Fingerprint))
+	}
+	root.SetAttributes(attribute.Int(prefix+"serving_trace_version", 1), attribute.String(prefix+"unit_id", decision.UnitID), attribute.String(prefix+"decision_reason", decision.Reason))
+	if actual != "" {
+		root.SetAttributes(attribute.String(prefix+"served_fingerprint", actual))
+	}
+	if cause != "" {
+		root.SetAttributes(attribute.String(prefix+"decision_cause", string(cause)))
+	}
+	if revision > 0 {
+		root.SetAttributes(attribute.Int(prefix+"config_revision", revision))
+	}
+	if kind != "" {
+		root.SetAttributes(attribute.String(prefix+"unit_kind", kind))
+	}
+
+	if prior, exists := c.observed[identity]; exists && prior != string(observation) {
+		root.SetAttributes(attribute.String(prefix+"decision_reason", "unavailable"), attribute.String(prefix+"decision_cause", "invalid_identity"), attribute.String(prefix+"assignment_id", ""), attribute.String(prefix+"fingerprint", ""), attribute.String(prefix+"serving_policy_id", ""), attribute.String(prefix+"serving_policy_digest", ""))
+		return false
+	}
+	c.observed[identity] = string(observation)
+	if len(c.observed) > 10000 {
+		for key := range c.observed {
+			delete(c.observed, key)
+			break
+		}
+	}
+	if decision.Reason == "published" {
+		if canonicalErr == nil && actual == decision.Fingerprint && config != nil && config.Revision == decision.Revision && config.expires.After(time.Now()) && decision.expires.After(time.Now()) && config.Serving != nil && decision.Serving != nil && agentSameServing(&config.Serving.agentServingRef, &decision.Serving.agentServingRef) && config.Serving.allows(decision.Serving.PublicationID, actual) {
+			root.SetAttributes(attribute.String(prefix+"serving_policy_id", decision.Serving.PublicationID), attribute.Int(prefix+"serving_policy_revision", decision.Serving.Revision), attribute.String(prefix+"serving_policy_digest", decision.Serving.Digest))
+		}
+		return false
+	}
+	if decision.Reason != "assigned" {
+		return false
+	}
+	if config != nil && config.Live != nil && config.Live.AgentProfile == agentProfile && (canonicalErr != nil || actual != decision.Fingerprint) {
+		return false
+	}
 	if config == nil || config.Live == nil || config.Live.Status != "running" || config.Revision != decision.Revision || !config.expires.After(time.Now()) || !decision.expires.After(time.Now()) {
 		return false
 	}
 	if prior := c.recorded[identity]; prior != "" && prior != decision.AssignmentID {
 		return false
 	}
+	signedID, signedFingerprint := "", ""
+	for _, attr := range root.Attributes() {
+		if string(attr.Key) == prefix+"assignment_id" {
+			signedID = attr.Value.AsString()
+		}
+		if string(attr.Key) == prefix+"fingerprint" {
+			signedFingerprint = attr.Value.AsString()
+		}
+	}
+	if signedID != decision.AssignmentID || signedFingerprint != decision.Fingerprint {
+		return false
+	}
 	if !c.queueAgent(decision, traceID, false) {
 		return false
 	}
-	root.SetAttributes(attribute.String("neatlogs.agent."+decision.AgentKey+".assignment_id", decision.AssignmentID), attribute.String("neatlogs.agent."+decision.AgentKey+".fingerprint", decision.Fingerprint))
 	if _, exists := c.recorded[identity]; !exists {
 		c.recordedOrder = append(c.recordedOrder, identity)
 	}
@@ -345,5 +484,8 @@ func (c *AgentClient) Close() {
 	defer c.agentMu.Unlock()
 	c.publications = map[string]*agentConfiguration{}
 	c.leases = map[string]AgentDecision{}
+	c.servingLeases = map[string]AgentDecision{}
+	c.observed = map[string]string{}
+	c.refreshCauses = map[string]AgentDecisionCause{}
 	c.recorded = map[string]string{}
 }
