@@ -107,7 +107,7 @@ func infrastructureFailure(output string) bool {
 	return false
 }
 
-func testModuleVersion(repositoryRoot, packagePath, module, version string, timeout time.Duration) testRun {
+func testModuleVersion(repositoryRoot, packagePath, module, version, toolchain string, timeout time.Duration) testRun {
 	if version == "" {
 		return testRun{Status: "not_tested", Detail: "No analyzed baseline version is recorded"}
 	}
@@ -131,6 +131,9 @@ func testModuleVersion(repositoryRoot, packagePath, module, version string, time
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	environment := append(os.Environ(), "GOWORK=off")
+	if toolchain != "" {
+		environment = append(environment, "GOTOOLCHAIN="+toolchain)
+	}
 	commands := [][]string{{"mod", "edit", "-modfile=" + modFile, "-require=" + module + "@" + version, "-replace=github.com/neatlogs/neatlogs-go=" + repositoryRoot},
 		{"list", "-m", "-modfile=" + modFile, "-mod=mod", "-f={{.Version}}", module},
 		{"test", "-modfile=" + modFile, "-mod=mod", "-count=1", "./..."}}
@@ -155,6 +158,24 @@ func testModuleVersion(repositoryRoot, packagePath, module, version string, time
 		}
 	}
 	return testRun{Status: "pass", Detail: "Adapter package tests passed against this published module version", ResolvedVersion: resolvedVersion, Seconds: int(time.Since(started).Seconds())}
+}
+
+// toolchainOverride maps a recorded toolchain requirement such as
+// "requires go >= 1.26.0 (running go 1.25.3; GOTOOLCHAIN=local)" to an explicit
+// GOTOOLCHAIN value. Dependency go lines do not reliably trigger toolchain
+// switching for go test under "auto", so the satisfying version is forced.
+func toolchainOverride(requirement string) string {
+	marker := "go >= "
+	if idx := strings.Index(requirement, marker); idx >= 0 {
+		version := strings.TrimSpace(requirement[idx+len(marker):])
+		if end := strings.IndexAny(version, " )"); end >= 0 {
+			version = version[:end]
+		}
+		if version != "" {
+			return "go" + version
+		}
+	}
+	return "auto"
 }
 
 func suiteVerdict(baseline, latest testRun) (string, string) {
@@ -198,11 +219,10 @@ func verify(report releaseReport, evidence evidenceReport, repositoryRoot string
 	}
 	for _, change := range report.Changes {
 		module := moduleResult{Module: change.Module, PreviouslyAnalyzed: change.PreviouslyAnalyzed, Latest: change.Latest, Suites: []suiteResult{}}
+		toolchain := ""
 		if requirement := requirements[change.Module]; requirement != "" {
-			module.Status = "blocked"
-			module.Detail = "The published module requires a newer Go version than this runner: " + requirement
-			result.Modules = append(result.Modules, module)
-			continue
+			toolchain = toolchainOverride(requirement)
+			module.Detail = "The published module requires a newer Go version than this runner (" + requirement + "); adapter tests run with " + toolchain + " instead"
 		}
 		integrations := append([]string(nil), change.Integrations...)
 		sort.Strings(integrations)
@@ -212,8 +232,8 @@ func verify(report releaseReport, evidence evidenceReport, repositoryRoot string
 				module.Suites = append(module.Suites, suiteResult{Integration: integration, Status: "not_tested", Detail: "No adapter test suite is mapped to this integration"})
 				continue
 			}
-			baseline := testModuleVersion(repositoryRoot, packagePath, change.Module, change.PreviouslyAnalyzed, timeout)
-			latest := testModuleVersion(repositoryRoot, packagePath, change.Module, change.Latest, timeout)
+			baseline := testModuleVersion(repositoryRoot, packagePath, change.Module, change.PreviouslyAnalyzed, toolchain, timeout)
+			latest := testModuleVersion(repositoryRoot, packagePath, change.Module, change.Latest, toolchain, timeout)
 			status, detail := suiteVerdict(baseline, latest)
 			module.Suites = append(module.Suites, suiteResult{Integration: integration, Package: packagePath, Status: status, Detail: detail, Baseline: baseline, Latest: latest})
 		}
