@@ -13,7 +13,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 )
 
-// AgentClient reuses the bounded A/B transport and receipt outbox for session-only v2 admission.
+// AgentClient reuses the bounded A/B transport and receipt outbox for customer and session v2 admission.
 type AgentClient struct {
 	*ABTestClient
 	agentMu       sync.Mutex
@@ -139,7 +139,7 @@ func (c *AgentClient) refreshAgent(ctx context.Context, key string) error {
 	return nil
 }
 
-// Choose admits a session over HTTP when its lease is missing. Call before opening the root trace.
+// Choose admits a customer or session over HTTP when its lease is missing. Call before opening the root trace.
 func (c *AgentClient) Choose(ctx context.Context, key string, options AgentChoiceOptions) AgentDecision {
 	fallback := AgentDecision{agentAssignment: agentAssignment{ProtocolVersion: 2, AgentKey: key, Arm: "a", Reason: "unavailable", Params: abCopyParams(options.Fallback)}, UnitID: options.Unit}
 	registered := false
@@ -294,6 +294,8 @@ func (c *AgentClient) RecordRun(ctx context.Context, decision AgentDecision) boo
 	}
 	return true
 }
+
+// CompleteDecision finishes an exported conversation; fixed-horizon customer units stay open.
 func (c *AgentClient) CompleteDecision(ctx context.Context, decision AgentDecision, traceID string) bool {
 	if ctx.Err() != nil || decision.Reason != "assigned" {
 		return false
@@ -305,11 +307,11 @@ func (c *AgentClient) CompleteDecision(ctx context.Context, decision AgentDecisi
 	}
 	return c.queueAgent(decision, traceID, true)
 }
-func (c *AgentClient) queueAgent(decision AgentDecision, traceID string, complete bool) bool {
+func (c *AgentClient) queueAgent(decision AgentDecision, traceID string, conversationComplete bool) bool {
 	if !utf8.ValidString(traceID) || abLength(traceID) < 1 || abLength(traceID) > 128 {
 		return false
 	}
-	identityBytes, _ := json.Marshal([]any{"agent", decision.AgentKey, decision.AssignmentID, traceID, complete})
+	identityBytes, _ := json.Marshal([]any{"agent", decision.AgentKey, decision.AssignmentID, traceID, conversationComplete})
 	identity := string(identityBytes)
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -327,7 +329,7 @@ func (c *AgentClient) queueAgent(decision AgentDecision, traceID string, complet
 	if err != nil {
 		return false
 	}
-	payload, _ := json.Marshal(map[string]any{"protocolVersion": 2, "eventId": eventID, "assignmentId": decision.AssignmentID, "unitId": decision.UnitID, "traceId": traceID, "unitComplete": complete})
+	payload, _ := json.Marshal(map[string]any{"protocolVersion": 2, "eventId": eventID, "assignmentId": decision.AssignmentID, "unitId": decision.UnitID, "traceId": traceID, "conversationComplete": conversationComplete, "unitComplete": conversationComplete && decision.Unit == "session" && decision.CompletionPolicy == "explicit"})
 	c.seen[identity] = abSeenExposure{eventID: eventID}
 	c.seenOrder = append(c.seenOrder, identity)
 	if len(c.seenOrder) > 10000 {

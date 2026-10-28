@@ -9,7 +9,7 @@ import (
 	"unicode/utf8"
 )
 
-var errAgentProtocol = errors.New("neatlogs: invalid session agent protocol")
+var errAgentProtocol = errors.New("neatlogs: invalid agent protocol")
 var agentAttributeKey = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_.-]{0,63}$`)
 
 type agentVersion struct {
@@ -22,6 +22,7 @@ type agentLive struct {
 	CandidateRevision    int    `json:"candidateRevision"`
 	AllocationVersion    int    `json:"allocationVersion"`
 	Unit                 string `json:"unit"`
+	CompletionPolicy     string `json:"completionPolicy"`
 	CurrentFingerprint   string `json:"currentFingerprint"`
 	CandidateFingerprint string `json:"candidateFingerprint"`
 	PolicyDigest         string `json:"policyDigest"`
@@ -58,16 +59,18 @@ type agentAssignment struct {
 	AllocationVersion int      `json:"allocationVersion,omitempty"`
 	EnrollmentID      string   `json:"enrollmentId,omitempty"`
 	AssignmentID      string   `json:"assignmentId,omitempty"`
+	Unit              string   `json:"unit,omitempty"`
+	CompletionPolicy  string   `json:"completionPolicy,omitempty"`
 }
 
-// AgentDecision carries an immutable receipt across execution and session completion.
+// AgentDecision carries an immutable receipt across execution and conversation completion.
 type AgentDecision struct {
 	agentAssignment
 	UnitID  string
 	expires time.Time
 }
 
-// AgentChoiceOptions supplies a session identity, explicit attributes and deployed fallback settings.
+// AgentChoiceOptions supplies a customer or session identity, explicit attributes and deployed fallback settings.
 type AgentChoiceOptions struct {
 	Unit       string
 	Attributes map[string]any
@@ -123,6 +126,9 @@ func agentValidAttributes(value map[string]any) bool {
 	}
 	return true
 }
+func agentValidCompletion(unit, policy string) bool {
+	return unit == "session" && policy == "explicit" || unit == "end_user" && policy == "fixed_horizon"
+}
 func (c *agentConfiguration) validate(key string, previous *agentConfiguration, now time.Time) error {
 	if c.ProtocolVersion != 2 || c.AgentKey != key || !abKeyPattern.MatchString(key) || c.Revision < 1 || !abSaltPattern.MatchString(c.Current.Fingerprint) || !agentValidParams(c.Current.Params) || previous != nil && c.Revision < previous.Revision {
 		return errAgentProtocol
@@ -134,7 +140,7 @@ func (c *agentConfiguration) validate(key string, previous *agentConfiguration, 
 		return err
 	}
 	if live := c.Live; live != nil {
-		if !datasetUUID.MatchString(live.TestID) || !datasetUUID.MatchString(live.ExperimentID) || live.CandidateRevision < 1 || live.AllocationVersion < 1 || live.AllocationVersion > 2147483647 || live.Unit != "session" || live.CurrentFingerprint != c.Current.Fingerprint || !abSaltPattern.MatchString(live.CandidateFingerprint) || !abSaltPattern.MatchString(live.PolicyDigest) {
+		if !datasetUUID.MatchString(live.TestID) || !datasetUUID.MatchString(live.ExperimentID) || live.CandidateRevision < 1 || live.AllocationVersion < 1 || live.AllocationVersion > 2147483647 || !agentValidCompletion(live.Unit, live.CompletionPolicy) || live.CurrentFingerprint != c.Current.Fingerprint || !abSaltPattern.MatchString(live.CandidateFingerprint) || !abSaltPattern.MatchString(live.PolicyDigest) {
 			return errAgentProtocol
 		}
 		if live.Status != "running" && live.Status != "paused" && live.Status != "auto_paused" {
@@ -162,7 +168,7 @@ func (a *agentAssignment) validate(c *agentConfiguration, now time.Time) (time.T
 	}
 	if a.Reason == "assigned" {
 		live := c.Live
-		if live == nil || live.Status != "running" || a.TestID != live.TestID || a.ExperimentID != live.ExperimentID || a.CandidateRevision != live.CandidateRevision || a.AllocationVersion != live.AllocationVersion || !datasetUUID.MatchString(a.EnrollmentID) || !datasetUUID.MatchString(a.AssignmentID) || a.Arm != "a" && a.Arm != "b" {
+		if live == nil || live.Status != "running" || a.TestID != live.TestID || a.ExperimentID != live.ExperimentID || a.CandidateRevision != live.CandidateRevision || a.AllocationVersion != live.AllocationVersion || a.Unit != live.Unit || a.CompletionPolicy != live.CompletionPolicy || !datasetUUID.MatchString(a.EnrollmentID) || !datasetUUID.MatchString(a.AssignmentID) || a.Arm != "a" && a.Arm != "b" {
 			return time.Time{}, errAgentProtocol
 		}
 		fingerprint := c.Current.Fingerprint
@@ -176,7 +182,7 @@ func (a *agentAssignment) validate(c *agentConfiguration, now time.Time) (time.T
 		if a.Reason != "outside_audience" && a.Reason != "outside_share" && a.Reason != "paused" && a.Reason != "current" {
 			return time.Time{}, errAgentProtocol
 		}
-		if a.Arm != "a" || a.Fingerprint != c.Current.Fingerprint || a.AssignmentID != "" || a.TestID != "" || a.AllocationVersion != 0 || a.EnrollmentID != "" || a.ExperimentID != "" || a.CandidateRevision != 0 {
+		if a.Arm != "a" || a.Fingerprint != c.Current.Fingerprint || a.AssignmentID != "" || a.TestID != "" || a.AllocationVersion != 0 || a.EnrollmentID != "" || a.ExperimentID != "" || a.CandidateRevision != 0 || a.Unit != "" || a.CompletionPolicy != "" {
 			return time.Time{}, errAgentProtocol
 		}
 	}

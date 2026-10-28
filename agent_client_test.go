@@ -25,6 +25,18 @@ type agentFixture struct {
 		Unit  string `json:"unit"`
 		Valid bool   `json:"valid"`
 	} `json:"unitVectors"`
+	CompletionVectors []struct {
+		Unit             string `json:"unit"`
+		CompletionPolicy string `json:"completionPolicy"`
+		Valid            bool   `json:"valid"`
+	} `json:"completionVectors"`
+	CustomerJourney struct {
+		UnitID string `json:"unitId"`
+		Traces []struct {
+			SessionID            string `json:"sessionId"`
+			ConversationComplete bool   `json:"conversationComplete"`
+		} `json:"traces"`
+	} `json:"customerJourney"`
 }
 
 func agentVectors(t *testing.T) agentFixture {
@@ -107,6 +119,20 @@ func agentChoose(client *AgentClient) AgentDecision {
 }
 func TestAgentSharedVectors(t *testing.T) {
 	fixture := agentVectors(t)
+	for _, vector := range fixture.CompletionVectors {
+		fixture.Config["expiresAt"] = time.Now().Add(time.Minute).UTC().Format(time.RFC3339Nano)
+		fixture.Config["live"].(map[string]any)["unit"] = vector.Unit
+		fixture.Config["live"].(map[string]any)["completionPolicy"] = vector.CompletionPolicy
+		data, _ := json.Marshal(fixture.Config)
+		var config agentConfiguration
+		err := agentDecode(data, &config)
+		if err == nil {
+			err = config.validate("support", nil, time.Now())
+		}
+		if (err == nil) != vector.Valid {
+			t.Fatalf("completion policy mismatch %+v: %v", vector, err)
+		}
+	}
 	for _, v := range fixture.AttributeVectors {
 		if agentValidAttributes(v.Attributes) != v.Valid {
 			t.Fatalf("attributes mismatch %+v", v)
@@ -161,7 +187,7 @@ func TestAgentConfigRevocation(t *testing.T) {
 		})
 	}
 }
-func TestAgentPauseAndUnsupportedUnit(t *testing.T) {
+func TestAgentPauseAndInvalidCompletionPolicy(t *testing.T) {
 	client, state := agentTestClient(t, 60, 60)
 	_ = agentChoose(client)
 	state.change(func(s *agentTestState) {
@@ -178,7 +204,7 @@ func TestAgentPauseAndUnsupportedUnit(t *testing.T) {
 	})
 	_ = client.Refresh(context.Background())
 	if agentChoose(client).Reason != "unavailable" {
-		t.Fatal("unsupported unit served")
+		t.Fatal("invalid completion policy served")
 	}
 }
 func TestAgentChangedPublicationAndTypedAttributes(t *testing.T) {
@@ -277,7 +303,7 @@ func TestAgentRootAttributionRetriesAndCompletion(t *testing.T) {
 				sent = append(sent, r.Body)
 			}
 		}
-		if len(sent) != 3 || sent[0]["eventId"] != sent[1]["eventId"] || sent[2]["assignmentId"] != decision.AssignmentID || sent[2]["unitComplete"] != true {
+		if len(sent) != 3 || sent[0]["eventId"] != sent[1]["eventId"] || sent[2]["assignmentId"] != decision.AssignmentID || sent[2]["unitComplete"] != true || sent[2]["conversationComplete"] != true {
 			t.Fatalf("incorrect receipts %+v", sent)
 		}
 	})
@@ -355,5 +381,125 @@ func TestAgentNaturalExpiryWithoutRevisionBump(t *testing.T) {
 	}
 	if result := agentChoose(client); result.Reason != "current" || result.Params["model"] != "current" {
 		t.Fatal("natural expiry failed")
+	}
+}
+
+func TestAgentCustomerConversationsCompleteWithoutClosingCustomer(t *testing.T) {
+	client, state := agentTestClient(t, 60, 60)
+	fixture := agentVectors(t)
+	state.change(func(s *agentTestState) {
+		s.config["live"].(map[string]any)["unit"] = "end_user"
+		s.config["live"].(map[string]any)["completionPolicy"] = "fixed_horizon"
+		s.assignment["unit"] = "end_user"
+		s.assignment["completionPolicy"] = "fixed_horizon"
+	})
+	sink := tracetest.NewInMemoryExporter()
+	telemetry, err := NewClient(context.Background(), Config{WorkflowName: "customer"}, WithExporter(sink))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer telemetry.Shutdown(context.Background())
+	traceIDs := map[string]bool{}
+	for index, step := range fixture.CustomerJourney.Traces {
+		selected := client.Choose(context.Background(), "support", AgentChoiceOptions{Unit: fixture.CustomerJourney.UnitID, Attributes: map[string]any{"environment": "production", "premium": true}, Fallback: ABParams{"model": "deployed"}})
+		if selected.Reason != "assigned" {
+			t.Fatalf("customer assignment rejected %+v", selected)
+		}
+		data, _ := json.Marshal(selected.agentAssignment)
+		var wire map[string]any
+		_ = json.Unmarshal(data, &wire)
+		if wire["unit"] != "end_user" || wire["completionPolicy"] != "fixed_horizon" {
+			t.Fatalf("missing frozen completion policy %s", data)
+		}
+		ctx := Identify(telemetry.Context(context.Background()), IdentifyOptions{SessionID: step.SessionID, EndUserID: fixture.CustomerJourney.UnitID})
+		ctx, root, end := Trace(ctx, "customer-turn")
+		if !client.RecordRun(ctx, selected) || !client.RecordRun(ctx, selected) {
+			t.Fatal("customer run not recorded")
+		}
+		traceID := root.SpanContext().TraceID().String()
+		traceIDs[traceID] = true
+		end()
+		if err := telemetry.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if index == 2 {
+			state.change(func(s *agentTestState) {
+				s.config["revision"] = float64(2)
+				s.config["live"].(map[string]any)["unit"] = "session"
+				s.config["live"].(map[string]any)["completionPolicy"] = "explicit"
+			})
+			if err := client.Refresh(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if step.ConversationComplete {
+			if !client.CompleteDecision(ctx, selected, traceID) || !client.CompleteDecision(ctx, selected, traceID) {
+				t.Fatal("conversation completion rejected")
+			}
+		}
+		if err := client.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var roots tracetest.SpanStubs
+	for _, span := range sink.GetSpans() {
+		if !span.Parent.IsValid() {
+			roots = append(roots, span)
+		}
+	}
+	if len(roots) != 3 || len(traceIDs) != 3 {
+		t.Fatalf("unexpected traces %d / %d", len(roots), len(traceIDs))
+	}
+	for i, root := range roots {
+		attributes := map[string]string{}
+		for _, attr := range root.Attributes {
+			attributes[string(attr.Key)] = attr.Value.AsString()
+		}
+		if attributes["neatlogs.session.id"] != fixture.CustomerJourney.Traces[i].SessionID || attributes["neatlogs.end_user.id"] != fixture.CustomerJourney.UnitID || attributes["neatlogs.agent.support.assignment_id"] != fixture.Assignment["assignmentId"] {
+			t.Fatalf("wrong root identity %+v", attributes)
+		}
+	}
+	state.change(func(s *agentTestState) {
+		var admissions, sent []map[string]any
+		for _, request := range s.requests {
+			if strings.HasSuffix(request.Path, "/assignments") {
+				admissions = append(admissions, request.Body)
+			}
+			if strings.HasSuffix(request.Path, "/exposures") {
+				sent = append(sent, request.Body)
+			}
+		}
+		if len(admissions) != 1 || admissions[0]["unitId"] != fixture.CustomerJourney.UnitID || len(admissions[0]) != 4 {
+			t.Fatalf("incorrect admission %+v", admissions)
+		}
+		if len(sent) != 5 {
+			t.Fatalf("incorrect receipts %+v", sent)
+		}
+		completions := []bool{false, false, true, false, true}
+		events := map[string]bool{}
+		for i, receipt := range sent {
+			events[receipt["eventId"].(string)] = true
+			if len(receipt) != 7 || receipt["protocolVersion"] != float64(2) || receipt["assignmentId"] != fixture.Assignment["assignmentId"] || receipt["unitId"] != fixture.CustomerJourney.UnitID || !traceIDs[receipt["traceId"].(string)] || receipt["conversationComplete"] != completions[i] || receipt["unitComplete"] != false {
+				t.Fatalf("incorrect customer receipt %+v", receipt)
+			}
+		}
+		if len(events) != 5 {
+			t.Fatal("duplicate event identities")
+		}
+	})
+}
+
+func TestAgentAssignmentPolicyMustMatchPublication(t *testing.T) {
+	client, state := agentTestClient(t, 60, 60)
+	for _, policy := range []map[string]any{{"unit": "end_user", "completionPolicy": "fixed_horizon"}, {"unit": "session", "completionPolicy": "unknown"}, {"unit": "session"}} {
+		state.change(func(s *agentTestState) {
+			delete(s.assignment, "completionPolicy")
+			for key, value := range policy {
+				s.assignment[key] = value
+			}
+		})
+		if agentChoose(client).Reason != "unavailable" {
+			t.Fatalf("invalid assignment policy served %+v", policy)
+		}
 	}
 }
