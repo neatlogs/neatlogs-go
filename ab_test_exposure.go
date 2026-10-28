@@ -8,6 +8,7 @@ import (
 	"unicode/utf8"
 
 	"go.opentelemetry.io/otel/attribute"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
 // ABExposureOptions describes the version used by one trace. Completion is explicit.
@@ -30,6 +31,7 @@ type abSeenExposure struct {
 	allocationVersion int
 }
 type abPendingExposure struct {
+	payload  []byte
 	key      string
 	exposure abExposure
 	queuedAt time.Time
@@ -161,9 +163,14 @@ func (c *ABTestClient) queueExposure(ctx context.Context, key string, options AB
 	return true
 }
 func abTagTrace(ctx context.Context, key, traceID, arm string) {
+	if span := abRootSpan(ctx, traceID); span != nil {
+		span.SetAttributes(attribute.String("neatlogs.ab."+key, arm))
+	}
+}
+func abRootSpan(ctx context.Context, traceID string) sdktrace.ReadWriteSpan {
 	binding, _ := ctx.Value(privateTraceContextKey{}).(privateTraceContext)
 	if binding.owner == nil || !binding.spanContext.IsValid() || binding.spanContext.TraceID().String() != traceID {
-		return
+		return nil
 	}
 	registry := binding.owner.lifecycle
 	registry.mu.Lock()
@@ -184,9 +191,7 @@ func abTagTrace(ctx context.Context, key, traceID, arm string) {
 		}
 	}
 	registry.mu.Unlock()
-	if span != nil {
-		span.SetAttributes(attribute.String("neatlogs.ab."+key, arm))
-	}
+	return span
 }
 
 // Flush sends receipts in order. Trace-finalization delays preserve the queue.
@@ -212,7 +217,10 @@ func (c *ABTestClient) Flush(ctx context.Context) error {
 			continue
 		}
 		c.mu.Unlock()
-		body, _ := json.Marshal(item.exposure)
+		body := item.payload
+		if body == nil {
+			body, _ = json.Marshal(item.exposure)
+		}
 		status, _, data, err := c.request(ctx, item.key, "exposures", body, nil)
 		if err != nil {
 			break

@@ -48,20 +48,22 @@ type ABAssignmentOptions struct {
 // ABTestClient caches settings and queues exposure receipts independently of telemetry.
 // Flush telemetry before calling Flush on this client.
 type ABTestClient struct {
-	mu               sync.Mutex
-	refreshMu        sync.Mutex
-	flushMu          sync.Mutex
-	endpoint, apiKey string
-	keys             []string
-	http             *http.Client
-	configs          map[string]abConfiguration
-	queue            []abPendingExposure
-	seen             map[string]abSeenExposure
-	seenOrder        []string
-	rejected         int
-	closed, started  bool
-	ctx              context.Context
-	cancel           context.CancelFunc
+	mu                     sync.Mutex
+	refreshMu              sync.Mutex
+	flushMu                sync.Mutex
+	endpoint, apiKey       string
+	apiPath                string
+	onAuthorizationFailure func(string)
+	keys                   []string
+	http                   *http.Client
+	configs                map[string]abConfiguration
+	queue                  []abPendingExposure
+	seen                   map[string]abSeenExposure
+	seenOrder              []string
+	rejected               int
+	closed, started        bool
+	ctx                    context.Context
+	cancel                 context.CancelFunc
 }
 
 func NewABTestClient(cfg ABTestConfig) (*ABTestClient, error) {
@@ -96,7 +98,7 @@ func NewABTestClient(cfg ABTestConfig) (*ABTestClient, error) {
 	isolated.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	base.Path = ""
 	ctx, cancel := context.WithCancel(context.Background())
-	return &ABTestClient{endpoint: strings.TrimRight(base.String(), "/"), apiKey: strings.TrimSpace(cfg.APIKey), keys: keys, http: &isolated, configs: map[string]abConfiguration{}, seen: map[string]abSeenExposure{}, ctx: ctx, cancel: cancel}, nil
+	return &ABTestClient{endpoint: strings.TrimRight(base.String(), "/"), apiPath: "/api/v1/ab-tests", apiKey: strings.TrimSpace(cfg.APIKey), keys: keys, http: &isolated, configs: map[string]abConfiguration{}, seen: map[string]abSeenExposure{}, ctx: ctx, cancel: cancel}, nil
 }
 
 // Start fetches settings, then refreshes them and retries queued receipts every minute.
@@ -224,7 +226,7 @@ func (c *ABTestClient) request(ctx context.Context, key, operation string, paylo
 	if payload != nil {
 		method = http.MethodPost
 	}
-	req, err := http.NewRequestWithContext(ctx, method, c.endpoint+"/api/v1/ab-tests/"+url.PathEscape(key)+"/"+operation, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, method, c.endpoint+c.apiPath+"/"+url.PathEscape(key)+"/"+operation, bytes.NewReader(payload))
 	if err != nil {
 		return 0, nil, nil, errABConfiguration
 	}
@@ -239,6 +241,9 @@ func (c *ABTestClient) request(ctx context.Context, key, operation string, paylo
 		return 0, nil, nil, errABTransient
 	}
 	defer response.Body.Close()
+	if (response.StatusCode == 401 || response.StatusCode == 403) && c.onAuthorizationFailure != nil {
+		c.onAuthorizationFailure(key)
+	}
 	if response.StatusCode == http.StatusNotModified || operation == "config" && response.StatusCode != http.StatusOK {
 		return response.StatusCode, response.Header, nil, nil
 	}
