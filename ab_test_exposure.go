@@ -194,32 +194,46 @@ func abRootSpan(ctx context.Context, traceID string) sdktrace.ReadWriteSpan {
 	return span
 }
 
-// Flush sends receipts in order. Trace-finalization delays preserve the queue.
+// Flush sends receipts in unit order. Trace-finalization delays preserve that unit's queue.
 // It never ends a unit implicitly and retains the same event ID on retries.
 func (c *ABTestClient) Flush(ctx context.Context) error {
 	c.flushMu.Lock()
 	defer c.flushMu.Unlock()
 	deadline := time.Now().Add(5 * time.Second)
+	blockedUnits := make(map[[3]string]bool)
+	index := 0
 	for time.Now().Before(deadline) {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		c.mu.Lock()
-		if c.closed || len(c.queue) == 0 {
+		if c.closed || index >= len(c.queue) {
 			c.mu.Unlock()
 			break
 		}
-		item := c.queue[0]
+		item := c.queue[index]
 		if time.Since(item.queuedAt) > 24*time.Hour {
-			c.queue = c.queue[1:]
+			c.queue = append(c.queue[:index], c.queue[index+1:]...)
 			c.rejected++
 			c.mu.Unlock()
 			continue
 		}
 		c.mu.Unlock()
 		body := item.payload
+		unitID := item.exposure.UnitID
 		if body == nil {
 			body, _ = json.Marshal(item.exposure)
+		} else {
+			var identity struct {
+				UnitID string `json:"unitId"`
+			}
+			_ = json.Unmarshal(body, &identity)
+			unitID = identity.UnitID
+		}
+		unit := [3]string{c.apiPath, item.key, unitID}
+		if blockedUnits[unit] {
+			index++
+			continue
 		}
 		status, _, data, err := c.request(ctx, item.key, "exposures", body, nil)
 		if err != nil {
@@ -233,11 +247,16 @@ func (c *ABTestClient) Flush(ctx context.Context) error {
 		accepted := status >= 200 && status < 300 && parsed && response.Accepted
 		rejected := status == 400 || status == 401 || status == 403 || status == 404 || status == 422 || status == 409 && parsed && response.Code != "" && response.Code != "AB_TRACE_NOT_READY"
 		if !accepted && !rejected {
+			if status >= 200 && status < 300 || status == 409 && parsed && response.Code == "AB_TRACE_NOT_READY" {
+				blockedUnits[unit] = true
+				index++
+				continue
+			}
 			break
 		}
 		c.mu.Lock()
-		if len(c.queue) > 0 && c.queue[0].exposure.EventID == item.exposure.EventID {
-			c.queue = c.queue[1:]
+		if index < len(c.queue) && c.queue[index].exposure.EventID == item.exposure.EventID {
+			c.queue = append(c.queue[:index], c.queue[index+1:]...)
 			if rejected {
 				c.rejected++
 			}

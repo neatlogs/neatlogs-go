@@ -261,6 +261,133 @@ func TestABExposureOrderAndRetries(t *testing.T) {
 		t.Fatalf("incorrect retry or closure order %+v", events)
 	}
 }
+
+func TestABDelayedUnitDoesNotBlockIndependentUnits(t *testing.T) {
+	for _, status := range []int{409, 200} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			var mu sync.Mutex
+			var sent []abExposure
+			var ready atomic.Bool
+			client := abTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				var event abExposure
+				_ = json.NewDecoder(r.Body).Decode(&event)
+				mu.Lock()
+				sent = append(sent, event)
+				mu.Unlock()
+				if event.UnitID == "blocked" && !ready.Load() {
+					w.WriteHeader(status)
+					abRespond(w, map[string]any{"code": "AB_TRACE_NOT_READY", "accepted": false})
+					return
+				}
+				abRespond(w, map[string]any{"accepted": true})
+			})
+			ctx := context.Background()
+			for _, unit := range []string{"blocked", "independent"} {
+				for _, complete := range []bool{false, true} {
+					if !client.LogExposure(ctx, abTestKey, ABExposureOptions{UnitID: unit, Arm: "a", TraceID: unit + "-trace", UnitComplete: complete}) {
+						t.Fatal("could not queue receipt")
+					}
+				}
+			}
+			if client.Flush(ctx) != ErrABExposurePending {
+				t.Fatal("delayed unit must remain pending")
+			}
+			mu.Lock()
+			if len(sent) != 3 || sent[0].UnitID != "blocked" || sent[0].UnitComplete || sent[1].UnitID != "independent" || sent[1].UnitComplete || !sent[2].UnitComplete {
+				t.Fatalf("unexpected delivery order: %+v", sent)
+			}
+			firstID := sent[0].EventID
+			mu.Unlock()
+			if got := client.Diagnostics(); got.Pending != 2 || got.Rejected != 0 {
+				t.Fatalf("unexpected diagnostics: %+v", got)
+			}
+			ready.Store(true)
+			if err := client.Flush(ctx); err != nil {
+				t.Fatal(err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(sent) != 5 || sent[3].EventID != firstID || sent[3].UnitComplete || !sent[4].UnitComplete {
+				t.Fatalf("retry changed identity or closure order: %+v", sent)
+			}
+		})
+	}
+}
+
+func TestAgentDelayedUnitBlocksRenewedLeaseClosure(t *testing.T) {
+	var mu sync.Mutex
+	var sent []map[string]any
+	var ready atomic.Bool
+	client := abTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		var event map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&event)
+		mu.Lock()
+		sent = append(sent, event)
+		mu.Unlock()
+		if event["traceId"] == "old-run" && !ready.Load() {
+			w.WriteHeader(409)
+			abRespond(w, map[string]any{"code": "AB_TRACE_NOT_READY"})
+			return
+		}
+		abRespond(w, map[string]any{"accepted": true})
+	})
+	client.apiPath = "/api/v2/experiment-agents"
+	agent := &AgentClient{ABTestClient: client}
+	for _, event := range []struct {
+		key, unit, trace, lease string
+		complete                bool
+	}{
+		{abTestKey, "blocked", "old-run", "10000000-0000-4000-8000-000000000001", false},
+		{abTestKey, "blocked", "renewed-closure", "10000000-0000-4000-8000-000000000002", true},
+		{abTestKey, "independent", "other-unit", "10000000-0000-4000-8000-000000000003", false},
+		{"other", "blocked", "other-key", "10000000-0000-4000-8000-000000000004", false},
+	} {
+		decision := AgentDecision{agentAssignment: agentAssignment{AgentKey: event.key, AssignmentID: event.lease, Unit: "session", CompletionPolicy: "explicit"}, UnitID: event.unit}
+		if !agent.queueAgent(decision, event.trace, event.complete) {
+			t.Fatal("could not queue agent receipt")
+		}
+	}
+	ctx := context.Background()
+	if client.Flush(ctx) != ErrABExposurePending {
+		t.Fatal("old lease must remain pending")
+	}
+	mu.Lock()
+	if len(sent) != 3 || sent[0]["traceId"] != "old-run" || sent[1]["traceId"] != "other-unit" || sent[2]["traceId"] != "other-key" {
+		t.Fatalf("unrelated receipts did not progress: %+v", sent)
+	}
+	first := sent[0]
+	mu.Unlock()
+	ready.Store(true)
+	if err := client.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sent) != 5 || sent[3]["eventId"] != first["eventId"] || sent[4]["assignmentId"] == first["assignmentId"] || sent[4]["conversationComplete"] != true {
+		t.Fatalf("renewed lease bypassed ordering or retry identity changed: %+v", sent)
+	}
+}
+
+func TestABGlobalDeliveryFailuresStillStopIndependentUnits(t *testing.T) {
+	for _, status := range []int{408, 429, 500, 503, 409} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			var calls atomic.Int32
+			client := abTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.WriteHeader(status)
+				abRespond(w, map[string]any{})
+			})
+			for _, unit := range []string{"first", "other"} {
+				if !client.LogExposure(context.Background(), abTestKey, ABExposureOptions{UnitID: unit, Arm: "a", TraceID: unit}) {
+					t.Fatal("queue failed")
+				}
+			}
+			if client.Flush(context.Background()) != ErrABExposurePending || calls.Load() != 1 || client.Diagnostics().Pending != 2 {
+				t.Fatal("global failure did not stop delivery")
+			}
+		})
+	}
+}
 func TestABExposureBoundaries(t *testing.T) {
 	client := abTestClient(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(403) })
 	ctx := context.Background()
