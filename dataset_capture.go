@@ -35,6 +35,7 @@ type DatasetCaptureReceipt struct {
 	CaptureID string `json:"captureId"`
 	DatasetID string `json:"datasetId"`
 	State     string `json:"state"`
+	replayed  bool   `json:"-"`
 }
 
 // DatasetCaptureError retains the durable receipt for Status or Wait recovery.
@@ -182,6 +183,14 @@ func (c *DatasetClient) Capture(ctx context.Context, telemetry *Client, options 
 	}
 	if options.Destination.DatasetID != "" && receipt.DatasetID != strings.ToLower(options.Destination.DatasetID) {
 		return receipt, &DatasetCaptureError{Phase: "registration", Receipt: receipt, Err: errors.New("neatlogs: dataset capture response changed destination")}
+	}
+	if receipt.replayed {
+		status, statusErr := c.Status(ctx, receipt.CaptureID)
+		if statusErr != nil {
+			return receipt, &DatasetCaptureError{Phase: "registration", Receipt: receipt, Err: statusErr}
+		}
+		receipt.State = status.State
+		return receipt, &DatasetCaptureError{Phase: "registration", Receipt: receipt, Err: errors.New("neatlogs: registration was replayed; execution was not started")}
 	}
 	if receipt.State != "recording" {
 		// Replayed registration may already be sealed. It must never execute again.
