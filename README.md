@@ -288,3 +288,7 @@ Probe uses the normal `/v1/traces` OTLP route with the
 only when the exact trace is visible and its persisted hierarchy, span
 semantics, input/output, versioned metadata, and numeric token totals validate.
 HTTP acceptance or exporter flush alone never reports success.
+
+## A/B tests
+
+Use cached assignments, record actual exposures, and explicitly close completed sessions or users. See [A/B testing in Go](AB_TESTING.md) for setup and delivery order.

@@ -1,0 +1,482 @@
+package neatlogs
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+const abTestKey = "cheap_model"
+const abTestSalt = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+func abFixture() map[string]any {
+	return map[string]any{"protocolVersion": 1, "id": "20000000-0000-4000-8000-000000000001", "key": abTestKey, "revision": 1, "allocationVersion": 1, "salt": abTestSalt, "unit": "session", "status": "running", "enabled": true, "defaultArm": "a", "expiresAt": time.Now().Add(time.Minute).Format(time.RFC3339Nano), "endsAt": time.Now().Add(time.Hour).Format(time.RFC3339Nano), "refreshAfterSeconds": 60, "assignment": abAssignmentAlgorithm, "etag": "settings-v1", "arms": []any{
+		map[string]any{"key": "a", "label": "Original", "params": map[string]any{"model": "gpt-4o"}, "weight": 4105},
+		map[string]any{"key": "b", "label": "Cheaper", "params": map[string]any{"model": "gpt-4o-mini"}, "weight": 5895},
+	}}
+}
+func abTestClient(t *testing.T, handler http.HandlerFunc) *ABTestClient {
+	t.Helper()
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	client, err := NewABTestClient(ABTestConfig{Endpoint: server.URL, APIKey: "test-key", Keys: []string{abTestKey}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(client.Close)
+	return client
+}
+func abRespond(w http.ResponseWriter, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(value)
+}
+func TestABAssignmentProtocol(t *testing.T) {
+	for unit, want := range map[string]uint32{"user-1": 2509, "用户-α": 2445, "session:42": 4105} {
+		if got := abBucket(abTestSalt, unit); got != want {
+			t.Fatalf("bucket(%q)=%d want %d", unit, got, want)
+		}
+	}
+	var calls atomic.Int32
+	client := abTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.Header.Get("Authorization") != "Bearer test-key" {
+			t.Error("missing API credential")
+		}
+		abRespond(w, abFixture())
+	})
+	if err := client.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	choice := client.Assign(context.Background(), abTestKey, ABAssignmentOptions{Unit: "session:42"})
+	if choice.Arm != "b" || choice.Params["model"] != "gpt-4o-mini" || choice.Reason != "assigned" || calls.Load() != 1 {
+		t.Fatalf("choice=%+v calls=%d", choice, calls.Load())
+	}
+	choice.Params["model"] = "mutated"
+	if client.Assign(context.Background(), abTestKey, ABAssignmentOptions{Unit: "session:42"}).Params["model"] != "gpt-4o-mini" {
+		t.Fatal("mutated cached settings")
+	}
+	client.mu.Lock()
+	config := client.configs[abTestKey]
+	*config.Arms[0].Weight = 4106
+	*config.Arms[1].Weight = 5894
+	client.configs[abTestKey] = config
+	client.mu.Unlock()
+	if client.Assign(context.Background(), abTestKey, ABAssignmentOptions{Unit: "session:42"}).Arm != "a" {
+		t.Fatal("assignment threshold differs from other SDKs")
+	}
+}
+func TestABTransientRefreshPreservesOriginalExpiry(t *testing.T) {
+	for _, status := range []int{408, 429, 500, 503, 0, -1} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			var failure atomic.Bool
+			client := abTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if !failure.Load() {
+					v := abFixture()
+					v["expiresAt"] = time.Now().Add(20 * time.Second).Format(time.RFC3339Nano)
+					abRespond(w, v)
+					return
+				}
+				if status <= 0 {
+					conn, _, err := w.(http.Hijacker).Hijack()
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					defer conn.Close()
+					if status == -1 {
+						_, _ = fmt.Fprint(conn, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"protocolVersion\":")
+					}
+					return
+				}
+				w.WriteHeader(status)
+			})
+			if err := client.Refresh(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			original := client.configs[abTestKey].expires
+			failure.Store(true)
+			if client.Refresh(context.Background()) == nil {
+				t.Fatal("expected refresh failure")
+			}
+			if choice := client.Choose(abTestKey, ABAssignmentOptions{Unit: "session:42"}); choice.Arm != "b" || choice.Reason != "assigned" {
+				t.Fatalf("lost still-valid assignment: %+v", choice)
+			}
+			if !client.configs[abTestKey].expires.Equal(original) {
+				t.Fatal("failure changed original expiry")
+			}
+			client.mu.Lock()
+			config := client.configs[abTestKey]
+			config.expires = time.Now()
+			client.configs[abTestKey] = config
+			client.mu.Unlock()
+			_ = client.Refresh(context.Background())
+			choice := client.Choose(abTestKey, ABAssignmentOptions{Unit: "session:42", Fallback: ABParams{"model": "control"}})
+			if choice.Reason != "unavailable" || choice.Params["model"] != "control" {
+				t.Fatalf("served expired settings: %+v", choice)
+			}
+		})
+	}
+}
+
+func TestABInvalidRefreshDiscardsUnexpiredCache(t *testing.T) {
+	for _, status := range []int{401, 403, 404, 302, 200} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			var failure atomic.Bool
+			client := abTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if !failure.Load() {
+					abRespond(w, abFixture())
+					return
+				}
+				w.WriteHeader(status)
+				abRespond(w, map[string]any{"invalid": true})
+			})
+			if err := client.Refresh(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			failure.Store(true)
+			if client.Refresh(context.Background()) == nil {
+				t.Fatal("accepted invalid refresh")
+			}
+			if client.Choose(abTestKey, ABAssignmentOptions{Unit: "session:42"}).Reason != "unavailable" {
+				t.Fatal("kept invalid settings")
+			}
+		})
+	}
+}
+
+func TestABShippedDefaultsAndExpiry(t *testing.T) {
+	client := abTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		v := abFixture()
+		v["status"] = "shipped"
+		v["enabled"] = false
+		v["defaultArm"] = "b"
+		arms := v["arms"].([]any)
+		arms[0].(map[string]any)["weight"] = 0
+		arms[1].(map[string]any)["weight"] = 10000
+		abRespond(w, v)
+	})
+	if err := client.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := client.Assign(context.Background(), abTestKey, ABAssignmentOptions{Unit: "u"}); got.Arm != "b" || got.Reason != "default" {
+		t.Fatalf("shipped choice %+v", got)
+	}
+	if client.Diagnostics().Pending != 0 {
+		t.Fatal("disabled assignment logged an exposure")
+	}
+	client.mu.Lock()
+	config := client.configs[abTestKey]
+	config.expires = time.Now().Add(-time.Second)
+	client.configs[abTestKey] = config
+	client.mu.Unlock()
+	if got := client.Assign(context.Background(), abTestKey, ABAssignmentOptions{Unit: "u"}); got.Arm != "a" || got.Reason != "unavailable" {
+		t.Fatalf("expired choice %+v", got)
+	}
+}
+func TestABConditionalRefreshAndInvalidRevision(t *testing.T) {
+	var calls atomic.Int32
+	client := abTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		if n == 2 {
+			if r.Header.Get("If-None-Match") != "settings-v1" {
+				t.Error("missing conditional cache header")
+			}
+			w.Header().Set("X-AB-Config-Expires-At", time.Now().Add(time.Minute).Format(time.RFC3339Nano))
+			w.WriteHeader(304)
+			return
+		}
+		value := abFixture()
+		if n == 1 {
+			value["revision"] = 2
+		}
+		abRespond(w, value)
+	})
+	if client.Refresh(context.Background()) != nil || client.Refresh(context.Background()) != nil {
+		t.Fatal("refresh failed")
+	}
+	if client.Refresh(context.Background()) == nil {
+		t.Fatal("accepted an older configuration")
+	}
+	if client.Assign(context.Background(), abTestKey, ABAssignmentOptions{Unit: "u"}).Reason != "unavailable" {
+		t.Fatal("kept invalid settings")
+	}
+}
+func TestABRejectsInvalidConfiguration(t *testing.T) {
+	for name, edit := range map[string]func(map[string]any){"identity": func(v map[string]any) { v["id"] = "bad" }, "algorithm": func(v map[string]any) { v["assignment"] = "custom" }, "expiry": func(v map[string]any) { v["expiresAt"] = time.Now().Add(time.Hour).Format(time.RFC3339Nano) }, "allocation": func(v map[string]any) { v["arms"].([]any)[0].(map[string]any)["weight"] = 5 }, "status": func(v map[string]any) { v["status"] = "paused" }, "missing_enabled": func(v map[string]any) { delete(v, "enabled") }, "nested_params": func(v map[string]any) {
+		v["arms"].([]any)[0].(map[string]any)["params"] = map[string]any{"nested": map[string]any{}}
+	}} {
+		t.Run(name, func(t *testing.T) {
+			client := abTestClient(t, func(w http.ResponseWriter, r *http.Request) { v := abFixture(); edit(v); abRespond(w, v) })
+			if client.Refresh(context.Background()) == nil {
+				t.Fatal("accepted invalid config")
+			}
+		})
+	}
+}
+func TestABExposureOrderAndRetries(t *testing.T) {
+	var mu sync.Mutex
+	var events []abExposure
+	ready := false
+	client := abTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		var event abExposure
+		_ = json.NewDecoder(r.Body).Decode(&event)
+		mu.Lock()
+		events = append(events, event)
+		accept := ready
+		mu.Unlock()
+		if !accept {
+			w.WriteHeader(409)
+			abRespond(w, map[string]any{"code": "AB_TRACE_NOT_READY"})
+			return
+		}
+		abRespond(w, map[string]any{"accepted": true})
+	})
+	ctx := context.Background()
+	opts := ABExposureOptions{UnitID: "session", Arm: "b", TraceID: "trace"}
+	if !client.LogExposure(ctx, abTestKey, opts) || !client.LogExposure(ctx, abTestKey, opts) || !client.CompleteUnit(ctx, abTestKey, opts, "external") {
+		t.Fatal("queue failed")
+	}
+	if client.Diagnostics().Pending != 2 {
+		t.Fatal("duplicate exposure was queued")
+	}
+	if client.Flush(ctx) != ErrABExposurePending {
+		t.Fatal("must retain not-ready receipt")
+	}
+	mu.Lock()
+	ready = true
+	mu.Unlock()
+	if err := client.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) != 3 || events[0].EventID != events[1].EventID || events[0].UnitComplete || !events[2].UnitComplete || events[2].Source != "external" {
+		t.Fatalf("incorrect retry or closure order %+v", events)
+	}
+}
+
+func TestABDelayedUnitDoesNotBlockIndependentUnits(t *testing.T) {
+	for _, status := range []int{409, 200} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			var mu sync.Mutex
+			var sent []abExposure
+			var ready atomic.Bool
+			client := abTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				var event abExposure
+				_ = json.NewDecoder(r.Body).Decode(&event)
+				mu.Lock()
+				sent = append(sent, event)
+				mu.Unlock()
+				if event.UnitID == "blocked" && !ready.Load() {
+					w.WriteHeader(status)
+					abRespond(w, map[string]any{"code": "AB_TRACE_NOT_READY", "accepted": false})
+					return
+				}
+				abRespond(w, map[string]any{"accepted": true})
+			})
+			ctx := context.Background()
+			for _, unit := range []string{"blocked", "independent"} {
+				for _, complete := range []bool{false, true} {
+					if !client.LogExposure(ctx, abTestKey, ABExposureOptions{UnitID: unit, Arm: "a", TraceID: unit + "-trace", UnitComplete: complete}) {
+						t.Fatal("could not queue receipt")
+					}
+				}
+			}
+			if client.Flush(ctx) != ErrABExposurePending {
+				t.Fatal("delayed unit must remain pending")
+			}
+			mu.Lock()
+			if len(sent) != 3 || sent[0].UnitID != "blocked" || sent[0].UnitComplete || sent[1].UnitID != "independent" || sent[1].UnitComplete || !sent[2].UnitComplete {
+				t.Fatalf("unexpected delivery order: %+v", sent)
+			}
+			firstID := sent[0].EventID
+			mu.Unlock()
+			if got := client.Diagnostics(); got.Pending != 2 || got.Rejected != 0 {
+				t.Fatalf("unexpected diagnostics: %+v", got)
+			}
+			ready.Store(true)
+			if err := client.Flush(ctx); err != nil {
+				t.Fatal(err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(sent) != 5 || sent[3].EventID != firstID || sent[3].UnitComplete || !sent[4].UnitComplete {
+				t.Fatalf("retry changed identity or closure order: %+v", sent)
+			}
+		})
+	}
+}
+
+func TestAgentDelayedUnitBlocksRenewedLeaseClosure(t *testing.T) {
+	var mu sync.Mutex
+	var sent []map[string]any
+	var ready atomic.Bool
+	client := abTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		var event map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&event)
+		mu.Lock()
+		sent = append(sent, event)
+		mu.Unlock()
+		if event["traceId"] == "old-run" && !ready.Load() {
+			w.WriteHeader(409)
+			abRespond(w, map[string]any{"code": "AB_TRACE_NOT_READY"})
+			return
+		}
+		abRespond(w, map[string]any{"accepted": true})
+	})
+	client.apiPath = "/api/v2/experiment-agents"
+	agent := &AgentClient{ABTestClient: client}
+	for _, event := range []struct {
+		key, unit, trace, lease string
+		complete                bool
+	}{
+		{abTestKey, "blocked", "old-run", "10000000-0000-4000-8000-000000000001", false},
+		{abTestKey, "blocked", "renewed-closure", "10000000-0000-4000-8000-000000000002", true},
+		{abTestKey, "independent", "other-unit", "10000000-0000-4000-8000-000000000003", false},
+		{"other", "blocked", "other-key", "10000000-0000-4000-8000-000000000004", false},
+	} {
+		decision := AgentDecision{agentAssignment: agentAssignment{AgentKey: event.key, AssignmentID: event.lease, Unit: "session", CompletionPolicy: "explicit"}, UnitID: event.unit}
+		if !agent.queueAgent(decision, event.trace, event.complete) {
+			t.Fatal("could not queue agent receipt")
+		}
+	}
+	ctx := context.Background()
+	if client.Flush(ctx) != ErrABExposurePending {
+		t.Fatal("old lease must remain pending")
+	}
+	mu.Lock()
+	if len(sent) != 3 || sent[0]["traceId"] != "old-run" || sent[1]["traceId"] != "other-unit" || sent[2]["traceId"] != "other-key" {
+		t.Fatalf("unrelated receipts did not progress: %+v", sent)
+	}
+	first := sent[0]
+	mu.Unlock()
+	ready.Store(true)
+	if err := client.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sent) != 5 || sent[3]["eventId"] != first["eventId"] || sent[4]["assignmentId"] == first["assignmentId"] || sent[4]["conversationComplete"] != true {
+		t.Fatalf("renewed lease bypassed ordering or retry identity changed: %+v", sent)
+	}
+}
+
+func TestABGlobalDeliveryFailuresStillStopIndependentUnits(t *testing.T) {
+	for _, status := range []int{408, 429, 500, 503, 409} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			var calls atomic.Int32
+			client := abTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.WriteHeader(status)
+				abRespond(w, map[string]any{})
+			})
+			for _, unit := range []string{"first", "other"} {
+				if !client.LogExposure(context.Background(), abTestKey, ABExposureOptions{UnitID: unit, Arm: "a", TraceID: unit}) {
+					t.Fatal("queue failed")
+				}
+			}
+			if client.Flush(context.Background()) != ErrABExposurePending || calls.Load() != 1 || client.Diagnostics().Pending != 2 {
+				t.Fatal("global failure did not stop delivery")
+			}
+		})
+	}
+}
+func TestABExposureBoundaries(t *testing.T) {
+	client := abTestClient(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(403) })
+	ctx := context.Background()
+	event := "20000000-0000-4000-8000-000000000003"
+	if !client.LogExposure(ctx, abTestKey, ABExposureOptions{UnitID: "u", Arm: "a", TraceID: "t", EventID: event}) {
+		t.Fatal("first receipt")
+	}
+	if client.LogExposure(ctx, abTestKey, ABExposureOptions{UnitID: "different", Arm: "b", TraceID: "t", EventID: event}) {
+		t.Fatal("overwrote a pending event ID")
+	}
+	if client.LogExposure(ctx, "unregistered", ABExposureOptions{UnitID: "u", Arm: "a", TraceID: "t"}) || client.LogExposure(ctx, abTestKey, ABExposureOptions{UnitID: "u", Arm: "a"}) {
+		t.Fatal("accepted missing trace or unknown key")
+	}
+	if client.Flush(ctx) != ErrABExposureRejected || client.Diagnostics().Pending != 0 {
+		t.Fatal("permanent rejection was retried")
+	}
+	client.Close()
+	if client.LogExposure(ctx, abTestKey, ABExposureOptions{UnitID: "v", Arm: "a", TraceID: "t"}) {
+		t.Fatal("closed client queued exposure")
+	}
+}
+func TestABQueueLimitAndRetention(t *testing.T) {
+	client := abTestClient(t, func(w http.ResponseWriter, r *http.Request) { t.Error("expired queue made HTTP request") })
+	for i := 0; i < 1000; i++ {
+		if !client.LogExposure(context.Background(), abTestKey, ABExposureOptions{UnitID: fmt.Sprint(i), Arm: "a", TraceID: "trace"}) {
+			t.Fatalf("queue failed at %d", i)
+		}
+	}
+	if client.LogExposure(context.Background(), abTestKey, ABExposureOptions{UnitID: "extra", Arm: "a", TraceID: "trace"}) {
+		t.Fatal("unbounded queue")
+	}
+	client.mu.Lock()
+	for i := range client.queue {
+		client.queue[i].queuedAt = time.Now().Add(-25 * time.Hour)
+	}
+	client.mu.Unlock()
+	if client.Flush(context.Background()) != ErrABExposureRejected || client.Diagnostics().Pending != 0 || client.Diagnostics().Rejected != 1001 {
+		t.Fatal("expired receipts were not counted")
+	}
+}
+func TestABHTTPBoundaries(t *testing.T) {
+	for _, endpoint := range []string{"http://example.com", "https://user:pass@example.com", "https://example.com/path", "https://example.com?x=y"} {
+		if _, err := NewABTestClient(ABTestConfig{Endpoint: endpoint, APIKey: "key"}); err == nil {
+			t.Errorf("accepted endpoint %s", endpoint)
+		}
+	}
+	t.Run("bounded_response", func(t *testing.T) {
+		client := abTestClient(t, func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(strings.Repeat("x", 65537))) })
+		if client.Refresh(context.Background()) == nil {
+			t.Fatal("accepted oversized response")
+		}
+	})
+	t.Run("redirect", func(t *testing.T) {
+		var redirected atomic.Bool
+		target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { redirected.Store(true) }))
+		defer target.Close()
+		client := abTestClient(t, func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, target.URL, 302) })
+		_ = client.Refresh(context.Background())
+		if redirected.Load() {
+			t.Fatal("credentials followed redirect")
+		}
+	})
+}
+func TestABRejectsInvalidUTF8Unit(t *testing.T) {
+	client := abTestClient(t, func(w http.ResponseWriter, r *http.Request) { abRespond(w, abFixture()) })
+	_ = client.Refresh(context.Background())
+	if client.Assign(context.Background(), abTestKey, ABAssignmentOptions{Unit: string([]byte{255})}).Reason != "unavailable" {
+		t.Fatal("invalid UTF-8 unit was hashed differently from the server")
+	}
+	if client.LogExposure(context.Background(), abTestKey, ABExposureOptions{UnitID: string([]byte{255}), Arm: "a", TraceID: "t"}) {
+		t.Fatal("invalid UTF-8 receipt")
+	}
+}
+func TestABConcurrentAssignmentAndContext(t *testing.T) {
+	client := abTestClient(t, func(w http.ResponseWriter, r *http.Request) { abRespond(w, abFixture()) })
+	_ = client.Refresh(context.Background())
+	ctx := WithABTestClient(context.Background(), client)
+	var wg sync.WaitGroup
+	for i := 0; i < 40; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if ABTest(ctx, abTestKey, ABAssignmentOptions{Unit: "session:42"}).Arm != "b" {
+				t.Error("unstable assignment")
+			}
+		}()
+	}
+	wg.Wait()
+	if ABTest(context.Background(), abTestKey, ABAssignmentOptions{Unit: "u", Fallback: ABParams{"model": "control"}}).Reason != "unavailable" {
+		t.Fatal("context leaked client")
+	}
+}
