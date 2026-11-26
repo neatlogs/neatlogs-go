@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
+	"strings"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -15,6 +17,7 @@ import (
 // the span, and an end func the caller must invoke exactly once (usually via
 // defer). It is the Go equivalent of Python's `with neatlogs.trace(...)` and
 // TypeScript's `neatlogs.trace({...}, fn)`.
+// The workflow span records the caller's source location.
 //
 // Session and end-user identity are NOT passed as arguments here — they ride on
 // the context. Set them once at the request/turn boundary with Identify, then
@@ -32,7 +35,7 @@ import (
 // applies to this WORKFLOW root, the WrapGenAI auto-root, and spans created by
 // integrations using the private provider. Trace itself only opens the span.
 func Trace(ctx context.Context, name string) (context.Context, trace.Span, func()) {
-	return StartSpan(ctx, name, attrs.KindWorkflow)
+	return startTypedSpan(ctx, name, attrs.KindWorkflow, nil)
 }
 
 // SetTraceOutput records the application-declared final result on the root span
@@ -75,17 +78,34 @@ func SetTraceInput(span trace.Span, value any) error {
 // or on the process-wide Init provider when no Client is bound.
 // Use it at framework and service boundaries where Trace's WORKFLOW kind is not
 // appropriate (for example a TOOL child extracted from an incoming trace).
+// Explicit attributes override captured source attributes.
 func StartSpan(
 	ctx context.Context,
 	name string,
 	kind string,
 	attributes ...attribute.KeyValue,
 ) (context.Context, trace.Span, func()) {
+	return startTypedSpan(ctx, name, kind, attributes)
+}
+
+func startTypedSpan(
+	ctx context.Context,
+	name string,
+	kind string,
+	attributes []attribute.KeyValue,
+) (context.Context, trace.Span, func()) {
 	if isHTTPKind(kind) {
 		return startNoopSpan(ctx, name)
 	}
-	attributes = append([]attribute.KeyValue{
-		attribute.String(attrs.SpanKind, kind),
-	}, attributes...)
-	return startSpanForContext(ctx, name, trace.WithAttributes(attributes...))
+	startAttributes := append([]attribute.KeyValue{attribute.String(attrs.SpanKind, kind)}, attributes...)
+	// Keep the kind and caller attributes first so inferred fields use only spare slots.
+	for _, inferred := range manualSpanCodeLocation() {
+		otelKey := attribute.Key(strings.TrimPrefix(string(inferred.Key), "neatlogs."))
+		if !slices.ContainsFunc(attributes, func(explicit attribute.KeyValue) bool {
+			return explicit.Key == inferred.Key || explicit.Key == otelKey
+		}) {
+			startAttributes = append(startAttributes, inferred)
+		}
+	}
+	return startSpanForContext(ctx, name, trace.WithAttributes(startAttributes...))
 }

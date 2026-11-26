@@ -2,6 +2,8 @@ package neatlogs
 
 import (
 	"context"
+	"path/filepath"
+	"runtime"
 	"testing"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -11,6 +13,55 @@ import (
 	attrs "github.com/neatlogs/neatlogs-go/internal/attributes"
 )
 
+func TestManualSpansCaptureCallerSource(t *testing.T) {
+	sink := tracetest.NewInMemoryExporter()
+	ctx := context.Background()
+	client, err := NewClient(ctx, Config{WorkflowName: "code-location"}, WithExporter(sink))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Shutdown(ctx)
+	ctx = client.Context(ctx)
+
+	_, file, rootLine, _ := runtime.Caller(0)
+	rootCtx, _, endRoot := Trace(ctx, "root")
+	_, _, childLine, _ := runtime.Caller(0)
+	_, _, endChild := StartSpan(rootCtx, "child", attrs.KindTool)
+	_, _, endOverride := StartSpan(rootCtx, "override", attrs.KindTool,
+		attribute.String("neatlogs.code.file.path", "mapped/tool.go"),
+		attribute.Int("code.line.number", 72),
+	)
+	endChild()
+	endOverride()
+	endRoot()
+	if err := client.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, wantLine := range map[string]int{"root": rootLine + 1, "child": childLine + 1} {
+		got := byName(sink, name).Attributes
+		if path, _ := attrString(got, "neatlogs.code.file.path"); filepath.Base(path) != filepath.Base(file) {
+			t.Errorf("%s source file = %q, want %q", name, path, file)
+		}
+		if line, _ := attrInt(got, "neatlogs.code.line.number"); line != int64(wantLine) {
+			t.Errorf("%s source line = %d, want %d", name, line, wantLine)
+		}
+		if fn, _ := attrString(got, "neatlogs.code.function.name"); fn != "TestManualSpansCaptureCallerSource" {
+			t.Errorf("%s source function = %q", name, fn)
+		}
+		if ns, _ := attrString(got, "neatlogs.code.namespace"); ns != "github.com/neatlogs/neatlogs-go" {
+			t.Errorf("%s source namespace = %q", name, ns)
+		}
+	}
+	override := byName(sink, "override").Attributes
+	if path, _ := attrString(override, "neatlogs.code.file.path"); path != "mapped/tool.go" {
+		t.Errorf("explicit source file = %q, want mapped/tool.go", path)
+	}
+	if line, _ := attrInt(override, "neatlogs.code.line.number"); line != 72 {
+		t.Errorf("explicit source line = %d, want 72", line)
+	}
+}
+
 func TestStartSpanRejectsHTTPKind(t *testing.T) {
 	ctx, span, end := StartSpan(context.Background(), "GET", "HTTP")
 	defer end()
@@ -19,6 +70,40 @@ func TestStartSpanRejectsHTTPKind(t *testing.T) {
 	}
 	if trace.SpanFromContext(ctx).SpanContext().IsValid() {
 		t.Fatal("rejected HTTP span must not alter the caller context")
+	}
+}
+
+func TestStartSpanPreservesCallerAttributesAtLimit(t *testing.T) {
+	t.Setenv("OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT", "3")
+	ctx := context.Background()
+	sink := tracetest.NewInMemoryExporter()
+	client, err := NewClient(ctx, Config{WorkflowName: "code-location"}, WithExporter(sink))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Shutdown(ctx)
+
+	_, _, end := StartSpan(client.Context(ctx), "limited", attrs.KindTool,
+		attribute.String("neatlogs.test.attribute", "keep"),
+		attribute.String("code.file.path", "mapped/tool.go"),
+	)
+	end()
+	if err := client.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	exported := byName(sink, "limited").Attributes
+	for key, want := range map[string]string{
+		attrs.SpanKind:            attrs.KindTool,
+		"neatlogs.test.attribute": "keep",
+		"neatlogs.code.file.path": "mapped/tool.go",
+	} {
+		if value, _ := attrString(exported, key); value != want {
+			t.Errorf("%s = %q, want %q", key, value, want)
+		}
+	}
+	if _, found := attrInt(exported, "neatlogs.code.line.number"); found {
+		t.Error("inferred code line must not take a slot from a caller attribute")
 	}
 }
 
