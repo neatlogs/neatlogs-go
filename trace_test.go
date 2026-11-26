@@ -73,6 +73,40 @@ func TestStartSpanRejectsHTTPKind(t *testing.T) {
 	}
 }
 
+func TestStartSpanPreservesCallerAttributesAtLimit(t *testing.T) {
+	t.Setenv("OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT", "3")
+	ctx := context.Background()
+	sink := tracetest.NewInMemoryExporter()
+	client, err := NewClient(ctx, Config{WorkflowName: "code-location"}, WithExporter(sink))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Shutdown(ctx)
+
+	_, _, end := StartSpan(client.Context(ctx), "limited", attrs.KindTool,
+		attribute.String("neatlogs.test.attribute", "keep"),
+		attribute.String("code.file.path", "mapped/tool.go"),
+	)
+	end()
+	if err := client.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	exported := byName(sink, "limited").Attributes
+	for key, want := range map[string]string{
+		attrs.SpanKind:            attrs.KindTool,
+		"neatlogs.test.attribute": "keep",
+		"neatlogs.code.file.path": "mapped/tool.go",
+	} {
+		if value, _ := attrString(exported, key); value != want {
+			t.Errorf("%s = %q, want %q", key, value, want)
+		}
+	}
+	if _, found := attrInt(exported, "neatlogs.code.line.number"); found {
+		t.Error("inferred code line must not take a slot from a caller attribute")
+	}
+}
+
 func TestExporterDropsInjectedHTTPSpanAndCompletionMarker(t *testing.T) {
 	sink := tracetest.NewInMemoryExporter()
 	client, err := NewClient(

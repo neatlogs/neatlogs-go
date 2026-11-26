@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
+	"strings"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -95,7 +97,15 @@ func startTypedSpan(
 	if isHTTPKind(kind) {
 		return startNoopSpan(ctx, name)
 	}
-	defaults := []attribute.KeyValue{attribute.String(attrs.SpanKind, kind)}
-	defaults = append(defaults, manualSpanCodeLocation()...)
-	return startSpanForContext(ctx, name, trace.WithAttributes(append(defaults, attributes...)...))
+	startAttributes := append([]attribute.KeyValue{attribute.String(attrs.SpanKind, kind)}, attributes...)
+	// Keep the kind and caller attributes first so inferred fields use only spare slots.
+	for _, inferred := range manualSpanCodeLocation() {
+		otelKey := attribute.Key(strings.TrimPrefix(string(inferred.Key), "neatlogs."))
+		if !slices.ContainsFunc(attributes, func(explicit attribute.KeyValue) bool {
+			return explicit.Key == inferred.Key || explicit.Key == otelKey
+		}) {
+			startAttributes = append(startAttributes, inferred)
+		}
+	}
+	return startSpanForContext(ctx, name, trace.WithAttributes(startAttributes...))
 }
